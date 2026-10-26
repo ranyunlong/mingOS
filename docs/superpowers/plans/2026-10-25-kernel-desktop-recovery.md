@@ -40,4 +40,4 @@ Files：新的artifacts/system-payload-20261025/review-kernel-recovery-*；新�
 - [ ] 核对QMP实际消费与scanout、资源压力在worker回收后、sync/unmount/kernelPowerdown及无强制QMP退出。
 - [ ] 保存设计、源码/输入/包身份、测试、运行结果和边界；通过后继续独立kernel异常崩溃恢复profile及其余平台服务。整体goal保持active。
 
-当前本计划未执行代码变更；导出包的独立复现VM验证正在进行。
+2026-10-26检查点：Task1的InputPlan状态/代际观察已经实现，当前Boot44测试通过；Task2已生成v20/v21恢复bundle并实际运行。Task3未通过，不能将上方清单视为全部完成。v21为26/30；本轮v23顺序关闭仅是独立诊断，Counter自然完成但Text两代取消，原恢复资格仍RED。原始日志、全部失败盘与v19导出快照保留。后续先补同一父侧时钟的Close请求/送达诊断，不改变限额；详见artifacts/kernel-recovery-20261026/independent-review-v23.json。

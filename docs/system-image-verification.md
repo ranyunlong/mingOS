@@ -49,3 +49,11 @@ QEMU10.0.13/q35/TCG，guest2vCPU/2048MiB，外层容器4CPU/4GiB且UID65534/capd
 ## 最新恢复场景（v20）
 
 七步真实QMP恢复流程成功关闭Text1/PID216并启动Text2/PID219/window3/generation2，Counter维持PID213/window1/generation1。但最后Counter返回APP_CANCELLED，30项门槛有3项因其缺自然Outcome失败；保持RED，不以状态流程成功代替整体恢复通过。私有结束盘Counter11已保存，原盘未挂载。正在以原预算/Result保护采集关闭边界，原v18/v19/导出复现的成功记录仍仅限各自场景。
+
+## 恢复诊断续记（v21—v23）
+
+v21已结束，30项中26项通过、4项失败；除Counter自然Outcome/readback之外，Text第二代640日志hash也与again不符，匹配候选agaain。原QMP仅五组按下/释放；Wayland第二个a释放处理相隔425.811ms，超过400ms重复阈值，这支持重复键时序线索，不能把hash匹配或该间隔当作私有编辑缓冲区与完整根因证明。原始guest连续offset重建全部9份日志，并核对诊断stderr完整性收据。Boot当前回归44/44通过。
+
+v22新增Counter单独关闭步骤，但将instrumentedQualification设为false激活了普通诊断的短采集窗口；流程未到对照点，不能用于归因。失败bundle/原始日志/私有盘均保留。v23恢复原v21采集配置后完成八步：Counter单独关闭的Result、native成功退出、finally/dispose和10→11 readback通过；Text1单独关闭与Text2随后关闭仍各自APP_CANCELLED，后者frameClock.closes=0。因此不能仅凭Counter成功就把关闭改为排队，也不能用这次修改过的八步profile宣告原七步资格通过。
+
+本轮未改生产Host/SDK、Wasm或任何worker限额。v23无QMP强制退出，三worker均reap/cgroup pids0，guest sync/unmount/kernelPowerdown；自然Outcome要求仍因Text失败而未通过。v19导出原快照SHA再次核对不变，原盘未挂载。诊断证据见[独立核查](../artifacts/kernel-recovery-20261026/independent-review-v23.json)。下一份诊断需要同一父侧Instant记录Close请求与SDK回复写出时间，并采集有界worker CPU/cgroup样本，避免跨时钟原点相减或靠延长限额掩盖问题。
