@@ -1,0 +1,42 @@
+import assert from 'node:assert/strict';
+import {readFile,writeFile,readdir} from 'node:fs/promises';
+import {join,dirname,resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {createHash} from 'node:crypto';
+const probe=dirname(fileURLToPath(import.meta.url));const root=resolve(probe,'../..');const out=join(root,'artifacts/compose-jvm-qualification');
+const sha=b=>createHash('sha256').update(b).digest('hex');const json=async file=>JSON.parse(await readFile(join(out,file),'utf8'));const checks=[];
+for(const filename of (await readdir(out)).filter(f=>f.endsWith('.command.json'))){
+ const receipt=await json(filename);const prefix=filename.slice(0,-'.command.json'.length);
+ assert.equal(sha(await readFile(join(out,prefix+'.stdout.log'))),receipt.stdoutSha256,filename+' stdout');
+ assert.equal(sha(await readFile(join(out,prefix+'.stderr.log'))),receipt.stderrSha256,filename+' stderr');
+}
+checks.push('Complete compile/run/javap/jar stdout and stderr hashes match their command receipts');
+const compilation=await json('jvm-compile-02.command.json');assert.equal(compilation.exitCode,0);
+for(const [file,hash] of Object.entries(compilation.inputHashes))assert.equal(sha(await readFile(join(probe,file))),hash,file+' compile input');
+checks.push('Final compiled source and build input hashes remain unchanged');
+const firstArtifacts=await json('attempt-01/artifacts.json');
+assert.equal(sha(await readFile(join(out,'attempt-01/compose-jvm-counter.jar'))),firstArtifacts.applicationJar.sha256);
+const firstCompile=await json('jvm-compile-01.command.json');
+assert.equal(sha(await readFile(join(out,'attempt-01/Main.kt'))),firstCompile.inputHashes['src/main/kotlin/qualification/Main.kt']);
+assert.equal((await json('attempt-01/jvm-run.command.json')).exitCode,1);
+checks.push('First failed run retains matching historical JAR/source and original exit status');
+const artifacts=await json('artifacts.json');
+for(const file of [artifacts.applicationJar,...artifacts.runtimeClasspath,...artifacts.compilerPluginConfigurations.flatMap(c=>c.artifacts)])assert.equal(sha(await readFile(file.file)),file.sha256,file.file);
+assert(artifacts.runtimeClasspath.some(a=>a.coordinate==='androidx.compose.runtime:runtime-desktop:1.10.0'));
+assert(artifacts.runtimeClasspath.some(a=>a.coordinate==='org.jetbrains.kotlin:kotlin-stdlib:2.3.20'));
+assert(artifacts.compilerPluginConfigurations.flatMap(c=>c.artifacts).some(a=>a.coordinate==='org.jetbrains.kotlin:kotlin-compose-compiler-plugin-embeddable:2.3.20'));
+checks.push('Official resolved Runtime 1.10.0, compiler 2.3.20 and transitive JAR hashes match retained artifact records');
+for(const file of artifacts.classes){const bytes=await readFile(join(out,'classfiles',file.path));assert.equal(sha(bytes),file.sha256,file.path);assert.equal(bytes.readUInt32BE(0),0xcafebabe);assert.equal(bytes.readUInt16BE(6),65,file.path+' Java21 class version');}
+checks.push('All retained application classfiles match hashes and JVM class major version 65');
+const result=await json('result.json');assert.equal(result.compile.status,'passed');assert.equal(result.run.status,'passed');assert.equal(result.lowering.status,'confirmed');
+const run=await json('jvm-run-02.command.json');assert.equal(run.exitCode,0);assert(run.command.replaceAll('\\','/').endsWith('/jbr/bin/java.exe'));
+assert(run.args.includes('-Djava.awt.headless=true'));assert(!run.args.some(a=>a.includes('build/classes')));
+const program=result.run.program;for(const key of ['initial','rememberMutableStateRecomposition','nodeRemoval','compositionDispose'])assert.equal(program[key],true);
+assert.equal(program.rememberInitializations,1);assert.equal(program.committedCompositions,3);assert.equal(program.disposableEffectParentDisposals,1);assert.equal(program.disposableEffectChildDisposals,1);
+assert.equal(result.limits.sandboxQualified,false);assert.equal(result.limits.sdkOnlyIsolationQualified,false);assert.equal(result.limits.performanceQualified,false);
+checks.push('Direct JAR execution passed all four lifecycle phases; no sandbox/performance claim is present');
+const bytecode=await readFile(join(out,'javap-main-02.stdout.log'),'utf8');assert(bytecode.includes('Counter(qualification.Observations, androidx.compose.runtime.Composer, int)'));assert(bytecode.includes('Composer.startRestartGroup'));assert(bytecode.includes('major version: 65'));
+checks.push('javap confirms real Composer lowering in the retained application JAR');
+const checkpoint=await json('wasi-checkpoint.json');for(const file of checkpoint.sourceFiles)assert.equal(sha(await readFile(join(root,file.path))),file.sha256,file.path+' frozen WASI source');
+checks.push('All frozen WASI port source hashes match the checkpoint; no further WASI edits occurred');
+const verified={status:'passed',checkedAt:new Date().toISOString(),checks};await writeFile(join(out,'verification.json'),JSON.stringify(verified,null,2)+'\n');console.log(JSON.stringify(verified,null,2));

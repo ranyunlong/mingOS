@@ -1,0 +1,16 @@
+{
+  "name": "mingos-app-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:kotlin": "node --test tests/kotlin.integration.mjs",
+    "build:kotlin": "node scripts/build-kotlin.mjs",
+    "demo": "node scripts/demo.mjs",
+    "check": "node scripts/check.mjs"
+  }
+}

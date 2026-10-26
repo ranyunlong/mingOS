@@ -1,0 +1,22 @@
+import assert from 'node:assert/strict';
+import {mkdir,readFile,readdir,writeFile} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+import {fileURLToPath} from 'node:url';
+import {join,resolve} from 'node:path';
+import {adaptKotlinWasi} from '../../scripts/wasm-sdk-adapter.mjs';
+import {inspectImports} from '../compose-wasi/port/wasm-imports.mjs';
+const probe=fileURLToPath(new URL('./',import.meta.url));const root=resolve(probe,'../..');
+const dir=join(probe,'build/compileSync/wasmWasi/main/productionExecutable/kotlin');
+const files=(await readdir(dir)).filter(f=>f.endsWith('.wasm'));assert.equal(files.length,1);
+const raw=await readFile(join(dir,files[0]));const {bytes,rewrites}=adaptKotlinWasi(raw);
+const imports=inspectImports(bytes).imports;
+const arity={'ming_v1.log':2,'ming_v2.random_fill':2,'ming_frame_v1.clock_monotonic_ns':2,'ming_frame_v1.wait':4};
+for(const i of imports){assert.ok(i.module+'.'+i.name in arity);assert.deepEqual(i.params,Array(arity[i.module+'.'+i.name]).fill('i32'));assert.deepEqual(i.results,['i32']);}
+assert.ok(imports.some(i=>i.module==='ming_frame_v1'&&i.name==='wait'));
+for(const r of rewrites)assert.deepEqual(r,{from:'wasi_snapshot_preview1.random_get',to:'ming_v2.random_fill'});
+await WebAssembly.compile(bytes);const out=join(root,'artifacts/frame-live/package');await mkdir(out,{recursive:true});
+const sha=b=>createHash('sha256').update(b).digest('hex');
+await writeFile(join(out,'compiler.wasm'),raw);await writeFile(join(out,'main.wasm'),bytes);
+await writeFile(join(out,'app.json'),JSON.stringify({schemaVersion:1,id:'dev.ming.frame-live',version:'0.1.0',sdkVersion:5,entry:'main.wasm'},null,2)+'\n');
+await writeFile(join(out,'build-info.json'),JSON.stringify({kotlin:'2.3.20',rawPath:join(dir,files[0]),rawSha256:sha(raw),packagedSha256:sha(bytes),imports,rewrites},null,2)+'\n');
+console.log(JSON.stringify({status:'packaged',out,sha256:sha(bytes),imports},null,2));

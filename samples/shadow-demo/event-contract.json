@@ -1,0 +1,232 @@
+{
+  "schemaVersion": 1,
+  "application": "artifacts/shadow-demo/app.json",
+  "initialViewport": {
+    "width": 1100,
+    "height": 760
+  },
+  "completionEvent": {
+    "code": 40,
+    "value": "framesSubmitted"
+  },
+  "eventFormat": [
+    "type",
+    "a",
+    "b",
+    "c"
+  ],
+  "eventTypes": {
+    "close": 0,
+    "resize": 1,
+    "click": 4,
+    "idle": 8
+  },
+  "buttons": {
+    "move": {
+      "click": [
+        4,
+        40,
+        40,
+        0
+      ],
+      "halfOpenBounds": [
+        24,
+        24,
+        112,
+        60
+      ]
+    },
+    "color": {
+      "click": [
+        4,
+        144,
+        40,
+        0
+      ],
+      "halfOpenBounds": [
+        128,
+        24,
+        216,
+        60
+      ]
+    }
+  },
+  "panel": {
+    "initial": {
+      "x": 48,
+      "y": 128,
+      "shadowY": 136
+    },
+    "moved": {
+      "x": 64,
+      "y": 136,
+      "shadowY": 144
+    },
+    "width": "viewportWidth-112",
+    "height": "viewportHeight-208",
+    "shadowColors": [
+      "0x58304440",
+      "0x784c4290"
+    ]
+  },
+  "resources": {
+    "stylesCreated": 2,
+    "textLayoutsCreated": 5,
+    "textLayoutCreation": "startup only; no resize/click allocation",
+    "styles": [
+      {
+        "radius": 24,
+        "blur": 12,
+        "canonicalCore": [
+          73,
+          73
+        ],
+        "canonicalPatch": [
+          97,
+          97
+        ]
+      },
+      {
+        "radius": 16,
+        "blur": 6,
+        "canonicalCore": [
+          45,
+          45
+        ],
+        "canonicalPatch": [
+          57,
+          57
+        ]
+      }
+    ],
+    "keyReuse": "Initial, click toggles and listed large resize cases use the same two keys. Tiny/narrow/minimum sizes may alter keys."
+  },
+  "limits": {
+    "maxCommands": 15,
+    "maxShadows": 3,
+    "maxAA": 5,
+    "maxPixelCandidateProduct": 62914560
+  },
+  "timing": "frame.textPrepareMicros (actual Rust host field)",
+  "cases": {
+    "initial": {
+      "events": [
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 1
+    },
+    "move": {
+      "events": [
+        [
+          4,
+          40,
+          40,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 2
+    },
+    "color": {
+      "events": [
+        [
+          4,
+          144,
+          40,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 2
+    },
+    "restore": {
+      "events": [
+        [
+          4,
+          40,
+          40,
+          0
+        ],
+        [
+          4,
+          144,
+          40,
+          0
+        ],
+        [
+          4,
+          144,
+          40,
+          0
+        ],
+        [
+          4,
+          40,
+          40,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 5
+    },
+    "largeResize": {
+      "events": [
+        [
+          1,
+          1920,
+          1080,
+          0
+        ],
+        [
+          1,
+          2048,
+          2048,
+          0
+        ],
+        [
+          1,
+          4096,
+          1024,
+          0
+        ],
+        [
+          1,
+          1024,
+          4096,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 5,
+      "finalViewport": [
+        1024,
+        4096
+      ]
+    }
+  }
+}

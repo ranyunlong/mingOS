@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.ming.read-file",
+  "version": "0.1.0",
+  "sdkVersion": 1,
+  "entry": "main.wasm"
+}

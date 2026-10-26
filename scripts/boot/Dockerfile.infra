@@ -1,0 +1,18 @@
+FROM mingos-boot-tools:20261025-trixie13
+LABEL org.mingos.task="boot-infra-20261025"
+USER root
+COPY infra-packages.lock /opt/mingos-boot-infra/packages.lock
+RUN set -eu; \
+    mkdir -p /opt/mingos-boot-infra/debs; \
+    apt-get update; \
+    cd /opt/mingos-boot-infra/debs; \
+    xargs apt-get -o APT::Sandbox::User=root download < ../packages.lock; \
+    sha256sum ./*.deb > ../download.sha256; \
+    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends ./*.deb > ../install.log 2>&1 \
+      || { tail -n 100 ../install.log; exit 1; }; \
+    gzip -n ../install.log; \
+    dpkg-query -W -f='${binary:Package}\t${Version}\n' > ../installed-packages.tsv; \
+    cp /etc/apt/sources.list.d/debian.sources ../debian.sources; \
+    rm -rf /var/lib/apt/lists/*
+USER 65534:65534
+WORKDIR /tmp

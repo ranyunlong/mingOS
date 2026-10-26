@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/ming-app-host"]
+resolver = "3"
+
+# Keep deterministic CPU reference rendering usable in developer previews.
+[profile.dev.package.ming-app-host]
+opt-level = 1

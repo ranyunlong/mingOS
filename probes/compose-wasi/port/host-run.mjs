@@ -1,0 +1,13 @@
+import {spawn} from 'node:child_process';
+import {readFile,writeFile,mkdir,stat} from 'node:fs/promises';
+import {resolve,dirname,join} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {createHash} from 'node:crypto';
+const probe=dirname(fileURLToPath(import.meta.url));const root=resolve(probe,'../../..');const out=join(root,'artifacts/compose-qualification/port');
+const sha=b=>createHash('sha256').update(b).digest('hex');const source=join(root,'.cache/rust-target/debug/ming-app-host.exe');
+const bytes=await readFile(source);const sourceStat=await stat(source);const dir=join(out,'host-snapshot');await mkdir(dir,{recursive:true});const binary=join(dir,'ming-app-host.exe');await writeFile(binary,bytes);const hash=sha(bytes);if(sha(await readFile(binary))!==hash)throw new Error('Snapshot hash mismatch');
+const label='counter-host-pinned';const command=binary;const args=['run',join(out,'counter-03/app.json'),'--timeout-ms','60000'];const moduleSha256=sha(await readFile(join(out,'counter-03/main.wasm')));const startedAt=new Date().toISOString();const stdout=[],stderr=[];
+console.log(JSON.stringify({label,command,args,binarySha256:hash,moduleSha256,startedAt}));
+const exitCode=await new Promise((done,reject)=>{const child=spawn(command,args,{cwd:root,windowsHide:true});child.stdout.on('data',data=>{stdout.push(data);process.stdout.write(data)});child.stderr.on('data',data=>{stderr.push(data);process.stderr.write(data)});child.on('error',reject);child.on('exit',code=>done(code??1));});
+const output=Buffer.concat(stdout),errors=Buffer.concat(stderr);await writeFile(join(out,label+'.stdout.log'),output);await writeFile(join(out,label+'.stderr.log'),errors);
+const receipt={label,command,args,cwd:root,sourceBinary:source,sourceMtimeAtSnapshot:sourceStat.mtime.toISOString(),binarySha256:hash,moduleSha256,startedAt,finishedAt:new Date().toISOString(),exitCode,stdoutSha256:sha(output),stderrSha256:sha(errors)};await writeFile(join(out,label+'.command.json'),JSON.stringify(receipt,null,2)+'\n');if(sha(await readFile(binary))!==hash)throw new Error('Pinned host changed');process.exitCode=exitCode;

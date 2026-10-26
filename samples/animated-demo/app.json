@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.ming.animated-demo",
+  "version": "0.1.0",
+  "sdkVersion": 5,
+  "entry": "main.wasm"
+}

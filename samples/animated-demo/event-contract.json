@@ -1,0 +1,231 @@
+{
+  "schemaVersion": 1,
+  "status": "compiled-real-host-baseline-passed-awaiting-full-source-bound-matrix",
+  "minimumSdkVersion": 5,
+  "entryApi": "ming.compose.MingFramedApplication.run(content: @Composable () -> Unit): MingAppResult",
+  "initialViewport": {
+    "width": 1100,
+    "height": 760
+  },
+  "successExit": {
+    "exactEvents": [
+      {
+        "code": 40,
+        "value": "framesSubmitted"
+      }
+    ],
+    "minimumFrames": 1
+  },
+  "failureExit": {
+    "exactEvents": [
+      {
+        "code": 60,
+        "value": "result.code"
+      }
+    ],
+    "successEventMustBeAbsent": true
+  },
+  "animation": {
+    "startDelayMs": 80,
+    "durationFromFirstFrameNs": 400000000,
+    "initialAlpha": 32,
+    "finalAlpha": 255,
+    "rgb": "#245e55",
+    "maximumFrameSteps": 64,
+    "maximumFrameSuspensionsPerGeneration": 65,
+    "clock": "real parent HostFrameClock via withFrameNanos",
+    "opportunityIsNotHardwareVsync": true,
+    "repeatKey": "remember generation",
+    "canceledGenerationPublishesCompletionInFinally": false
+  },
+  "content": {
+    "order": [
+      "title",
+      "replay",
+      "fade",
+      "status"
+    ],
+    "title": "MingOS · 帧动画",
+    "replay": "重新播放",
+    "fade": "渐显文字",
+    "inProgress": "动画进行中",
+    "completed": "动画完成",
+    "runtimeClockOrFrameValuesVisible": false
+  },
+  "budget": {
+    "nodesIncludingRoot": 6,
+    "textLayouts": 4,
+    "buttons": 1,
+    "expectedCommands": 7,
+    "maximumCommands": 15,
+    "maximumPixels": 4194304,
+    "worstPixelCommandWork": 29360128,
+    "maximumPixelCommandWork": 64000000,
+    "preserveEveryLegalViewport": true
+  },
+  "replayButton": {
+    "event": [
+      4,
+      40,
+      90,
+      0
+    ],
+    "status": "provisional scripted point inside the visible replay button; no physical mouse test",
+    "actualMouseTest": "not performed; ComputerUse stopped",
+    "limitation": "Queued click delivery and final convergence alone do not independently count canceled coroutine instances"
+  },
+  "cases": {
+    "complete": {
+      "events": null,
+      "viewport": [
+        1100,
+        760
+      ],
+      "expectCompleteAnimation": true
+    },
+    "replay": {
+      "events": [
+        [
+          4,
+          40,
+          90,
+          0
+        ],
+        [
+          8,
+          0,
+          0,
+          0
+        ],
+        [
+          4,
+          40,
+          90,
+          0
+        ]
+      ],
+      "viewport": [
+        1100,
+        760
+      ],
+      "expectCompleteAnimation": true,
+      "expectedClickInputs": 2
+    },
+    "earlyClose": {
+      "events": [
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "viewport": [
+        1100,
+        760
+      ],
+      "expectCompleteAnimation": false,
+      "minimumFrames": 0,
+      "note": "Close may preempt the first render; do not require a snapshot or terminal animation state"
+    },
+    "narrow": {
+      "events": [
+        [
+          1,
+          220,
+          760,
+          0
+        ]
+      ],
+      "viewport": [
+        220,
+        760
+      ],
+      "expectCompleteAnimation": true
+    },
+    "tiny": {
+      "events": [
+        [
+          1,
+          1,
+          1,
+          0
+        ]
+      ],
+      "viewport": [
+        1,
+        1
+      ],
+      "expectCompleteAnimation": true
+    },
+    "maxSquare": {
+      "events": [
+        [
+          1,
+          2048,
+          2048,
+          0
+        ]
+      ],
+      "viewport": [
+        2048,
+        2048
+      ],
+      "expectCompleteAnimation": true
+    },
+    "wide": {
+      "events": [
+        [
+          1,
+          4096,
+          1024,
+          0
+        ]
+      ],
+      "viewport": [
+        4096,
+        1024
+      ],
+      "expectCompleteAnimation": true
+    },
+    "tall": {
+      "events": [
+        [
+          1,
+          1024,
+          4096,
+          0
+        ]
+      ],
+      "viewport": [
+        1024,
+        4096
+      ],
+      "expectCompleteAnimation": true
+    }
+  },
+  "headlessProtocol": {
+    "inputOwner": "ming_frame_v1.wait",
+    "defaultEvents": "No --events; EOF closes only after frame/timer work is exhausted",
+    "explicitCloseCanCancelEarly": true,
+    "idle8": "finite yield only; not virtual time and not a promised millisecond delay"
+  },
+  "verificationLimits": {
+    "timeoutMs": 60000,
+    "fuel": 300000000,
+    "nativeAutoCloseMs": 15000
+  },
+  "remainingGates": [
+    "Parent root :animated-demo registration, build whitelist and adapter/build-info branch",
+    "Real Kotlin/Compose compile and exact typed import/adapter checks",
+    "Real CPU/GPU terminal image equality plus visual confirmation of 动画完成",
+    "Replay hit geometry and real cancellation/restart observation",
+    "Native no-readback / explicit-snapshot presentation identity",
+    "Parent independent runtime/coroutine verification; no fake SDK/clock substitute"
+  ],
+  "entryReadiness": {
+    "status": "ready-parent-verified",
+    "evidence": "artifacts/framed-app/result.json",
+    "scope": "Parent headless CPU entry test, not this sample"
+  }
+}

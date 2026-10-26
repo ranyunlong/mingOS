@@ -1,0 +1,23 @@
+# Only this task's pre-existing immutable image; never pulls or modifies host Linux.
+FROM mingos-linux-task3:b89a9dc7cdce
+LABEL org.mingos.task="boot-system-20261025"
+ENV DEBIAN_FRONTEND=noninteractive RUSTUP_AUTO_INSTALL=0
+COPY packages.lock /opt/mingos-boot/locks/requested-packages.lock
+RUN set -eu; \
+    mkdir -p /opt/mingos-boot/debs; \
+    cp /etc/apt/sources.list.d/debian.sources /opt/mingos-boot/locks/debian.sources; \
+    apt-get update; \
+    cd /opt/mingos-boot/debs; \
+    xargs -r apt-get download < /opt/mingos-boot/locks/requested-packages.lock; \
+    sha256sum ./*.deb > /opt/mingos-boot/locks/download.sha256; \
+    apt-get -o APT::Sandbox::User=root install -y --no-install-recommends ./*.deb > /opt/mingos-boot/locks/apt-install.log 2>&1 \
+      || { cat /opt/mingos-boot/locks/apt-install.log; exit 1; }; \
+    tail -n 80 /opt/mingos-boot/locks/apt-install.log; \
+    gzip -n /opt/mingos-boot/locks/apt-install.log; \
+    dpkg-query -W -f='${binary:Package}\t${Version}\n' > /opt/mingos-boot/locks/installed-packages.tsv; \
+    apt-cache policy > /opt/mingos-boot/locks/apt-policy.txt; \
+    cp /etc/os-release /opt/mingos-boot/locks/os-release; \
+    qemu-system-x86_64 --version > /opt/mingos-boot/locks/qemu-version.txt; \
+    weston --version > /opt/mingos-boot/locks/weston-version.txt; \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /work

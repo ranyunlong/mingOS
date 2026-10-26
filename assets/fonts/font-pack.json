@@ -1,0 +1,473 @@
+{
+  "schema_version": 1,
+  "font_pack_revision": 1,
+  "builtin_font_id": 1,
+  "upstream": {
+    "repository": "https://github.com/notofonts/noto-cjk",
+    "commit": "523d033d6cb47f4a80c58a35753646f5c3608a78",
+    "tag": "Sans2.004",
+    "font_path": "Sans/SubsetOTF/SC/NotoSansSC-Regular.otf",
+    "license_path": "LICENSE"
+  },
+  "font": {
+    "path": "assets/fonts/NotoSansSC-Regular.otf",
+    "size_bytes": 8331336,
+    "sha256": "faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9",
+    "sfnt_version": "OTTO",
+    "head_revision": {
+      "raw_16_16": 131334,
+      "decimal": 2.003997802734375
+    },
+    "num_glyphs": 31036,
+    "tables": [
+      {
+        "tag": "BASE",
+        "offset": 8026612,
+        "length_bytes": 228,
+        "directory_checksum": "1b8e18d8"
+      },
+      {
+        "tag": "CFF ",
+        "offset": 21432,
+        "length_bytes": 8005177,
+        "directory_checksum": "12345ad1"
+      },
+      {
+        "tag": "DSIG",
+        "offset": 8150328,
+        "length_bytes": 8,
+        "directory_checksum": "00000001"
+      },
+      {
+        "tag": "GDEF",
+        "offset": 8150336,
+        "length_bytes": 28,
+        "directory_checksum": "020e0201"
+      },
+      {
+        "tag": "GPOS",
+        "offset": 8150364,
+        "length_bytes": 43996,
+        "directory_checksum": "8c6d2566"
+      },
+      {
+        "tag": "GSUB",
+        "offset": 8194360,
+        "length_bytes": 11876,
+        "directory_checksum": "9d6b3329"
+      },
+      {
+        "tag": "OS/2",
+        "offset": 384,
+        "length_bytes": 96,
+        "directory_checksum": "9fe306d0"
+      },
+      {
+        "tag": "VORG",
+        "offset": 8206236,
+        "length_bytes": 920,
+        "directory_checksum": "8d4ff415"
+      },
+      {
+        "tag": "cmap",
+        "offset": 2608,
+        "length_bytes": 18791,
+        "directory_checksum": "eae7b32f"
+      },
+      {
+        "tag": "head",
+        "offset": 284,
+        "length_bytes": 54,
+        "directory_checksum": "1fff6986"
+      },
+      {
+        "tag": "hhea",
+        "offset": 340,
+        "length_bytes": 36,
+        "directory_checksum": "0c1181ae"
+      },
+      {
+        "tag": "hmtx",
+        "offset": 8207156,
+        "length_bytes": 124144,
+        "directory_checksum": "7e94565e"
+      },
+      {
+        "tag": "maxp",
+        "offset": 376,
+        "length_bytes": 6,
+        "directory_checksum": "793c5000"
+      },
+      {
+        "tag": "name",
+        "offset": 480,
+        "length_bytes": 2126,
+        "directory_checksum": "d2ad1686"
+      },
+      {
+        "tag": "post",
+        "offset": 21400,
+        "length_bytes": 32,
+        "directory_checksum": "ff860032"
+      },
+      {
+        "tag": "vhea",
+        "offset": 8331300,
+        "length_bytes": 36,
+        "directory_checksum": "0c9e8f12"
+      },
+      {
+        "tag": "vmtx",
+        "offset": 8026840,
+        "length_bytes": 123486,
+        "directory_checksum": "dac8a830"
+      }
+    ],
+    "names": [
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 0,
+        "label": "copyright",
+        "value": "© 2014-2021 Adobe (http://www.adobe.com/)."
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 1,
+        "label": "family",
+        "value": "Noto Sans SC"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 2,
+        "label": "style",
+        "value": "Regular"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 3,
+        "label": "unique_id",
+        "value": "2.004;GOOG;NotoSansSC-Regular;ADOBE"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 4,
+        "label": "full_name",
+        "value": "Noto Sans SC"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 5,
+        "label": "version",
+        "value": "Version 2.004;hotconv 1.0.118;makeotfexe 2.5.65603"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 6,
+        "label": "postscript_name",
+        "value": "NotoSansSC-Regular"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 7,
+        "label": "trademark",
+        "value": "Noto is a trademark of Google Inc."
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 8,
+        "label": "manufacturer",
+        "value": "Adobe"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 9,
+        "label": "designer",
+        "value": "Ryoko NISHIZUKA 西塚涼子 (kana, bopomofo & ideographs); Paul D. Hunt (Latin, Greek & Cyrillic); Sandoll Communications 산돌커뮤니케이션, Soo-young JANG 장수영 & Joo-yeon KANG 강주연 (hangul elements, letters & syllables)"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 10,
+        "label": "description",
+        "value": "Dr. Ken Lunde (project architect, glyph set definition & overall production); Masataka HATTORI 服部正貴 (production & ideograph elements)"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 11,
+        "label": "vendor_url",
+        "value": "http://www.google.com/get/noto/"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 12,
+        "label": "designer_url",
+        "value": "http://www.adobe.com/type/"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 13,
+        "label": "license_description",
+        "value": "This Font Software is licensed under the SIL Open Font License, Version 1.1. This Font Software is distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software."
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 1033,
+        "name_id": 14,
+        "label": "license_url",
+        "value": "http://scripts.sil.org/OFL"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 2052,
+        "name_id": 1,
+        "label": "family",
+        "value": "Noto Sans SC"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 2052,
+        "name_id": 2,
+        "label": "style",
+        "value": "Regular"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "language_id": 2052,
+        "name_id": 4,
+        "label": "full_name",
+        "value": "Noto Sans SC"
+      }
+    ],
+    "notices": {
+      "copyright": [
+        "© 2014-2021 Adobe (http://www.adobe.com/)."
+      ],
+      "trademark": [
+        "Noto is a trademark of Google Inc."
+      ],
+      "license_description": [
+        "This Font Software is licensed under the SIL Open Font License, Version 1.1. This Font Software is distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software."
+      ],
+      "license_url": [
+        "http://scripts.sil.org/OFL"
+      ]
+    },
+    "cmaps": [
+      {
+        "platform_id": 0,
+        "encoding_id": 3,
+        "format": 4,
+        "offset": 211,
+        "length_bytes": 4920,
+        "validation": "scalar_mapping",
+        "language": 0,
+        "segment_count": 470,
+        "mapped_scalar_count": 30445,
+        "supplementary_scalar_count": 0
+      },
+      {
+        "platform_id": 0,
+        "encoding_id": 4,
+        "format": 12,
+        "offset": 5131,
+        "length_bytes": 13660,
+        "validation": "scalar_mapping",
+        "language": 0,
+        "group_count": 1137,
+        "mapped_scalar_count": 30890,
+        "supplementary_scalar_count": 445
+      },
+      {
+        "platform_id": 0,
+        "encoding_id": 5,
+        "format": 14,
+        "offset": 52,
+        "length_bytes": 147,
+        "validation": "inventory_only"
+      },
+      {
+        "platform_id": 1,
+        "encoding_id": 25,
+        "format": 6,
+        "offset": 199,
+        "length_bytes": 12,
+        "validation": "inventory_only"
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 1,
+        "format": 4,
+        "offset": 211,
+        "length_bytes": 4920,
+        "validation": "scalar_mapping",
+        "language": 0,
+        "segment_count": 470,
+        "mapped_scalar_count": 30445,
+        "supplementary_scalar_count": 0
+      },
+      {
+        "platform_id": 3,
+        "encoding_id": 10,
+        "format": 12,
+        "offset": 5131,
+        "length_bytes": 13660,
+        "validation": "scalar_mapping",
+        "language": 0,
+        "group_count": 1137,
+        "mapped_scalar_count": 30890,
+        "supplementary_scalar_count": 445
+      }
+    ],
+    "coverage": {
+      "corpus": "MingOS 中文，标点。AV fi é Á",
+      "normalization": "none; exact input scalars",
+      "selected_cmap_record": 5,
+      "scalars": [
+        {
+          "character": "M",
+          "codepoint": "U+004D",
+          "glyph_id": 46
+        },
+        {
+          "character": "i",
+          "codepoint": "U+0069",
+          "glyph_id": 74
+        },
+        {
+          "character": "n",
+          "codepoint": "U+006E",
+          "glyph_id": 79
+        },
+        {
+          "character": "g",
+          "codepoint": "U+0067",
+          "glyph_id": 72
+        },
+        {
+          "character": "O",
+          "codepoint": "U+004F",
+          "glyph_id": 48
+        },
+        {
+          "character": "S",
+          "codepoint": "U+0053",
+          "glyph_id": 52
+        },
+        {
+          "character": " ",
+          "codepoint": "U+0020",
+          "glyph_id": 1
+        },
+        {
+          "character": "中",
+          "codepoint": "U+4E2D",
+          "glyph_id": 8805
+        },
+        {
+          "character": "文",
+          "codepoint": "U+6587",
+          "glyph_id": 14750
+        },
+        {
+          "character": "，",
+          "codepoint": "U+FF0C",
+          "glyph_id": 29763
+        },
+        {
+          "character": "标",
+          "codepoint": "U+6807",
+          "glyph_id": 15387
+        },
+        {
+          "character": "点",
+          "codepoint": "U+70B9",
+          "glyph_id": 17602
+        },
+        {
+          "character": "。",
+          "codepoint": "U+3002",
+          "glyph_id": 1142
+        },
+        {
+          "character": "A",
+          "codepoint": "U+0041",
+          "glyph_id": 34
+        },
+        {
+          "character": "V",
+          "codepoint": "U+0056",
+          "glyph_id": 55
+        },
+        {
+          "character": "f",
+          "codepoint": "U+0066",
+          "glyph_id": 71
+        },
+        {
+          "character": "é",
+          "codepoint": "U+00E9",
+          "glyph_id": 167
+        },
+        {
+          "character": "́",
+          "codepoint": "U+0301",
+          "glyph_id": 253
+        }
+      ],
+      "covered_scalar_count": 18,
+      "required_scalar_count": 18,
+      "missing": [],
+      "mapped_scalar_count": 30890,
+      "supplementary_scalar_count": 445
+    }
+  },
+  "license": {
+    "path": "assets/fonts/OFL.txt",
+    "size_bytes": 4301,
+    "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+    "spdx_id": "OFL-1.1"
+  },
+  "notice": {
+    "path": "assets/fonts/NOTICE.txt",
+    "size_bytes": 1538,
+    "sha256": "dba763e855188e111402c4e05af419128eb88395e7f625179e8c43914bb73158"
+  },
+  "qualification": {
+    "scope": "immutable bytes, bounded sfnt/name/cmap metadata and corpus scalar coverage",
+    "outline_tables": "inventory only; not an outline sanitizer",
+    "auxiliary_cmaps": "bounded inventory only; no variation-sequence or Mac repertoire claim",
+    "directory_checksums": "recorded; byte integrity enforced by pinned whole-file SHA-256",
+    "runtime": "shaping, rasterization and memory qualification are separate"
+  }
+}

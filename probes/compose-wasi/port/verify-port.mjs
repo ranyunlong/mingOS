@@ -1,0 +1,40 @@
+import assert from 'node:assert/strict';
+import {readFile,writeFile,readdir} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+import {dirname,join,resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {inspectImports} from './wasm-imports.mjs';
+const probe=dirname(fileURLToPath(import.meta.url));const root=resolve(probe,'../../..');const out=join(root,'artifacts/compose-qualification/port');
+const sha=b=>createHash('sha256').update(b).digest('hex');const json=async p=>JSON.parse(await readFile(join(out,p),'utf8'));const checks=[];
+for(const file of (await readdir(out)).filter(f=>f.endsWith('.command.json'))){const receipt=await json(file);const label=file.slice(0,-'.command.json'.length);assert.equal(sha(await readFile(join(out,label+'.stdout.log'))),receipt.stdoutSha256,file);assert.equal(sha(await readFile(join(out,label+'.stderr.log'))),receipt.stderrSha256,file);}
+checks.push('All top-level command stdout/stderr hashes match retained receipts, including failures');
+const compile=await json('resume-counter-compile-03.command.json');assert.equal(compile.exitCode,0);for(const [file,hash] of Object.entries(compile.inputHashes))assert.equal(sha(await readFile(join(probe,file))),hash,file+' compiled input');
+checks.push('Final compiled source/build inputs remain unchanged');
+const result=await json('result.json');assert.equal(result.stages.realMingHostExecution,'passed');assert.equal(result.stages.officialRuntimeSourceCompile,'passed');
+const module=await json('counter-03/module.json');const raw=await readFile(join(out,'counter-03/raw.wasm'));const bytes=await readFile(join(out,'counter-03/main.wasm'));assert.equal(sha(raw),module.rawSha256);assert.equal(sha(bytes),module.packagedSha256);
+const native=WebAssembly.Module.imports(await WebAssembly.compile(bytes));assert(native.every(i=>i.kind==='function'&&((i.module==='ming_v1'&&i.name==='log')||(i.module==='ming_v2'&&i.name==='random_fill'))));
+const reflected=inspectImports(bytes);assert.deepEqual(reflected.imports.map(({module,name,kind})=>({module,name,kind})),native);for(const imp of reflected.imports){assert.deepEqual(imp.params,['i32','i32']);assert.deepEqual(imp.results,['i32']);}
+assert.deepEqual(module.rewrites,[{from:'wasi_snapshot_preview1.random_get',to:'ming_v2.random_fill'}]);assert.equal(module.adapterError,null);
+checks.push('Real final Wasm hashes, GC import types and unchanged adapter mapping; packaged imports are Ming-only');
+const pinned=await json('counter-host-pinned.command.json');const host=await json('counter-host-pinned.stdout.log');assert.equal(pinned.exitCode,0);assert.equal(host.exitCode,0);assert.equal(host.runtime,'rust-wasmtime');assert.equal(sha(await readFile(pinned.command)),pinned.binarySha256);assert.equal(sha(bytes),pinned.moduleSha256);assert.equal(result.hostEvidence.sha256,pinned.binarySha256);assert.equal(result.hostEvidence.executedModuleSha256,pinned.moduleSha256);assert.equal(result.compile.packagedSha256,module.packagedSha256);
+const expected=[[220,512],[221,0],[222,512],[201,0],[202,2],[203,1],[204,1],[205,1],[206,1],[207,0],[208,1],[209,1],[212,2],[210,3],[211,1],[299,1]].map(([code,value])=>({code,value}));assert.deepEqual(host.events,expected);assert.deepEqual(result.run.events,expected);
+checks.push('Hash-pinned real Ming host passed exact remember/state/recomposition/removal/disposal and 512-slot-release assertions');
+const artifacts=await json('compiled-artifacts.json');
+async function verifyArtifact(artifact){if(artifact.kind==='file'){assert.equal(sha(await readFile(artifact.file)),artifact.sha256,artifact.file)}else{for(const entry of artifact.files)assert.equal(sha(await readFile(join(artifact.file,entry.path))),entry.sha256,entry.path);assert.equal(sha(Buffer.from(JSON.stringify(artifact.files))),artifact.sha256,artifact.file+' tree hash');}}
+for(const record of [...artifacts.dependencies,...artifacts.runtimeDependencies,...artifacts.compiler])await verifyArtifact(record.artifact);for(const artifact of Object.values(artifacts.compiledKlibs))await verifyArtifact(artifact);
+assert(artifacts.runtimeDependencies.some(r=>r.coordinate==='org.jetbrains.kotlinx:atomicfu-wasm-wasi:0.27.0'));assert(artifacts.runtimeDependencies.some(r=>r.coordinate==='org.jetbrains.kotlinx:kotlinx-coroutines-core-wasm-wasi:1.9.0'));assert(artifacts.compiler.some(r=>r.coordinate==='org.jetbrains.kotlin:kotlin-compose-compiler-plugin-embeddable:2.3.20'));
+const manifest=await readFile(join(out,'klibs/runtime/default/manifest'),'utf8');assert(manifest.includes('wasm_targets=wasm-wasi'));assert(manifest.includes('compiler_version=2.3.20'));
+checks.push('Retained official-source Runtime KLIB is wasm-wasi/compiler2.3.20; all local and published dependencies match hashes');
+const audit=await json('source-audit.json');assert.equal(audit.commonAlgorithmEdits,0);assert.equal(audit.unchangedCommonKotlinFiles,238);for(const file of audit.files)assert.equal(sha(await readFile(join(root,file.path))),file.sha256,file.path);for(const patch of audit.patches)assert.equal(sha(await readFile(join(out,'patches',patch.label+'.patch'))),patch.sha256);
+const archivePaths={runtime:'artifacts/compose-qualification/downloads/dl.google.com/dl/android/maven2/androidx/compose/runtime/runtime-wasm-js/1.10.0/runtime-wasm-js-1.10.0-sources.jar','runtime-annotation':'artifacts/compose-qualification/downloads/dl.google.com/dl/android/maven2/androidx/compose/runtime/runtime-annotation/1.10.0/runtime-annotation-1.10.0-sources.jar',collection:'artifacts/compose-qualification/downloads/dl.google.com/dl/android/maven2/androidx/collection/collection/1.5.0/collection-1.5.0-sources.jar',annotation:'artifacts/compose-qualification/port-v1/downloads/dl.google.com/dl/android/maven2/androidx/annotation/annotation/1.9.1/annotation-1.9.1-sources.jar'};
+for(const source of await json('upstream-provenance.json'))assert.equal(sha(await readFile(join(root,archivePaths[source.name]))),source.archiveSha256,source.name+' source archive');
+checks.push('Official source archives, 287 upstream files, 238 untouched common Kotlin files and minimal review patches verified');
+const identityKey='platform/src/wasmWasiMain/kotlin/ming/compose/port/Identity.kt';const identityReceipt=JSON.parse(await readFile(join(root,'artifacts/compose-qualification/port-v1/identity-positive-host.command.json'),'utf8'));assert.equal(identityReceipt.exitCode,0);assert.equal(sha(await readFile(join(probe,identityKey))),identityReceipt.inputHashes[identityKey]);assert.equal(result.identity.globalStrongReferenceRegistry,false);
+checks.push('Identity source matches the independently executed pinned-Kotlin identity checkpoint');
+const clock=await json('clock-host-01.stdout.log');assert.equal(clock.exitCode,0);assert.deepEqual(clock.events,[{code:223,value:1}]);const diagnostics=await json('diagnostics-roundtrip-final.json');assert.equal(diagnostics.status,'passed');assert.deepEqual(diagnostics.lineByteLengths,[21,2048]);assert.equal(diagnostics.oversize2049BytesRejected,true);
+checks.push('Independent real-host clock-rejection and final UTF-8/2048-byte boundary probes passed');
+const compiler=await readFile(join(out,'compiler-evidence/counter-composables.txt'),'utf8');assert(compiler.includes('restartable skippable fun qualification.Counter'));const metrics=await json('compiler-evidence/counter-module.json');assert(metrics.restartableComposables>=1);
+for(const stream of await json('compiler-evidence/provenance.json'))assert.equal(sha(await readFile(join(out,stream.retainedFile))),stream.sha256);
+checks.push('Official Compose compiler lowering report/metrics retained and hash-verified');
+assert.equal(result.limits.productionComposeSupportClaim,false);assert.equal(result.limits.performanceQualified,false);assert.equal(result.limits.asyncRecomposerAndTimersQualified,false);assert.equal(result.limits.trueWeakReferencesQualified,false);
+const verified={status:'passed',checkedAt:new Date().toISOString(),checks};await writeFile(join(out,'verification.json'),JSON.stringify(verified,null,2)+'\n');console.log(JSON.stringify(verified,null,2));

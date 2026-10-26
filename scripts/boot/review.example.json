@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "reviewed": false,
+  "reviewer": null,
+  "hostSha256": null,
+  "catalogSha256": null,
+  "sessionMode": "bounded",
+  "extraArgs": [
+    "--duration-ms",
+    "60000"
+  ],
+  "budgetEvidence": null
+}

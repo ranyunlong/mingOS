@@ -1,0 +1,7 @@
+*
+!Dockerfile.tools
+!packages.lock
+!Dockerfile.infra
+!infra-packages.lock
+!Dockerfile.recovery
+!recovery-packages.lock

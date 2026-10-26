@@ -1,0 +1,9 @@
+import {readFile,writeFile} from 'node:fs/promises';
+import {dirname,resolve,join} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {createHash} from 'node:crypto';
+import {spawn} from 'node:child_process';
+const probe=dirname(fileURLToPath(import.meta.url));const root=resolve(probe,'../..');const out=join(root,'artifacts/compose-frame-qualification');const label=process.argv[2];const host=JSON.parse(await readFile(join(out,'host/provenance.json'),'utf8'));const info=JSON.parse(await readFile(join(out,label,'module.json'),'utf8'));const sha=b=>createHash('sha256').update(b).digest('hex');if(sha(await readFile(host.snapshot))!==host.sha256)throw new Error('Host snapshot changed');if(sha(await readFile(join(out,label,'main.wasm')))!==info.packagedSha256)throw new Error('Module changed');
+const args=['run',join(out,label,'app.json'),'--timeout-ms','60000','--fuel','300000000'];const stdout=[],stderr=[];const startedAt=new Date().toISOString();console.log(JSON.stringify({command:host.snapshot,args,hostSha256:host.sha256,moduleSha256:info.packagedSha256}));
+const exitCode=await new Promise((done,reject)=>{const child=spawn(host.snapshot,args,{cwd:root,windowsHide:true});child.stdout.on('data',b=>{stdout.push(b);process.stdout.write(b)});child.stderr.on('data',b=>{stderr.push(b);process.stderr.write(b)});child.on('error',reject);child.on('exit',c=>done(c??1));});
+const output=Buffer.concat(stdout),errors=Buffer.concat(stderr);await writeFile(join(out,label,'host.stdout.log'),output);await writeFile(join(out,label,'host.stderr.log'),errors);await writeFile(join(out,label,'host.command.json'),JSON.stringify({command:host.snapshot,args,cwd:root,startedAt,finishedAt:new Date().toISOString(),exitCode,hostSha256:host.sha256,moduleSha256:info.packagedSha256,stdoutSha256:sha(output),stderrSha256:sha(errors)},null,2)+'\n');process.exitCode=exitCode;

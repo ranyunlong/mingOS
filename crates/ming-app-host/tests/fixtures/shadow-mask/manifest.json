@@ -1,0 +1,100 @@
+{
+  "format": "row-major A8, no header",
+  "provenance": {
+    "source": "probes/shadow-nine-slice/reference.py",
+    "source_sha256": "3f4be92b5f86838f57e89354cc6d12cad3692a4bb8f7b915fd5544364d463883",
+    "snapshot": "oracle_source.py",
+    "generator": "generate.py",
+    "generator_sha256": "7197fea2292d6839b5ceb311dced9f5c2eee1e44d7da062610d352bef7e18fea",
+    "expected": "independent rational AA plus full-image direct per-tap H then V convolution",
+    "rounding": "(sum + (blur+1)^2//2)//(blur+1)^2 after EACH pass",
+    "domain": "canonical body plus zero halo of blur pixels; no mapper used to generate expected",
+    "python": "3.13.12 (tags/v3.13.12:1cbe481, Feb  3 2026, 18:22:25) [MSC v.1944 64 bit (AMD64)]"
+  },
+  "fixtures": [
+    {
+      "file": "max-r64-b16.a8",
+      "original_width": 769,
+      "original_height": 513,
+      "requested_radius": 64,
+      "effective_radius": 64,
+      "blur": 16,
+      "core_width": 161,
+      "core_height": 161,
+      "patch_width": 193,
+      "patch_height": 193,
+      "bytes": 37249,
+      "sha256": "60ccfd4108b431b4b4fa9ae9dbf6580100a1ba689b09dba3a4df56a3a40213ad"
+    },
+    {
+      "file": "r64-b0.a8",
+      "original_width": 513,
+      "original_height": 257,
+      "requested_radius": 64,
+      "effective_radius": 64,
+      "blur": 0,
+      "core_width": 129,
+      "core_height": 129,
+      "patch_width": 129,
+      "patch_height": 129,
+      "bytes": 16641,
+      "sha256": "d45024b1fa3e38d5d5ab0d5a64c943967f82045bf9a2b1d3642cd7635545d83d"
+    },
+    {
+      "file": "clamp-odd.a8",
+      "original_width": 12,
+      "original_height": 9,
+      "requested_radius": 64,
+      "effective_radius": 4,
+      "blur": 2,
+      "core_width": 12,
+      "core_height": 9,
+      "patch_width": 16,
+      "patch_height": 13,
+      "bytes": 208,
+      "sha256": "62e7811ee77d807dbf935fa67f21e10edfbd817ae4b9c0d334c927f6ed7a8f29"
+    },
+    {
+      "file": "thin-b16.a8",
+      "original_width": 1,
+      "original_height": 9,
+      "requested_radius": 64,
+      "effective_radius": 0,
+      "blur": 16,
+      "core_width": 1,
+      "core_height": 9,
+      "patch_width": 33,
+      "patch_height": 41,
+      "bytes": 1353,
+      "sha256": "46e031141675fec33f56e601871824e444a39b1482a1d022df195775d30711e6"
+    },
+    {
+      "file": "odd-single-axis.a8",
+      "original_width": 41,
+      "original_height": 19,
+      "requested_radius": 8,
+      "effective_radius": 8,
+      "blur": 3,
+      "core_width": 23,
+      "core_height": 19,
+      "patch_width": 29,
+      "patch_height": 25,
+      "bytes": 725,
+      "sha256": "ac45cf4a005a90d02222d99454e906abfb688dfd3d6faf517bcc8637377d0945"
+    },
+    {
+      "file": "round-each-pass.a8",
+      "original_width": 1,
+      "original_height": 2,
+      "requested_radius": 0,
+      "effective_radius": 0,
+      "blur": 2,
+      "core_width": 1,
+      "core_height": 2,
+      "patch_width": 5,
+      "patch_height": 6,
+      "bytes": 30,
+      "sha256": "4da9e5baefaed9355609bf767dbb35998201412e873bda25518926fb8fa9fd82"
+    }
+  ]
+}

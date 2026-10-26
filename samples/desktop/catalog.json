@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "apps": [
+    {
+      "id": 1,
+      "title": "Compose",
+      "manifest": "../../artifacts/compose-demo/app.json"
+    },
+    {
+      "id": 2,
+      "title": "Motion",
+      "manifest": "../../artifacts/animated-demo/app.json"
+    }
+  ],
+  "autostart": [
+    1,
+    2
+  ]
+}

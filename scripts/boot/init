@@ -1,0 +1,17 @@
+#!/bin/sh
+# Guest PID1 bootstrap only. No corresponding mount/modprobe runs on the host.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /proc /sys /run /tmp /dev/pts /dev/shm
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs -o mode=0755,size=128m tmpfs /run
+mount -t tmpfs -o mode=1777,size=128m tmpfs /tmp
+mount -t devpts devpts /dev/pts
+mount -t tmpfs -o mode=1777,size=128m tmpfs /dev/shm
+exec </dev/console >/dev/console 2>&1
+printf 'MINGOS_INIT_STARTED\n'
+for module in virtio_pci virtio_rng virtio_gpu virtio_input evdev virtio_console virtio_blk ext4; do
+    modprobe "$module" || printf 'MINGOS_MODULE_FAILED=%s\n' "$module"
+done
+exec /usr/bin/python3 /etc/mingos/guest.py

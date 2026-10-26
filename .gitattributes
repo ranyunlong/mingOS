@@ -1,0 +1,36 @@
+# 自动处理文本文件，仓库内统一为 LF
+* text=auto
+
+# 明确用 LF 的源码/配置
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+*.kt    text eol=lf
+*.kts   text eol=lf
+*.java  text eol=lf
+*.js    text eol=lf
+*.ts    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.gitignore     text eol=lf
+*.gitattributes text eol=lf
+
+# Windows 批处理/脚本保留 CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制文件不做换行转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.zip   binary
+*.jar   binary

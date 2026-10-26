@@ -1,0 +1,10 @@
+[package]
+name = "ming-app-data-standalone"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+[[test]]
+name = "app_data"
+path = "../../../crates/ming-app-host/tests/app_data.rs"

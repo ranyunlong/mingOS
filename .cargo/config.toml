@@ -1,0 +1,9 @@
+[build]
+target-dir = ".cache/rust-target"
+jobs = 2
+
+[net]
+retry = 2
+
+[http]
+timeout = 60

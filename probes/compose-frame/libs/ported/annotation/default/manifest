@@ -1,0 +1,11 @@
+abi_version=2.3.0
+builtins_platform=WASM
+compiler_version=2.3.20
+ir_signature_versions=1,2
+jsOutputName=mingos-compose-wasi-official-source-port-annotation
+language_features=+AllowAnyAsAnActualTypeForExpectInterface +JsAllowImplementingFunctionInterface +MultiPlatformProjects
+metadata_version=2.3.0
+serializedIrFileFingerprints=3qqf3gfvm6l7t.1qoos8nf7krlp 27xjbh3tbd42a.1t0gvgddo7tgs 2w0jhuoz228q0.292lc6or01rpo 3t0eudq79lrpv.18rn309tt9mul 87adcu7npx98.tdmfyq8xh9ox 1taks93z63c6a.vca48q7m1056 2ezp0ubm9rk6y.1ljqgte2kh4sw bbk6da5l7x7f.yrdv9kqvx9yb fqdnchwhm9ds.3jjtnqx6qeh64 o8o1zctnncz5.2pd1c8x1202jc 2yljia84lelcf.2gtfvt8w8mdbh vemxipuyn204.3352r512ici6q 8van9ka42urd.15i1ohxj5s1x1 28fzy2b41xa9c.i3fu2bpet5nd h08nz3kqmzxc.2j29ciyq8p819 lxut4y5hsxar.11vq9sjozcadv 1f2x3vvxtb8n0.3qen1y5wg6vfl 3nnx0wk7zmonl.439jao3m717d 2xm4f25dw9787.az097f6z6ijd 1q6zhgd2v9t4b.1mj9psjuaia3y 2iy2o380chzsu.26m9t0ccyz9ol nlua2eo04gcy.3t6r1gvfm0fu 1vg6b8yvlc51.7zva8083pjdj 2fokq9cu71r9g.3i1lh6dfubbdw
+serializedKlibFingerprint=6l68x2zmldhv.2gq9xin2ezbn7
+unique_name=mingos-compose-wasi-official-source-port\:annotation
+wasm_targets=wasm-wasi

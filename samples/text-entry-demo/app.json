@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.ming.text-entry-demo",
+  "version": "0.1.0",
+  "sdkVersion": 6,
+  "entry": "main.wasm"
+}

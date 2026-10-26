@@ -1,0 +1,114 @@
+[
+  {
+    "afterMs": 0,
+    "action": {
+      "op": "click",
+      "app": 1,
+      "x": 40,
+      "y": 80
+    }
+  },
+  {
+    "afterMs": 250,
+    "action": {
+      "op": "text",
+      "app": 1,
+      "text": "中文A"
+    }
+  },
+  {
+    "afterMs": 500,
+    "action": {
+      "op": "preedit",
+      "app": 1,
+      "text": "你好",
+      "start": 3,
+      "end": 6
+    }
+  },
+  {
+    "afterMs": 750,
+    "action": {
+      "op": "text",
+      "app": 1,
+      "text": "你好"
+    }
+  },
+  {
+    "afterMs": 1000,
+    "action": {
+      "op": "key",
+      "app": 1,
+      "key": 3,
+      "down": true,
+      "repeat": false,
+      "modifiers": 1
+    }
+  },
+  {
+    "afterMs": 1250,
+    "action": {
+      "op": "text",
+      "app": 1,
+      "text": "文"
+    }
+  },
+  {
+    "afterMs": 1500,
+    "action": {
+      "op": "click",
+      "app": 1,
+      "x": 40,
+      "y": 128
+    }
+  },
+  {
+    "afterMs": 1750,
+    "action": {
+      "op": "key",
+      "app": 1,
+      "key": 10,
+      "down": true,
+      "repeat": false,
+      "modifiers": 2
+    }
+  },
+  {
+    "afterMs": 2000,
+    "action": {
+      "op": "text",
+      "app": 1,
+      "text": "独立字段"
+    }
+  },
+  {
+    "afterMs": 2250,
+    "action": {
+      "op": "key",
+      "app": 1,
+      "key": 9,
+      "down": true,
+      "repeat": false,
+      "modifiers": 0
+    }
+  },
+  {
+    "afterMs": 2500,
+    "action": {
+      "op": "key",
+      "app": 1,
+      "key": 6,
+      "down": true,
+      "repeat": false,
+      "modifiers": 0
+    }
+  },
+  {
+    "afterMs": 2750,
+    "action": {
+      "op": "text",
+      "app": 1,
+      "text": "完成"
+    }
+  }
+]

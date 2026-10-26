@@ -1,0 +1,8 @@
+.cache/
+.gradle/
+.kotlin/
+**/build/
+# probes 通过 include.init.gradle 把 Gradle 输出重定向到 builds/
+**/builds/
+artifacts/
+*.log

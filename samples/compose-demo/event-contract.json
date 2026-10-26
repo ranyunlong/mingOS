@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "initialViewport": {
+    "width": 1100,
+    "height": 760
+  },
+  "completionEvent": {
+    "code": 40,
+    "value": "framesSubmitted"
+  },
+  "buttons": {
+    "increment": [
+      4,
+      40,
+      120,
+      0
+    ],
+    "toggle": [
+      4,
+      40,
+      175,
+      0
+    ]
+  },
+  "cases": {
+    "initial": {
+      "events": [
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 1
+    },
+    "increment": {
+      "events": [
+        [
+          4,
+          40,
+          120,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 2
+    },
+    "hide": {
+      "events": [
+        [
+          4,
+          40,
+          175,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 2
+    },
+    "restore": {
+      "events": [
+        [
+          4,
+          40,
+          175,
+          0
+        ],
+        [
+          4,
+          40,
+          175,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 3
+    },
+    "largeResize": {
+      "events": [
+        [
+          1,
+          1920,
+          1080,
+          0
+        ],
+        [
+          1,
+          2048,
+          2048,
+          0
+        ],
+        [
+          1,
+          4096,
+          1024,
+          0
+        ],
+        [
+          1,
+          1024,
+          4096,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "frames": 5
+    }
+  }
+}

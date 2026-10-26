@@ -1,0 +1,8 @@
+gradle.settingsEvaluated { settings ->
+    settings.include(':stability')
+    settings.project(':stability').projectDir = new File(settings.settingsDir, 'stability')
+}
+gradle.beforeProject { project ->
+    // Preserve canonical counter/KLIB outputs during independent parent replay.
+    project.layout.buildDirectory.set(new File(project.rootDir, 'stability/builds/' + project.name))
+}

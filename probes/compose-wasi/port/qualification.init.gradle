@@ -1,0 +1,49 @@
+import groovy.json.JsonOutput
+import java.security.MessageDigest
+
+gradle.projectsEvaluated {
+    def projectRoot = gradle.rootProject
+    projectRoot.tasks.register('qualificationMetadata') {
+        doLast {
+            def output = new File(projectRoot.rootDir, '../../../artifacts/compose-qualification/port').canonicalFile
+            output.mkdirs()
+            def hash = { byte[] bytes -> MessageDigest.getInstance('SHA-256').digest(bytes).encodeHex().toString() }
+            def snapshot = { File file ->
+                if (file.isFile()) return [file: file.canonicalPath, kind: 'file', bytes: file.length(), sha256: hash(file.bytes)]
+                if (!file.isDirectory()) throw new GradleException('Missing artifact: ' + file)
+                def entries = []
+                file.eachFileRecurse { leaf -> if (leaf.isFile()) entries << [path: file.toPath().relativize(leaf.toPath()).toString().replace('\\', '/'), bytes: leaf.length(), sha256: hash(leaf.bytes)] }
+                entries.sort { a, b -> a.path <=> b.path }
+                return [file: file.canonicalPath, kind: 'directory', sha256: hash(JsonOutput.toJson(entries).getBytes('UTF-8')), files: entries]
+            }
+            def counter = projectRoot.project(':counter')
+            def configuration = counter.configurations.getByName('wasmWasiCompileClasspath')
+            def dependencies = configuration.resolvedConfiguration.resolvedArtifacts.collect { artifact ->
+                [coordinate: artifact.moduleVersion.id.toString(), artifact: snapshot(artifact.file)]
+            }
+            def runtimeConfiguration = counter.configurations.getByName('wasmWasiRuntimeClasspath')
+            def runtimeDependencies = runtimeConfiguration.resolvedConfiguration.resolvedArtifacts.collect { artifact ->
+                [coordinate: artifact.moduleVersion.id.toString(), artifact: snapshot(artifact.file)]
+            }
+            def compiler = counter.configurations.getByName('kotlinCompilerPluginClasspathWasmWasiMain').resolvedConfiguration.resolvedArtifacts.collect { artifact ->
+                [coordinate: artifact.moduleVersion.id.toString(), artifact: snapshot(artifact.file)]
+            }
+            def compiled = [:]
+            ['annotation', 'runtime-annotation', 'collection', 'platform', 'runtime', 'counter'].each { name ->
+                def module = projectRoot.project(':' + name)
+                def directory = new File(module.buildDir, 'classes/kotlin/wasmWasi/main')
+                def retained = new File(output, 'klibs/' + name)
+                projectRoot.copy { from directory; into retained }
+                compiled[name] = snapshot(retained)
+            }
+            def variants = configuration.incoming.resolutionResult.allComponents.collect { component ->
+                [id: component.id.displayName, variants: component.variants.collect { variant ->
+                    [name: variant.displayName, attributes: variant.attributes.keySet().collectEntries { key -> [(key.name): variant.attributes.getAttribute(key).toString()] }]
+                }]
+            }
+            def report = [dependencies: dependencies, runtimeDependencies: runtimeDependencies, compiler: compiler, compiledKlibs: compiled, variants: variants]
+            new File(output, 'compiled-artifacts.json').text = JsonOutput.prettyPrint(JsonOutput.toJson(report)) + '\n'
+            println(JsonOutput.prettyPrint(JsonOutput.toJson([dependencies: dependencies.collect { it.coordinate }, runtimeDependencies: runtimeDependencies.collect { it.coordinate }, compiler: compiler.collect { it.coordinate }, compiledKlibs: compiled.collectEntries { name, value -> [(name): value.sha256] }])))
+        }
+    }
+}

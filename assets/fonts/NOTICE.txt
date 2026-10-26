@@ -1,0 +1,29 @@
+MingOS builtin font pack revision 1
+
+Asset: NotoSansSC-Regular.otf (unmodified upstream bytes)
+Upstream release tag: Sans2.004
+Upstream commit: 523d033d6cb47f4a80c58a35753646f5c3608a78
+Exact upstream font: https://github.com/notofonts/noto-cjk/blob/523d033d6cb47f4a80c58a35753646f5c3608a78/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf
+Font size: 8331336 bytes
+Font SHA-256: faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9
+
+Embedded copyright (name ID 0):
+© 2014-2021 Adobe (http://www.adobe.com/).
+
+Embedded trademark (name ID 7):
+Noto is a trademark of Google Inc.
+
+Embedded license description (name ID 13):
+This Font Software is licensed under the SIL Open Font License, Version 1.1. This Font Software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software.
+
+Embedded license pointer (name ID 14):
+http://scripts.sil.org/OFL
+
+Accompanying license: SIL Open Font License, Version 1.1 (OFL-1.1).
+Local license: OFL.txt (unchanged copy of upstream LICENSE).
+Exact upstream license: https://github.com/notofonts/noto-cjk/blob/523d033d6cb47f4a80c58a35753646f5c3608a78/LICENSE
+License size: 4301 bytes
+License SHA-256: 6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2
+
+Qualification evidence: font-pack.json; verify with scripts/verify-font-pack.py.
+Scalar coverage is not evidence of shaping, rendering, or memory qualification.

@@ -1,0 +1,11 @@
+abi_version=2.3.0
+builtins_platform=WASM
+compiler_version=2.3.20
+ir_signature_versions=1,2
+jsOutputName=mingos-compose-wasi-official-source-port-platform
+language_features=+AllowAnyAsAnActualTypeForExpectInterface +JsAllowImplementingFunctionInterface +MultiPlatformProjects
+metadata_version=2.3.0
+serializedIrFileFingerprints=2s1q03y7iah5q.2yrlmtlef0lng 2gz2lhj3yczfv.20ln1o9iol3du
+serializedKlibFingerprint=1mmclc8apap4s.3gex9s2yq6cm4
+unique_name=mingos-compose-wasi-official-source-port\:platform
+wasm_targets=wasm-wasi

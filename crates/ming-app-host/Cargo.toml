@@ -1,0 +1,38 @@
+[package]
+name = "ming-app-host"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.99"
+
+[features]
+default = ["engine", "desktop", "text"]
+engine = ["dep:wasmtime"]
+text = ["dep:cosmic-text"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+desktop = ["engine", "dep:winit", "dep:softbuffer"]
+
+[dependencies]
+cosmic-text = { version = "=0.19.0", optional = true, default-features = false, features = ["std", "swash"] }
+bytemuck = { version = "=1.25.2", optional = true }
+wgpu = { version = "=27.0.1", optional = true, default-features = false, features = ["std", "dx12", "vulkan", "wgsl"] }
+pollster = { version = "=0.4.0", optional = true }
+anyhow = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = "0.18"
+getrandom = "0.4"
+winit = { version = "=0.30.13", optional = true, default-features = false, features = ["rwh_06","x11","wayland","wayland-dlopen"] }
+softbuffer = { version = "=0.4.8", optional = true }
+wasmtime = { version = "=50.0.0", default-features = false, features = ["anyhow", "cranelift", "gc", "gc-drc", "runtime", "std"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+wat = "1"
+
+[[example]]
+name = "precompile_system"
+required-features = ["engine", "desktop"]

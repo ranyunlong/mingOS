@@ -1,0 +1,24 @@
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+LABEL org.mingos.task="boot-infra-20261025" org.mingos.purpose="runtime-tools-recovery-no-rust"
+ENV DEBIAN_FRONTEND=noninteractive
+COPY recovery-packages.lock /opt/mingos-boot/locks/requested-packages.lock
+RUN set -eu; \
+    . /etc/os-release; test "$VERSION_ID" = 13; \
+    mkdir -p /opt/mingos-boot/debs /opt/mingos-boot-infra; \
+    cp /etc/apt/sources.list.d/debian.sources /opt/mingos-boot/locks/debian.sources; \
+    apt-get -o APT::Sandbox::User=root update; \
+    xargs apt-get -o APT::Sandbox::User=root --download-only --yes --no-install-recommends install < /opt/mingos-boot/locks/requested-packages.lock; \
+    cp /var/cache/apt/archives/*.deb /opt/mingos-boot/debs/; \
+    cd /opt/mingos-boot/debs; sha256sum ./*.deb > ../locks/download.sha256; \
+    xargs apt-get -o APT::Sandbox::User=root --yes --no-install-recommends install < /opt/mingos-boot/locks/requested-packages.lock > ../locks/apt-install.log 2>&1 \
+      || { tail -n 100 ../locks/apt-install.log; exit 1; }; \
+    gzip -n ../locks/apt-install.log; \
+    dpkg-query -W -f='${binary:Package}\t${Version}\n' > ../locks/installed-packages.tsv; \
+    cp /etc/os-release ../locks/os-release; \
+    qemu-system-x86_64 --version > ../locks/qemu-version.txt; \
+    weston --version > ../locks/weston-version.txt; \
+    ln -s ../mingos-boot/debs /opt/mingos-boot-infra/debs; \
+    ln -s ../mingos-boot/locks/download.sha256 /opt/mingos-boot-infra/download.sha256; \
+    rm -rf /var/lib/apt/lists/*
+USER 65534:65534
+WORKDIR /tmp

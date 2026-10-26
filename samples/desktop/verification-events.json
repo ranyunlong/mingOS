@@ -1,0 +1,123 @@
+[
+  {
+    "afterMs": 0,
+    "action": {
+      "op": "click",
+      "app": 1,
+      "x": 40,
+      "y": 120
+    }
+  },
+  {
+    "afterMs": 300,
+    "action": {
+      "op": "focus",
+      "app": 2
+    }
+  },
+  {
+    "afterMs": 600,
+    "action": {
+      "op": "minimize",
+      "app": 1
+    }
+  },
+  {
+    "afterMs": 900,
+    "action": {
+      "op": "restore",
+      "app": 1
+    }
+  },
+  {
+    "afterMs": 1200,
+    "action": {
+      "op": "maximize",
+      "app": 2
+    }
+  },
+  {
+    "afterMs": 1700,
+    "action": {
+      "op": "restore",
+      "app": 2
+    }
+  },
+  {
+    "afterMs": 2100,
+    "action": {
+      "op": "geometry",
+      "app": 1,
+      "x": 64,
+      "y": 72,
+      "width": 600,
+      "height": 440
+    }
+  },
+  {
+    "afterMs": 2500,
+    "action": {
+      "op": "click",
+      "app": 1,
+      "x": 40,
+      "y": 120
+    }
+  },
+  {
+    "afterMs": 3000,
+    "action": {
+      "op": "terminate",
+      "app": 2
+    }
+  },
+  {
+    "afterMs": 3600,
+    "action": {
+      "op": "launch",
+      "app": 2
+    }
+  },
+  {
+    "afterMs": 4200,
+    "action": {
+      "op": "close",
+      "app": 1
+    }
+  },
+  {
+    "afterMs": 4800,
+    "action": {
+      "op": "launch",
+      "app": 1
+    }
+  },
+  {
+    "afterMs": 5100,
+    "action": {
+      "op": "geometry",
+      "app": 2,
+      "x": 650,
+      "y": 160,
+      "width": 570,
+      "height": 500
+    }
+  },
+  {
+    "afterMs": 5400,
+    "action": {
+      "op": "geometry",
+      "app": 1,
+      "x": 56,
+      "y": 90,
+      "width": 640,
+      "height": 480
+    }
+  },
+  {
+    "afterMs": 5700,
+    "action": {
+      "op": "focus",
+      "app": 2
+    }
+  }
+]

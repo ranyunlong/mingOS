@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "apps": [
+    {
+      "id": 1,
+      "title": "Text Lab",
+      "manifest": "../../artifacts/text-entry-demo/app.json"
+    }
+  ],
+  "autostart": [
+    1
+  ]
+}

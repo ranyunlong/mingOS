@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.ming.shadow-demo",
+  "version": "0.1.0",
+  "sdkVersion": 4,
+  "entry": "main.wasm"
+}

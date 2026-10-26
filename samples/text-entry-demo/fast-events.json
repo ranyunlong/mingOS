@@ -1,0 +1,36 @@
+[
+  {
+    "afterMs": 0,
+    "action": {
+      "op": "click",
+      "app": 1,
+      "x": 40,
+      "y": 80
+    }
+  },
+  {
+    "afterMs": 0,
+    "action": {
+      "op": "text",
+      "app": 1,
+      "text": "甲A"
+    }
+  },
+  {
+    "afterMs": 0,
+    "action": {
+      "op": "click",
+      "app": 1,
+      "x": 40,
+      "y": 128
+    }
+  },
+  {
+    "afterMs": 0,
+    "action": {
+      "op": "text",
+      "app": 1,
+      "text": "乙B"
+    }
+  }
+]
