@@ -917,6 +917,19 @@ mod unix {
 #[test]
 fn actual_filesystem_create_failure_keeps_previous_value() {
     use std::os::unix::fs::PermissionsExt;
+    let has_dac_override = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:\t"))
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        })
+        .is_some_and(|effective| effective & (1 << 1) != 0);
+    if has_dac_override {
+        eprintln!("skipping permission-denial probe: CAP_DAC_OVERRIDE is effective");
+        return;
+    }
     let f = Fixture::new();
     let g = f.grant("readonly", &[1]);
     g.write(1, b"old").unwrap();

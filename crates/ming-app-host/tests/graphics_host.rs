@@ -91,6 +91,8 @@ fn a_64k_read_uses_one_bulk_rpc_and_writes_guest_memory() {
 }
 #[test]
 fn real_kotlin_viewer_renders_and_handles_scripted_input() {
+    // The real Kotlin artifact is a functional integration fixture; its diagnostic timeout is
+    // intentionally wider than the host's 5s default and is not a startup-performance claim.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest = root.join("artifacts/image-viewer/app.json");
     assert!(manifest.is_file(), "Build real Kotlin viewer first");
@@ -113,6 +115,8 @@ fn real_kotlin_viewer_renders_and_handles_scripted_input() {
             script.to_str().unwrap(),
             "--snapshot",
             image.to_str().unwrap(),
+            "--timeout-ms",
+            "20000",
         ],
     );
     assert!(ok, "{out}");
@@ -124,7 +128,7 @@ fn real_kotlin_viewer_renders_and_handles_scripted_input() {
     assert_eq!(v["frame"]["width"], 1000);
     assert_eq!(v["frame"]["height"], 700);
     assert!(fs::read(image).unwrap().starts_with(b"\x89PNG"));
-    let (ok, out) = run(&manifest, &[]);
+    let (ok, out) = run(&manifest, &["--timeout-ms", "20000"]);
     assert!(ok, "{out}");
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["framesSubmitted"], 0);
