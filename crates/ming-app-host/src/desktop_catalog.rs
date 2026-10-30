@@ -37,8 +37,15 @@ struct DiskEntry {
     id: u16,
     title: String,
     manifest: PathBuf,
+    #[serde(default)] identity: Option<DiskIdentity>,
     #[serde(default)] data_key: Option<String>,
     #[serde(default)] slots: Option<Vec<u8>>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiskIdentity {
+    package_id: String,
+    fingerprint: String,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct TrustedAppData { pub data_key: String, pub slots: Vec<u8> }
@@ -53,7 +60,7 @@ pub fn load_catalog(path: &Path) -> Result<Catalog> {
 pub(crate) fn load_catalog_with_data(path: &Path) -> Result<(Catalog, BTreeMap<u16, TrustedAppData>)> {
     let disk: DiskCatalog = serde_json::from_slice(&read_bounded(path, 16384, "DESKTOP_CATALOG")?)
         .context("DESKTOP_CATALOG_INVALID")?;
-    if disk.schema_version != 1
+    if !matches!(disk.schema_version, 1 | 2)
         || disk.apps.is_empty()
         || disk.apps.len() > 4
         || disk.autostart.len() > 4
@@ -104,6 +111,22 @@ pub(crate) fn load_catalog_with_data(path: &Path) -> Result<(Catalog, BTreeMap<u
         if package.manifest.sdk_version < 2 {
             bail!("DESKTOP_GRAPHICAL_PACKAGE_REQUIRED");
         }
+        if disk.schema_version == 2 {
+            #[cfg(not(target_os = "linux"))]
+            bail!("DESKTOP_INSTALL_IDENTITY_UNSUPPORTED");
+            #[cfg(target_os = "linux")]
+            {
+                let identity = app.identity.as_ref().context("DESKTOP_INSTALL_IDENTITY_MISSING")?;
+                if identity.package_id != package.manifest.id {
+                    bail!("DESKTOP_INSTALL_IDENTITY_ID");
+                }
+                if decode_fingerprint(&identity.fingerprint)? != package.storage_fingerprint() {
+                    bail!("DESKTOP_INSTALL_IDENTITY_MISMATCH");
+                }
+            }
+        } else if app.identity.is_some() {
+            bail!("DESKTOP_CATALOG_ENTRY");
+        }
         if let (Some(data_key), Some(slots)) = (app.data_key, app.slots) {
             if package.manifest.sdk_version < 6 { bail!("DESKTOP_DATA_SDK"); }
             bindings.insert(app.id, TrustedAppData { data_key, slots });
@@ -121,6 +144,18 @@ pub(crate) fn load_catalog_with_data(path: &Path) -> Result<(Catalog, BTreeMap<u
         apps,
         autostart: disk.autostart,
     }, bindings))
+}
+#[cfg(target_os = "linux")]
+fn decode_fingerprint(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        bail!("DESKTOP_INSTALL_IDENTITY_FINGERPRINT");
+    }
+    let mut result = [0u8; 32];
+    for (index, byte) in result.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| anyhow::anyhow!("DESKTOP_INSTALL_IDENTITY_FINGERPRINT"))?;
+    }
+    Ok(result)
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
@@ -356,5 +391,55 @@ impl DesktopOptions {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::fmt::Write as _;
+
+    fn hex(value: [u8; 32]) -> String {
+        let mut text = String::with_capacity(64);
+        for byte in value { write!(&mut text, "{byte:02x}").unwrap(); }
+        text
+    }
+
+    #[test]
+    fn catalog_v2_binds_each_entry_to_the_loaded_package_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("app")).unwrap();
+        std::fs::write(dir.path().join("app/main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(
+            dir.path().join("app/app.json"),
+            r#"{"schemaVersion":1,"id":"dev.example.installed","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#,
+        )
+        .unwrap();
+        let catalog = dir.path().join("catalog.json");
+        std::fs::write(
+            &catalog,
+            r#"{"schemaVersion":1,"apps":[{"id":1,"title":"Installed","manifest":"app/app.json"}],"autostart":[]}"#,
+        )
+        .unwrap();
+        let fingerprint = load_catalog(&catalog).unwrap().apps[0].package_fingerprint;
+        std::fs::write(
+            &catalog,
+            format!(
+                r#"{{"schemaVersion":2,"apps":[{{"id":1,"title":"Installed","manifest":"app/app.json","identity":{{"packageId":"dev.example.installed","fingerprint":"{}"}}}}],"autostart":[]}}"#,
+                hex(fingerprint),
+            ),
+        )
+        .unwrap();
+        assert!(load_catalog(&catalog).is_ok());
+        std::fs::write(
+            &catalog,
+            format!(
+                r#"{{"schemaVersion":2,"apps":[{{"id":1,"title":"Installed","manifest":"app/app.json","identity":{{"packageId":"dev.example.installed","fingerprint":"{}"}}}}],"autostart":[]}}"#,
+                "0".repeat(64),
+            ),
+        )
+        .unwrap();
+        let error = load_catalog(&catalog).unwrap_err();
+        assert!(format!("{error:#}").contains("DESKTOP_INSTALL_IDENTITY_MISMATCH"));
     }
 }

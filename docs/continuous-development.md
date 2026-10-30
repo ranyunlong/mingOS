@@ -120,6 +120,8 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 
 2026-10-30 数据根单一 authority：桌面 SDK6 默认私有目录现在通过 `open_default_private` 持有数据根排他锁，同时恢复公共授权策略；同一数据根的第二个桌面/持久 authority 在 worker 启动前拒绝，私有默认访问仍不读取旧私有授权记录。`ming-app-host` lib 220/220、公共存储 4/4 通过；该阶段只解决同一数据根的可信父侧串行化，不等同可信安装身份、多用户隔离、真实物理输入/GPU 或最终 kernel 系统验收。
 
+2026-10-30 catalog 安装身份绑定：新增 catalog schema v2 的每应用 `identity.packageId` 与十六进制 SHA-256 字段，加载时与实际 manifest/Wasm 完全比较，错误 ID 或指纹在创建桌面会话前拒绝；schema v1 保留为开发兼容格式。`ming-app-host` lib 221/221、catalog 集成 4/4 通过。该记录是可信父侧配置契约，不是发布者签名或完整安装器；多用户、更新/卸载生命周期和真实系统安装身份仍待完成。
+
 ## 验证原则
 
 - 软件编译、软件渲染、GPU计算、GPU Surface、Wayland客户端、桌面合成器和系统启动分别记录。
