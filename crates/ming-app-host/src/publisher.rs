@@ -51,7 +51,7 @@ impl PublisherTrustStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         verify_root(root)?;
-        let lock = open_lock(root, false)?;
+        let lock = open_lock(root, true)?;
         let records = load_records(&root.join(KEYRING_NAME), false)?;
         Ok(Self { root: root.to_path_buf(), records, lock })
     }
@@ -68,6 +68,18 @@ impl PublisherTrustStore {
         }
         VerifyingKey::from_bytes(public_key).map_err(|_| anyhow::anyhow!("PUBLISHER_KEY_INVALID"))?;
         records.insert(key_id.to_owned(), PublisherRecord { public_key: *public_key, state: PublisherState::Active });
+        persist_records(root, &records)
+    }
+
+    pub fn revoke(root: impl AsRef<Path>, key_id: &str) -> Result<()> {
+        validate_key_id(key_id)?;
+        let root = root.as_ref();
+        verify_root(root)?;
+        let _lock = open_lock(root, true)?;
+        let path = root.join(KEYRING_NAME);
+        let mut records = load_records(&path, false)?;
+        let record = records.get_mut(key_id).context("PUBLISHER_KEY_UNKNOWN")?;
+        record.state = PublisherState::Revoked;
         persist_records(root, &records)
     }
 
