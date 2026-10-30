@@ -1,10 +1,11 @@
 //! Parent-owned installation records for the Linux desktop.
 //!
-//! This is a local trust anchor supplied by the trusted parent. It binds a package ID to the
-//! exact loaded package bytes and version, but it is not a publisher signature or a replacement
-//! for a future signed distribution format.
+//! This is a local trust anchor supplied by the trusted parent. The development `open()` path
+//! binds a package ID to exact loaded package bytes and version; `open_verified()` additionally
+//! requires a trusted publisher signature.
 
 use crate::{app_data::valid_package_id, package::{Package, load_package}};
+use crate::publisher::PublisherTrustStore;
 use anyhow::{Context, Result, bail};
 use std::{
     collections::BTreeMap,
@@ -48,6 +49,7 @@ pub struct PackageInstallRegistry {
     root: PathBuf,
     records: Mutex<BTreeMap<String, Record>>,
     lock: File,
+    publisher_trust: Option<PublisherTrustStore>,
 }
 
 impl std::fmt::Debug for PackageInstallRegistry {
@@ -61,6 +63,16 @@ impl std::fmt::Debug for PackageInstallRegistry {
 impl PackageInstallRegistry {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
+        Self::open_with_publisher_trust(root, None)
+    }
+
+    pub fn open_verified(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        let publisher_trust = PublisherTrustStore::open(root)?;
+        Self::open_with_publisher_trust(root, Some(publisher_trust))
+    }
+
+    fn open_with_publisher_trust(root: &Path, publisher_trust: Option<PublisherTrustStore>) -> Result<Self> {
         if !root.is_absolute() {
             bail!("INSTALL_ROOT_ABSOLUTE");
         }
@@ -88,10 +100,11 @@ impl PackageInstallRegistry {
             }
         }
         let records = load_records(root.join(RECORD_NAME))?;
-        Ok(Self { root: root.to_path_buf(), records: Mutex::new(records), lock })
+        Ok(Self { root: root.to_path_buf(), records: Mutex::new(records), lock, publisher_trust })
     }
 
     pub fn install_package(&self, package: &Package) -> Result<InstallState> {
+        self.verify_publisher(package)?;
         let id = &package.manifest.id;
         validate_package_record(id, &package.manifest.version)?;
         let candidate = Record {
@@ -116,6 +129,7 @@ impl PackageInstallRegistry {
     /// versioned directory, and then publishes the matching active record atomically.
     pub fn install_from_manifest(&self, manifest_path: &Path) -> Result<InstallState> {
         let package = load_package(manifest_path).context("INSTALL_PACKAGE_LOAD")?;
+        self.verify_publisher(&package)?;
         validate_package_record(&package.manifest.id, &package.manifest.version)?;
         let candidate = Record {
             version: package.manifest.version.clone(),
@@ -160,6 +174,7 @@ impl PackageInstallRegistry {
         {
             bail!("INSTALL_CONTENT_MISMATCH");
         }
+        self.verify_publisher(&package)?;
         Ok(path)
     }
 
@@ -182,6 +197,7 @@ impl PackageInstallRegistry {
     }
 
     pub fn verify_package(&self, package: &Package) -> Result<()> {
+        self.verify_publisher(package)?;
         let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
         let record = records.get(&package.manifest.id).context("INSTALL_NOT_REGISTERED")?;
         if record.state != RecordState::Active {
@@ -191,6 +207,13 @@ impl PackageInstallRegistry {
             || record.fingerprint != package.storage_fingerprint()
         {
             bail!("INSTALL_PACKAGE_MISMATCH");
+        }
+        Ok(())
+    }
+
+    fn verify_publisher(&self, package: &Package) -> Result<()> {
+        if let Some(trust) = &self.publisher_trust {
+            trust.verify_package(package).context("INSTALL_PUBLISHER")?;
         }
         Ok(())
     }

@@ -1,6 +1,8 @@
 #![cfg(target_os = "linux")]
 
-use ming_app_host::{package::{Manifest, Package, load_package}, package_install::{InstallState, PackageInstallRegistry}};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use ed25519_dalek::{Signer, SigningKey};
+use ming_app_host::{package::{Manifest, Package, load_package}, package_install::{InstallState, PackageInstallRegistry}, publisher::PublisherTrustStore};
 use std::{fs, os::unix::fs::PermissionsExt};
 
 fn package(version: &str, bytes: &[u8]) -> Package {
@@ -18,6 +20,14 @@ fn package(version: &str, bytes: &[u8]) -> Package {
         },
         bytes: bytes.to_vec(),
     }
+}
+
+fn signed_package(version: &str, bytes: &[u8], key_id: &str, signing_key: &SigningKey) -> Package {
+    let mut package = package(version, bytes);
+    let signature = signing_key.sign(&package.signature_message(key_id).unwrap());
+    package.manifest.publisher_key_id = Some(key_id.into());
+    package.manifest.publisher_signature = Some(STANDARD.encode(signature.to_bytes()));
+    package
 }
 
 #[test]
@@ -104,4 +114,31 @@ fn install_from_manifest_stores_versioned_content_and_keeps_old_update_content()
     registry.uninstall("dev.example.installed").unwrap();
     assert!(registry.active_manifest_path("dev.example.installed").is_err());
     assert!(first.exists() && second.exists());
+}
+
+#[test]
+fn verified_registry_requires_active_publisher_signature() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let key = SigningKey::from_bytes(&[11; 32]);
+    PublisherTrustStore::provision(temp.path(), "release-2026", key.verifying_key().as_bytes()).unwrap();
+    let registry = PackageInstallRegistry::open_verified(temp.path()).unwrap();
+    let signed = signed_package("1.0.0", b"\0asm\x01\0\0\0", "release-2026", &key);
+    assert_eq!(registry.install_package(&signed).unwrap(), InstallState::Installed);
+    assert!(registry.install_package(&package("1.1.0", b"\0asm\x01\0\0\0\x00")).is_err());
+}
+
+#[test]
+fn verified_registry_rechecks_revocation_after_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let key = SigningKey::from_bytes(&[12; 32]);
+    PublisherTrustStore::provision(temp.path(), "release-2026", key.verifying_key().as_bytes()).unwrap();
+    let signed = signed_package("1.0.0", b"\0asm\x01\0\0\0", "release-2026", &key);
+    let registry = PackageInstallRegistry::open_verified(temp.path()).unwrap();
+    registry.install_package(&signed).unwrap();
+    drop(registry);
+    PublisherTrustStore::revoke(temp.path(), "release-2026").unwrap();
+    let registry = PackageInstallRegistry::open_verified(temp.path()).unwrap();
+    assert!(format!("{:#}", registry.verify_package(&signed).unwrap_err()).contains("PUBLISHER_KEY_REVOKED"));
 }
