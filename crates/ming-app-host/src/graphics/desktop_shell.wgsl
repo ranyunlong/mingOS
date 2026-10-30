@@ -43,6 +43,14 @@ fn dock(x:i32,y:i32) -> u32 {
         let cy=y-i32(p[b+1u]);
         if(cx<0 || cx>=64 || cy<0 || cy>=64) {continue;}
         if(cx>=8 && cx<56 && cy>=6 && cy<36) {color=select(0xfff8f9fbu,FOCUSED,p[b+3u]!=0u);}
+        if(p[b+13u]!=0u && cx>=4 && cx<20 && cy>=4 && cy<20) {
+            color=0xfff8f9fbu;
+            if(ink(85u,cx-6,cy-1)) {color=INK;}
+        }
+        if(p[b+13u]!=0u && cx>=46 && cx<62 && cy>=4 && cy<20) {
+            color=0xfff8f9fbu;
+            if(ink(83u,cx-48,cy-1)) {color=INK;}
+        }
         if(text_at_2x(b+5u,min(p[b+4u],1u),cx-27,cy-14,12) || text_at(b+5u,p[b+4u],cx-8,cy-40,48)) {color=INK;}
         if(cx>=29 && cx<35 && cy>=50 && cy<54) {
             switch p[b+2u] {
@@ -131,7 +139,7 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
                     if(ink(code,tx%6,ty)) {color=INK;}
                 }
             }
-            if(p[878u]!=1u && p[878u]<4u && cx>=dw-100 && cx<dw-20 && cy>=168 && cy<196) {
+            if(p[878u]!=1u && p[878u]<4u && p[878u]!=10u && cx>=dw-100 && cx<dw-20 && cy>=168 && cy<196) {
                 color=BLUE;
                 let allow=array<u32,6>(65u,76u,76u,79u,87u,32u);
                 let revoke=array<u32,6>(82u,69u,86u,79u,75u,69u);
@@ -140,9 +148,15 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
                 let ty=cy-178;
                 if(tx>=0 && tx<36 && ty>=0 && ty<7) {
                     var code=allow[u32(tx/6)];
-                    if(p[878u]==2u) {code=revoke[u32(tx/6)];}
-                    if(p[878u]==3u) {code=retry[u32(tx/6)];}
+                    if(p[878u]==2u || p[878u]==8u) {code=revoke[u32(tx/6)];}
+                    if(p[878u]==3u || p[878u]==7u || p[878u]==9u || p[878u]==11u) {code=retry[u32(tx/6)];}
                     if(ink(code,tx%6,ty)) {color=0xffffffffu;}
+                }
+                if(p[878u]==10u && cx>=dw-100 && cx<dw-20 && cy>=168 && cy<196) {
+                    let uninstall=array<u32,9>(85u,78u,73u,78u,83u,84u,65u,76u,76u);
+                    let tx=cx-(dw-100)-13;
+                    let ty=cy-178;
+                    if(tx>=0 && tx<54 && ty>=0 && ty<7 && ink(uninstall[u32(tx/6)],tx%6,ty)) {color=0xffffffffu;}
                 }
             }
         }

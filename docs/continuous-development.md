@@ -134,6 +134,8 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 
 2026-10-30 公共目录授权管理：新增公共授权代快照和按代撤销，桌面 `S` 管理入口优先显示公共授权并支持持久化失败重试；撤销只使旧公共 session 失效，不删除共享文件，重新授权后数据仍可读。公共授权管理 `5/5`、桌面 Shell `16/16`、`ming-app-host --all-targets -j1` 库 `226/226` 通过；设计见 [公共目录授权管理](superpowers/specs/2026-10-30-public-storage-management.md)，`finalSystemAccepted=false`。
 
+2026-10-30 桌面卸载确认：Dock 为每个应用增加 `U` 卸载入口，保留 `S` 公共目录管理入口；卸载必须经过当前已呈现帧对应的按下/释放，运行中的应用显示 `CLOSE APP FIRST`，普通卸载只撤销安装登记并保留私有数据。登记写入失败时提示 `RETRY`，成功后从当前 desktop catalog、autostart 和待启动队列移除应用；未配置安装登记根时 fail-closed。CPU Shell、原生 Dock 输入、卸载登记移除和私有数据保留回归均通过；固定 Rust 1.99.1 禁网环境下 `cargo test --offline --locked -p ming-app-host --all-targets -j1` 完成，库 `230 passed, 0 failed, 8 ignored`，全部已启用集成目标无失败；GPU feature 的可信 Shell shader 定向测试 `1 passed, 0 failed`。设计见 [桌面卸载确认](superpowers/specs/2026-10-30-desktop-uninstall-confirmation.md)，永久删除私有数据 UI、完整安装交互、多用户和跨平台安装服务仍待完成，`finalSystemAccepted=false`。
+
 ## 验证原则
 
 - 软件编译、软件渲染、GPU计算、GPU Surface、Wayland客户端、桌面合成器和系统启动分别记录。

@@ -123,6 +123,8 @@ enum DesktopStorageDecision {
     Management(crate::storage_consent::StorageManagement),
     PublicManagement(crate::storage_consent::PublicStorageManagement),
     Public(crate::storage_consent::PendingPublicConsent),
+    Uninstall { package_id: String, version: String, fingerprint: String },
+    UninstallBlocked,
     Information,
 }
 impl Instance {
@@ -471,6 +473,45 @@ impl Session {
                 self.launch_pending_autostart()?;
                 return Ok(());
             }
+            DesktopStorageDecision::Uninstall { package_id, version, fingerprint } => {
+                if allow {
+                    let result = self
+                        .options
+                        .install_registry
+                        .as_ref()
+                        .context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?
+                        .uninstall_with_data_policy(&package_id, crate::package_install::UninstallDataPolicy::PreservePrivateData);
+                    match result {
+                        Ok(_) => {
+                            self.catalog.apps.retain(|entry| entry.package_id != package_id);
+                            self.catalog.autostart.retain(|id| self.catalog.apps.iter().any(|entry| entry.id == *id));
+                            self.pending_autostart.retain(|id| self.catalog.apps.iter().any(|entry| entry.id == *id));
+                            self.log(app, 0, 0, "uninstalled", package_id);
+                        }
+                        Err(error) => {
+                            self.log(app, 0, 0, "uninstall_not_saved", format!("{error:#}"));
+                            let prompt = crate::graphics::desktop_shell::StoragePrompt::uninstall(&package_id, &version, &fingerprint, true)?;
+                            self.pending_storage = Some(PendingDesktopStorage {
+                                app,
+                                pending: DesktopStorageDecision::Uninstall { package_id, version, fingerprint },
+                                prompt,
+                                composed: None,
+                                presented: false,
+                            });
+                            self.changed();
+                            return Ok(());
+                        }
+                    }
+                }
+                self.changed();
+                self.launch_pending_autostart()?;
+                return Ok(());
+            }
+            DesktopStorageDecision::UninstallBlocked => {
+                self.changed();
+                self.launch_pending_autostart()?;
+                return Ok(());
+            }
             DesktopStorageDecision::Information => {
                 self.changed();
                 self.launch_pending_autostart()?;
@@ -534,6 +575,34 @@ impl Session {
                 }
             }
             (package, _) => (DesktopStorageDecision::Information, crate::graphics::desktop_shell::StoragePrompt::status(package.as_ref().map(|p| p.manifest.id.as_str()), false)?),
+        };
+        self.pending_storage = Some(PendingDesktopStorage { app, pending, prompt, composed: None, presented: false });
+        self.reset_input()?;
+        self.changed();
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_uninstall(&mut self, app: u16) -> Result<()> {
+        if self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen {
+            bail!("DESKTOP_UNINSTALL_UNAVAILABLE");
+        }
+        let entry = self.catalog.apps.iter().find(|entry| entry.id == app).context("DESKTOP_UNKNOWN_APP")?;
+        let registry = self.options.install_registry.as_ref().context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?;
+        let package = crate::package::load_package(&entry.manifest_path).context("DESKTOP_UNINSTALL_PACKAGE")?;
+        registry.verify_package(&package).context("DESKTOP_UNINSTALL_PACKAGE")?;
+        let (pending, prompt) = if self.instances.iter().any(|instance| instance.app == app) {
+            (DesktopStorageDecision::UninstallBlocked, crate::graphics::desktop_shell::StoragePrompt::uninstall_blocked(&package.manifest.id)?)
+        } else {
+            let mut fingerprint = String::with_capacity(64);
+            for byte in package.storage_fingerprint() { use std::fmt::Write as _; write!(&mut fingerprint, "{byte:02x}").expect("string write"); }
+            (
+                DesktopStorageDecision::Uninstall {
+                    package_id: package.manifest.id.clone(),
+                    version: package.manifest.version.clone(),
+                    fingerprint: fingerprint.clone(),
+                },
+                crate::graphics::desktop_shell::StoragePrompt::uninstall(&package.manifest.id, &package.manifest.version, &fingerprint, false)?,
+            )
         };
         self.pending_storage = Some(PendingDesktopStorage { app, pending, prompt, composed: None, presented: false });
         self.reset_input()?;
@@ -1781,6 +1850,44 @@ mod input_backpressure_tests {
         assert!(session.storage_prompt().is_none());
         authority.authorize_public(&package.manifest.id).unwrap();
         assert_eq!(authority.public_session(&package.manifest.id).unwrap().read_file("shared").unwrap(), b"keep");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_prompt_marks_registry_removed_and_keeps_private_data() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let install = temp.path().join("install");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&install).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&install, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.uninstall","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(crate::app_data::AppDataRoot::open(&data).unwrap()).unwrap());
+        authority.default_private_session_for_package(&package).unwrap().write_file("keep", b"data").unwrap();
+        drop(authority);
+        let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+        registry.install_package(&package).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Uninstall".into(), package_fingerprint: package.storage_fingerprint(), manifest_path: manifest, package_id: package.manifest.id.clone() }], autostart: vec![] };
+        let mut options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.clone().into_os_string()]).unwrap();
+        options.install_registry = Some(registry);
+        options.install_root = Some(install);
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.begin_uninstall(1).unwrap();
+        assert!(session.storage_prompt().unwrap().lines(600).iter().any(|line| line == b"PRIVATE DATA WILL BE KEPT"));
+        assert!(session.respond_storage_prompt(true).is_err());
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.respond_storage_prompt(true).unwrap();
+        assert!(session.storage_prompt().is_none());
+        assert!(session.catalog.apps.is_empty());
+        assert!(session.options.install_registry.as_ref().unwrap().active_manifest_path("dev.example.uninstall").is_err());
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(crate::app_data::AppDataRoot::open(&data).unwrap()).unwrap());
+        assert_eq!(authority.default_private_session_for_package(&package).unwrap().read_file("keep").unwrap(), b"data");
     }
     #[cfg(target_os = "linux")]
     #[test]

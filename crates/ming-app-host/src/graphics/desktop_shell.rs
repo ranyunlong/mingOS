@@ -65,11 +65,25 @@ impl StoragePrompt {
         if !crate::app_data::valid_package_id(id) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
         Ok(Self { id: id.into(), version: String::new(), fingerprint: String::new(), replacement: false, mode: 7 })
     }
+    pub fn uninstall(id: &str, version: &str, fingerprint: &str, retry: bool) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) || version.is_empty() || version.len() > 16_384
+            || !version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            || fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            bail!("DESKTOP_STORAGE_PROMPT_INVALID");
+        }
+        Ok(Self { id: id.into(), version: version.into(), fingerprint: fingerprint.into(), replacement: false, mode: if retry { 11 } else { 10 } })
+    }
+    pub fn uninstall_blocked(id: &str) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
+        Ok(Self { id: id.into(), version: String::new(), fingerprint: String::new(), replacement: true, mode: 12 })
+    }
     pub(super) fn buttons(&self) -> (&'static [u8], Option<&'static [u8]>) {
         match self.mode {
-            1 | 4 | 5 => (b"CLOSE", None),
+            1 | 4 | 5 | 12 => (b"CLOSE", None),
             2 | 8 => (b"CANCEL", Some(b"REVOKE")),
             3 | 7 | 9 => (b"CANCEL", Some(b"RETRY")),
+            10 => (b"CANCEL", Some(b"UNINSTALL")),
+            11 => (b"CANCEL", Some(b"RETRY")),
             _ => (b"DENY", Some(b"ALLOW")),
         }
     }
@@ -90,6 +104,22 @@ impl StoragePrompt {
                 format!("APP ID: {}", self.id).into_bytes(),
                 b"SHARED FILES MAY BE READ AND WRITTEN".to_vec(),
                 if self.mode == 6 { b"USER APPROVAL REQUIRED".to_vec() } else { b"AUTHORIZATION NOT SAVED".to_vec() },
+            ];
+        }
+        if self.mode == 10 || self.mode == 11 {
+            let mut lines = vec![b"UNINSTALL APP".to_vec()];
+            lines.extend(format!("APP ID: {}", self.id).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.extend(format!("VERSION: {}", self.version).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.extend(format!("SHA256: {}", self.fingerprint).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.push(b"PRIVATE DATA WILL BE KEPT".to_vec());
+            if self.mode == 11 { lines.push(b"UNINSTALL NOT SAVED".to_vec()); }
+            return lines;
+        }
+        if self.mode == 12 {
+            return vec![
+                b"UNINSTALL APP".to_vec(),
+                format!("APP ID: {}", self.id).into_bytes(),
+                b"CLOSE APP FIRST".to_vec(),
             ];
         }
         if self.mode >= 4 {
@@ -168,6 +198,13 @@ pub fn dock_storage_cell(width: i32, height: i32, index: usize, count: usize) ->
     let cell = dock_cell(width, height, index, count);
     if cell.width == 0 { return cell; }
     Rect { x: cell.x + 46, y: cell.y + 4, width: 16, height: 16 }
+}
+
+#[cfg(target_os = "linux")]
+pub fn dock_uninstall_cell(width: i32, height: i32, index: usize, count: usize) -> Rect {
+    let cell = dock_cell(width, height, index, count);
+    if cell.width == 0 { return cell; }
+    Rect { x: cell.x + 4, y: cell.y + 4, width: 16, height: 16 }
 }
 
 /// Trusted system control, in the same logical coordinates as the rendered header.
@@ -270,6 +307,16 @@ impl DesktopShell {
                             .any(|w| w.view.app == a.id && w.view.focused && !w.view.minimized);
                         if (8..56).contains(&cx) && (6..36).contains(&cy) {
                             color = if active { FOCUSED } else { TILE };
+                        }
+                        #[cfg(target_os = "linux")]
+                        {
+                            let uninstall = dock_uninstall_cell(root.width as i32, root.height as i32, i, apps.len());
+                            let storage = dock_storage_cell(root.width as i32, root.height as i32, i, apps.len());
+                            if uninstall.contains(x, y) || storage.contains(x, y) {
+                                let (icon, offset) = if uninstall.contains(x, y) { (b"U".as_slice(), 4) } else { (b"S".as_slice(), 46) };
+                                color = TILE;
+                                if text_at_2x(icon, cx - offset, cy - 1, 12) { color = INK; }
+                            }
                         }
                         if text_at_2x(&labels[i][..labels[i].len().min(1)], cx - 27, cy - 14, 12)
                             || text_at(&labels[i], cx - 8, cy - 40, 48)
@@ -460,5 +507,32 @@ mod storage_prompt_tests {
         let retry = StoragePrompt::public_management(id, None, true).unwrap();
         assert!(retry.lines(304).iter().any(|line| line == b"REVOCATION NOT SAVED"));
         assert_eq!(retry.buttons(), (b"CANCEL".as_slice(), Some(b"RETRY".as_slice())));
+    }
+
+    #[test]
+    fn uninstall_prompt_keeps_data_and_has_retry_and_blocked_states() {
+        let id = "dev.example.app";
+        let fingerprint = "f".repeat(64);
+        let prompt = StoragePrompt::uninstall(id, "1.0.0", &fingerprint, false).unwrap();
+        assert!(prompt.lines(304).iter().any(|line| line == b"UNINSTALL APP"));
+        assert!(prompt.lines(304).iter().any(|line| line == b"PRIVATE DATA WILL BE KEPT"));
+        assert_eq!(prompt.buttons(), (b"CANCEL".as_slice(), Some(b"UNINSTALL".as_slice())));
+        let retry = StoragePrompt::uninstall(id, "1.0.0", &fingerprint, true).unwrap();
+        assert!(retry.lines(304).iter().any(|line| line == b"UNINSTALL NOT SAVED"));
+        assert_eq!(retry.buttons(), (b"CANCEL".as_slice(), Some(b"RETRY".as_slice())));
+        let blocked = StoragePrompt::uninstall_blocked(id).unwrap();
+        assert!(blocked.lines(304).iter().any(|line| line == b"CLOSE APP FIRST"));
+        assert_eq!(blocked.buttons(), (b"CLOSE".as_slice(), None));
+    }
+
+    #[test]
+    fn uninstall_and_storage_dock_cells_are_separate_and_bounded() {
+        let uninstall = dock_uninstall_cell(1280, 800, 0, 1);
+        let storage = dock_storage_cell(1280, 800, 0, 1);
+        let cell = dock_cell(1280, 800, 0, 1);
+        assert!(cell.contains(uninstall.x, uninstall.y));
+        assert!(cell.contains(storage.x, storage.y));
+        assert!(!uninstall.contains(storage.x, storage.y));
+        assert!(!storage.contains(uninstall.x, uninstall.y));
     }
 }
