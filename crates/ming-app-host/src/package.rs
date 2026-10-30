@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use std::{
@@ -52,7 +52,7 @@ pub fn read_bounded(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[derive(Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: u32,
@@ -64,6 +64,10 @@ pub struct Manifest {
     pub private_storage: bool,
     #[serde(default)]
     pub public_storage: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_signature: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,6 +91,11 @@ impl Package {
         hash.update(&self.bytes);
         if self.manifest.private_storage { hash.update(b"\0private-storage-required-v1"); }
         if self.manifest.public_storage { hash.update(b"\0public-storage-requested-v1"); }
+        if let Some(key_id) = &self.manifest.publisher_key_id {
+            hash.update(b"\0publisher-key-id-v1");
+            hash.update((key_id.len() as u64).to_be_bytes());
+            hash.update(key_id.as_bytes());
+        }
         hash.finalize().into()
     }
 }

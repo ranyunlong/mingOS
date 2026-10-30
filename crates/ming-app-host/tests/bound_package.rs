@@ -4,7 +4,7 @@ use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
 fn package(version: &str, bytes: &[u8]) -> Package {
     Package {
-        manifest: Manifest { schema_version: 1, id: "dev.example.app".into(), version: version.into(), sdk_version: 6, entry: "main.wasm".into(), private_storage: true, public_storage: false },
+        manifest: Manifest { schema_version: 1, id: "dev.example.app".into(), version: version.into(), sdk_version: 6, entry: "main.wasm".into(), private_storage: true, public_storage: false, publisher_key_id: None, publisher_signature: None },
         bytes: bytes.to_vec(),
     }
 }

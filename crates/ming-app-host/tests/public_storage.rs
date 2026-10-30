@@ -81,6 +81,8 @@ fn package(bytes: &[u8]) -> Package {
             entry: "main.wasm".into(),
             private_storage: false,
             public_storage: true,
+            publisher_key_id: None,
+            publisher_signature: None,
         },
         bytes: bytes.to_vec(),
     }
