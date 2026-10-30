@@ -15,8 +15,10 @@ for(const p of ['ming-sdk/build.gradle.kts','ming-compose/build.gradle.kts','gra
 // Snapshot only actual local Kotlin/Gradle/probe inputs. Rust, AppData worker and unrelated
 // mutable artifacts are deliberately not part of this compilation inventory.
 for(const p of Object.keys(inputs)){const dest=join(out,'input-sources',p);await mkdir(join(dest,'..'),{recursive:true});await writeFile(dest,await readFile(join(root,p)));}
-const java=join(process.env.JAVA_HOME??'C:/Program Files/Android/Android Studio/jbr','bin/java.exe'),tmp=join(probe,'build/java-tmp');await mkdir(tmp,{recursive:true});
-const env={...process.env,GRADLE_USER_HOME:join(root,'.cache/gradle'),JAVA_TOOL_OPTIONS:'-Djdk.net.unixdomain.tmpdir="'+tmp+'"'};
+const javaHome=process.env.JAVA_HOME??(process.platform==='win32'?'C:/Program Files/Android/Android Studio/jbr':null);
+const java=javaHome?join(javaHome,'bin',process.platform==='win32'?'java.exe':'java'):'java',tmp=join(probe,'build/java-tmp');await mkdir(tmp,{recursive:true});
+const env={...process.env,GRADLE_USER_HOME:join(root,'.cache/gradle')};
+if(process.platform==='win32')env.JAVA_TOOL_OPTIONS='-Djdk.net.unixdomain.tmpdir="'+tmp+'"';
 const args=['-classpath',join(root,'gradle/wrapper/gradle-wrapper.jar'),'org.gradle.wrapper.GradleWrapperMain','--offline','--no-daemon','--stacktrace','-PprobeMode='+mode,':compileProductionExecutableKotlinWasmWasi'];
 const r={status:'running',mode,stage,kotlin:'2.3.20',command:java,args,cwd:probe,inputSha256:inputs,startedAt:new Date().toISOString()},stdout=[],stderr=[];
 try {

@@ -27,6 +27,87 @@ pub struct ShellApp {
     pub state: ShellAppState,
 }
 
+#[derive(Clone, Debug)]
+pub struct StoragePrompt { id: String, version: String, fingerprint: String, pub(super) replacement: bool, pub(super) mode: u32 }
+#[derive(Clone, Copy, Debug)]
+pub struct StoragePromptGeometry { pub dialog: Rect, pub deny: Rect, pub allow: Option<Rect> }
+
+impl StoragePrompt {
+    pub fn new(id: &str, version: &str, fingerprint: &str, replacement: bool) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) || version.len() > 16_384 || version.is_empty()
+            || !version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            || fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            bail!("DESKTOP_STORAGE_PROMPT_INVALID");
+        }
+        Ok(Self { id: id.into(), version: version.into(), fingerprint: fingerprint.into(), replacement, mode: u32::from(replacement) })
+    }
+    pub fn management(id: &str, fingerprint: Option<&str>, retry: bool) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) || fingerprint.is_some_and(|value| value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+            bail!("DESKTOP_STORAGE_PROMPT_INVALID");
+        }
+        Ok(Self { id: id.into(), version: String::new(), fingerprint: fingerprint.unwrap_or("LEGACY").into(), replacement: false, mode: if retry { 3 } else { 2 } })
+    }
+    pub fn status(id: Option<&str>, available: bool) -> Result<Self> {
+        if id.is_some_and(|value| !crate::app_data::valid_package_id(value)) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
+        Ok(Self { id: id.unwrap_or("").into(), version: String::new(), fingerprint: String::new(), replacement: true, mode: if available { 4 } else { 5 } })
+    }
+    pub fn public_request(id: &str) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
+        Ok(Self { id: id.into(), version: String::new(), fingerprint: String::new(), replacement: false, mode: 6 })
+    }
+    pub fn public_retry(id: &str) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
+        Ok(Self { id: id.into(), version: String::new(), fingerprint: String::new(), replacement: false, mode: 7 })
+    }
+    pub(super) fn buttons(&self) -> (&'static [u8], Option<&'static [u8]>) {
+        match self.mode {
+            1 | 4 | 5 => (b"CLOSE", None),
+            2 => (b"CANCEL", Some(b"REVOKE")),
+            3 | 7 => (b"CANCEL", Some(b"RETRY")),
+            _ => (b"DENY", Some(b"ALLOW")),
+        }
+    }
+    pub(crate) fn lines(&self, width: i32) -> Vec<Vec<u8>> {
+        let capacity = ((width - 24) / 6) as usize;
+        if self.mode == 6 || self.mode == 7 {
+            return vec![
+                b"PUBLIC STORAGE ACCESS".to_vec(),
+                format!("APP ID: {}", self.id).into_bytes(),
+                b"SHARED FILES MAY BE READ AND WRITTEN".to_vec(),
+                if self.mode == 6 { b"USER APPROVAL REQUIRED".to_vec() } else { b"AUTHORIZATION NOT SAVED".to_vec() },
+            ];
+        }
+        if self.mode >= 4 {
+            let mut lines = vec![b"PRIVATE STORAGE ACCESS".to_vec()];
+            if !self.id.is_empty() { lines.extend(format!("APP ID: {}", self.id).as_bytes().chunks(capacity).map(|part| part.to_vec())); }
+            lines.push(if self.mode == 4 { b"NO AUTHORIZATION".to_vec() } else { b"STORAGE UNAVAILABLE".to_vec() });
+            return lines;
+        }
+        let version = if self.version.len() > 32 { format!("{}...", &self.version[..32]) } else { self.version.clone() };
+        let mut lines = vec![if self.mode >= 2 { b"PRIVATE STORAGE ACCESS".to_vec() } else { b"PRIVATE STORAGE REQUEST".to_vec() }];
+        let mut values = vec![format!("APP ID: {}", self.id)];
+        if self.mode < 2 { values.push(format!("VERSION: {version}")); }
+        values.push(format!("SHA256: {}", self.fingerprint));
+        for value in values {
+            lines.extend(value.as_bytes().chunks(capacity).map(|part| part.to_vec()));
+        }
+        if self.mode >= 2 {
+            lines.push(b"DATA WILL BE KEPT".to_vec());
+            if self.mode == 3 { lines.push(b"REVOCATION NOT SAVED".to_vec()); }
+        } else {
+            lines.push(if self.replacement { b"DIFFERENT PACKAGE: CLOSE".to_vec() } else { b"PUBLISHER NOT VERIFIED".to_vec() });
+        }
+        lines
+    }
+}
+pub fn storage_prompt_geometry(width: i32, height: i32, replacement: bool) -> Option<StoragePromptGeometry> {
+    if !valid_screen(width as usize, height as usize) { return None; }
+    let dialog = Rect { x: (width - (width - 16).min(600)) / 2, y: (height - 208) / 2, width: (width - 16).min(600), height: 208 };
+    let deny = Rect { x: dialog.x + dialog.width - 192, y: dialog.y + 168, width: 80, height: 28 };
+    let allow = (!replacement).then_some(Rect { x: dialog.x + dialog.width - 100, y: dialog.y + 168, width: 80, height: 28 });
+    Some(StoragePromptGeometry { dialog, deny, allow })
+}
+
 pub(super) const BAR: u32 = 0xffe8ebef;
 pub(super) const INK: u32 = 0xff26313f;
 pub(super) const TITLE_BG: u32 = 0xffe2e5e9;
@@ -65,6 +146,13 @@ pub fn dock_cell(width: i32, height: i32, index: usize, count: usize) -> Rect {
         width: 64,
         height: DOCK,
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn dock_storage_cell(width: i32, height: i32, index: usize, count: usize) -> Rect {
+    let cell = dock_cell(width, height, index, count);
+    if cell.width == 0 { return cell; }
+    Rect { x: cell.x + 46, y: cell.y + 4, width: 16, height: 16 }
 }
 
 /// Trusted system control, in the same logical coordinates as the rendered header.
@@ -114,10 +202,19 @@ impl DesktopShell {
         windows: &[ShellWindow],
         apps: &[ShellApp],
     ) -> Result<RenderedFrame> {
+        self.draw_with_storage_prompt(root, windows, apps, None)
+    }
+    pub fn draw_with_storage_prompt(
+        &mut self,
+        root: &RenderedFrame,
+        windows: &[ShellWindow],
+        apps: &[ShellApp],
+        prompt: Option<&StoragePrompt>,
+    ) -> Result<RenderedFrame> {
         validate(root, windows, apps)?;
         #[cfg(feature = "gpu")]
         if let Some(gpu) = &self.gpu {
-            return gpu.draw(root, windows, apps);
+            return gpu.draw(root, windows, apps, prompt);
         }
         let Some(source) = root.cpu_pixels() else {
             bail!("DESKTOP_SHELL_CPU_FRAME_REQUIRED");
@@ -132,6 +229,7 @@ impl DesktopShell {
             .map(|a| ascii_title(&a.title, LABEL_CHARS))
             .collect();
         let mut pixels = Vec::with_capacity(source.len());
+        let overlay = prompt.map(|prompt| (storage_prompt_geometry(root.width as i32, root.height as i32, prompt.replacement).expect("validated viewport"), prompt.lines((root.width as i32 - 16).min(600)), prompt.buttons()));
         // Independent scalar oracle: choose an outer first; never paint a
         // lower title through the selected window's preserved root content.
         for y in 0..root.height as i32 {
@@ -203,6 +301,21 @@ impl DesktopShell {
                         };
                         if text_at(label, cx - 12, cy - TITLE - 16, w.view.outer.width - 24) {
                             color = INK;
+                        }
+                    }
+                }
+                if let Some((geometry, lines, buttons)) = &overlay {
+                    let r = geometry.dialog;
+                    if r.contains(x, y) {
+                        color = if x == r.x || y == r.y || x == r.x + r.width - 1 || y == r.y + r.height - 1 { LINE } else { 0xfffafbfc };
+                        for (i, line) in lines.iter().enumerate() {
+                            if text_at(line, x - r.x - 12, y - r.y - 12 - i as i32 * 14, r.width - 24) { color = INK; }
+                        }
+                        if geometry.deny.contains(x, y) {
+                            color = if text_at(buttons.0, x - geometry.deny.x - 22, y - geometry.deny.y - 10, 60) { INK } else { 0xffe2e5e9 };
+                        }
+                        if let Some(allow) = geometry.allow && allow.contains(x, y) {
+                            color = if text_at(buttons.1.unwrap_or_default(), x - allow.x - 22, y - allow.y - 10, 60) { 0xffffffff } else { BLUE };
                         }
                     }
                 }
@@ -284,4 +397,40 @@ fn text_at(text: &[u8], x: i32, y: i32, width: i32) -> bool {
 // logical pixels; reject negatives before division truncates to zero.
 fn text_at_2x(text: &[u8], x: i32, y: i32, width: i32) -> bool {
     x >= 0 && y >= 0 && text_at(text, x / 2, y / 2, width / 2)
+}
+
+#[cfg(test)]
+mod storage_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn minimum_dialog_fits_maximum_identity_and_full_fingerprint() {
+        let id = format!("a.{}", "a".repeat(126));
+        let fingerprint = "f".repeat(64);
+        let prompt = StoragePrompt::new(&id, &"1".repeat(100), &fingerprint, false).unwrap();
+        let lines = prompt.lines(304);
+        assert!(lines.len() <= 8);
+        assert!(lines.iter().all(|line| line.len() <= 46));
+        let joined = lines.concat();
+        assert!(joined.windows(id.len()).any(|window| window == id.as_bytes()));
+        assert!(joined.windows(fingerprint.len()).any(|window| window == fingerprint.as_bytes()));
+        assert!(lines.last().unwrap() == b"PUBLISHER NOT VERIFIED");
+    }
+
+    #[test]
+    fn management_prompt_shows_full_record_and_retained_data() {
+        let id = format!("a.{}", "a".repeat(126));
+        let fingerprint = "f".repeat(64);
+        let prompt = StoragePrompt::management(&id, Some(&fingerprint), false).unwrap();
+        let lines = prompt.lines(304);
+        assert!(lines.len() <= 8);
+        let joined = lines.concat();
+        assert!(joined.windows(id.len()).any(|value| value == id.as_bytes()));
+        assert!(joined.windows(fingerprint.len()).any(|value| value == fingerprint.as_bytes()));
+        assert!(lines.iter().any(|line| line == b"DATA WILL BE KEPT"));
+        assert_eq!(prompt.buttons(), (b"CANCEL".as_slice(), Some(b"REVOKE".as_slice())));
+        let retry = StoragePrompt::management(&id, None, true).unwrap();
+        assert!(retry.lines(304).iter().any(|line| line == b"REVOCATION NOT SAVED"));
+        assert_eq!(retry.buttons(), (b"CANCEL".as_slice(), Some(b"RETRY".as_slice())));
+    }
 }

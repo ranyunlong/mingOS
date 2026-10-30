@@ -5,19 +5,29 @@
 //! races and ACL verification require a separate production implementation. No worker should
 //! receive this grant or the root path. Revoke is linearized with I/O across all clones.
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     ops::Range,
     path::Path,
     sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 pub const MAX_SLOT_BYTES: usize = 65_536;
 pub const MAX_SLOTS: usize = 8;
 pub const MAX_TOTAL_BYTES: usize = MAX_SLOTS * MAX_SLOT_BYTES;
+#[cfg(target_os = "linux")]
+pub const MAX_PRIVATE_FILE_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+pub const MAX_PRIVATE_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_PRIVATE_ENTRIES: usize = 1024;
+const MAX_PRIVATE_PATH_BYTES: usize = 1024;
+const MAX_PRIVATE_COMPONENT_BYTES: usize = 255;
+const MAX_PRIVATE_PATH_DEPTH: usize = 16;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,11 +67,36 @@ fn io_error(error: std::io::Error) -> AppDataError {
 }
 type Result<T> = std::result::Result<T, AppDataError>;
 
+/// Validates guest paths before any component-wise, no-follow filesystem traversal.
+pub(crate) fn validate_private_path(path: &str) -> Result<Vec<&str>> {
+    if path.len() > MAX_PRIVATE_PATH_BYTES || path.contains(['\0', '\\']) {
+        return Err(AppDataError::InvalidArgument);
+    }
+    let components: Vec<_> = path.split('/').collect();
+    if components.len() > MAX_PRIVATE_PATH_DEPTH || components.iter().any(|component| {
+        component.is_empty()
+            || *component == "."
+            || *component == ".."
+            || component.len() > MAX_PRIVATE_COMPONENT_BYTES
+            || component.starts_with(".ming-data-")
+    }) {
+        return Err(AppDataError::InvalidArgument);
+    }
+    Ok(components)
+}
+
 /// A committed write. False means directory durability was not confirmed; the value is committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppDataWrite {
     pub length: usize,
     pub directory_synced: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateFileEntry {
+    pub name: String,
+    pub is_directory: bool,
 }
 
 /// Parent-held root capability. Linux reopens generations relative to the retained directory fd.
@@ -74,7 +109,19 @@ impl AppDataRoot {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> { Ok(Self { root: Arc::new(platform::Root::open(root.as_ref())?) }) }
     pub fn grant(&self, data_key: &str, slots: &[u8]) -> Result<AppDataGrant> {
         let mask = grant_slots(data_key, slots)?;
-        let directory = platform::Directory::open(&self.root, &key_directory_name(data_key))?;
+        self.grant_directory(&key_directory_name(data_key), mask)
+    }
+    /// The trusted parent must check user authorization and pass the installed package identity.
+    /// A guest-provided identity is never authority to create a grant.
+    pub fn grant_package(&self, package_id: &str, slots: &[u8]) -> Result<AppDataGrant> {
+        if !valid_package_id(package_id) {
+            return Err(AppDataError::InvalidArgument);
+        }
+        let mask = grant_slots("package", slots)?;
+        self.grant_directory(&package_directory_name(package_id), mask)
+    }
+    fn grant_directory(&self, name: &str, mask: u8) -> Result<AppDataGrant> {
+        let directory = platform::Directory::open(&self.root, name)?;
         Ok(AppDataGrant {
             shared: Arc::new(Mutex::new(State {
                 directory,
@@ -88,6 +135,712 @@ impl AppDataRoot {
                 change_read: None,
             })),
         })
+    }
+}
+/// Matches the package manifest identity contract.
+pub fn valid_package_id(id: &str) -> bool {
+    id.len() <= 128
+        && id.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && id.contains(['.', '-'])
+        && id.split(['.', '-']).all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+/// Authorization coordinator owned by the trusted parent. Decisions must come from trusted user
+/// interaction. Persistent mode is available on Linux and must be the sole authority for its root.
+pub struct PackageStorageAuthority {
+    root: AppDataRoot,
+    authorized: Mutex<BTreeMap<String, PackageAuthorization>>,
+    #[cfg(target_os = "linux")]
+    private: Mutex<BTreeMap<String, PackageAuthorization>>,
+    public_authorized: Mutex<BTreeMap<String, PackageAuthorization>>,
+    policy: Option<PersistentPolicy>,
+    public_policy: Option<PersistentPolicy>,
+    #[cfg(target_os = "linux")]
+    _private_only_lock: Option<PersistentPolicy>,
+}
+struct PackageAuthorization {
+    fingerprint: Option<[u8; 32]>,
+    grants: Vec<Weak<Mutex<State>>>,
+    generation: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    sessions: Vec<Weak<Mutex<bool>>>,
+}
+#[cfg(target_os = "linux")]
+pub(crate) struct AuthorizationSnapshot {
+    pub(crate) fingerprint: Option<[u8; 32]>,
+    generation: Arc<AtomicBool>,
+}
+#[cfg(target_os = "linux")]
+impl AuthorizationSnapshot {
+    pub(crate) fn revocation_pending(&self) -> bool { !self.generation.load(Ordering::Acquire) }
+}
+impl Default for PackageAuthorization {
+    fn default() -> Self {
+        Self {
+            fingerprint: None,
+            grants: Vec::new(),
+            generation: Arc::new(AtomicBool::new(true)),
+            #[cfg(target_os = "linux")]
+            sessions: Vec::new(),
+        }
+    }
+}
+struct PersistentPolicy { store: AppDataGrant, _lock: File }
+#[cfg(target_os = "linux")]
+impl Drop for PersistentPolicy {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // A forked child can retain the open file description until exec, even with CLOEXEC.
+        // Unlock explicitly after PackageStorageAuthority has revoked its active grants.
+        unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN); }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizationReceipt {
+    pub persisted: bool,
+    pub directory_synced: bool,
+}
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackageBinding { Missing, Matched, Conflict }
+const POLICY_HEADER: &str = "ming-private-storage-policy-v1\n";
+const POLICY_HEADER_V2: &str = "ming-private-storage-policy-v2\n";
+const PUBLIC_POLICY_HEADER: &str = "ming-public-storage-policy-v1\n";
+impl PackageStorageAuthority {
+    pub fn new(root: AppDataRoot) -> Self {
+        Self { root, authorized: Mutex::new(BTreeMap::new()), #[cfg(target_os = "linux")] private: Mutex::new(BTreeMap::new()), public_authorized: Mutex::new(BTreeMap::new()), policy: None, public_policy: None, #[cfg(target_os = "linux")] _private_only_lock: None }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_default_private(root: AppDataRoot) -> Result<Self> {
+        let store = root.grant_directory("system-private-storage-policy-v1", 1)?;
+        let lock = store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.lock_policy()?;
+        Ok(Self { root, authorized: Mutex::new(BTreeMap::new()), private: Mutex::new(BTreeMap::new()), public_authorized: Mutex::new(BTreeMap::new()), policy: None, public_policy: None, _private_only_lock: Some(PersistentPolicy { store, _lock: lock }) })
+    }
+    /// The caller must ensure that only this trusted coordinator issues package grants.
+    #[cfg(target_os = "linux")]
+    pub fn open_persistent(root: AppDataRoot) -> Result<Self> {
+        let store = root.grant_directory("system-private-storage-policy-v1", 1)?;
+        let lock = store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.lock_policy()?;
+        let public_store = root.grant_directory("system-public-storage-policy-v1", 1)?;
+        let public_lock = public_store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.lock_policy()?;
+        let bytes = match store.read(1, 0, MAX_SLOT_BYTES as i32) {
+            Ok(bytes) => bytes,
+            Err(AppDataError::NotFound) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let mut authorized = BTreeMap::new();
+        if !bytes.is_empty() {
+            let text = std::str::from_utf8(&bytes).map_err(|_| AppDataError::Io)?;
+            let (lines, v2) = if let Some(lines) = text.strip_prefix(POLICY_HEADER_V2) {
+                (lines, true)
+            } else { (text.strip_prefix(POLICY_HEADER).ok_or(AppDataError::Io)?, false) };
+            if !lines.is_empty() && !lines.ends_with('\n') { return Err(AppDataError::Io); }
+            let mut previous: Option<&str> = None;
+            for line in lines.lines() {
+                let (id, fingerprint) = if v2 {
+                    let (id, value) = line.split_once('\t').ok_or(AppDataError::Io)?;
+                    let fingerprint = if value == "-" { None } else {
+                        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err(AppDataError::Io); }
+                        let mut result = [0u8; 32];
+                        for (index, item) in result.iter_mut().enumerate() {
+                            *item = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| AppDataError::Io)?;
+                        }
+                        Some(result)
+                    };
+                    (id, fingerprint)
+                } else { (line, None) };
+                if !valid_package_id(id) || previous.is_some_and(|value| value >= id) {
+                    return Err(AppDataError::Io);
+                }
+                authorized.insert(id.to_owned(), PackageAuthorization { fingerprint, ..Default::default() });
+                previous = Some(id);
+            }
+        } else if store.size(1).is_ok() {
+            return Err(AppDataError::Io);
+        }
+        let public_bytes = match public_store.read(1, 0, MAX_SLOT_BYTES as i32) {
+            Ok(bytes) => bytes,
+            Err(AppDataError::NotFound) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let mut public_authorized = BTreeMap::new();
+        if !public_bytes.is_empty() {
+            let text = std::str::from_utf8(&public_bytes).map_err(|_| AppDataError::Io)?;
+            let lines = text.strip_prefix(PUBLIC_POLICY_HEADER).ok_or(AppDataError::Io)?;
+            if !lines.is_empty() && !lines.ends_with('\n') { return Err(AppDataError::Io); }
+            let mut previous: Option<&str> = None;
+            for id in lines.lines() {
+                if !valid_package_id(id) || previous.is_some_and(|value| value >= id) { return Err(AppDataError::Io); }
+                public_authorized.insert(id.to_owned(), PackageAuthorization::default());
+                previous = Some(id);
+            }
+        } else if public_store.size(1).is_ok() {
+            return Err(AppDataError::Io);
+        }
+        Ok(Self { root, authorized: Mutex::new(authorized), private: Mutex::new(BTreeMap::new()), public_authorized: Mutex::new(public_authorized), policy: Some(PersistentPolicy { store, _lock: lock }), public_policy: Some(PersistentPolicy { store: public_store, _lock: public_lock }), _private_only_lock: None })
+    }
+    fn persist(&self, authorized: &BTreeMap<String, PackageAuthorization>) -> Result<AuthorizationReceipt> {
+        let Some(policy) = &self.policy else {
+            return Ok(AuthorizationReceipt { persisted: false, directory_synced: false });
+        };
+        let v2 = authorized.values().any(|entry| entry.generation.load(Ordering::Acquire) && entry.fingerprint.is_some());
+        let mut text = String::from(if v2 { POLICY_HEADER_V2 } else { POLICY_HEADER });
+        for (id, entry) in authorized {
+            if !entry.generation.load(Ordering::Acquire) { continue; }
+            text.push_str(id);
+            if v2 {
+                use std::fmt::Write as _;
+                text.push('\t');
+                if let Some(fingerprint) = entry.fingerprint {
+                    for byte in fingerprint { write!(&mut text, "{byte:02x}").map_err(|_| AppDataError::Io)?; }
+                } else { text.push('-'); }
+            }
+            text.push('\n');
+            if text.len() > MAX_SLOT_BYTES { return Err(AppDataError::Io); }
+        }
+        let receipt = policy.store.write(1, text.as_bytes())?;
+        Ok(AuthorizationReceipt { persisted: true, directory_synced: receipt.directory_synced })
+    }
+    fn persist_public(&self, authorized: &BTreeMap<String, PackageAuthorization>) -> Result<AuthorizationReceipt> {
+        let Some(policy) = &self.public_policy else {
+            return Ok(AuthorizationReceipt { persisted: false, directory_synced: false });
+        };
+        let mut text = String::from(PUBLIC_POLICY_HEADER);
+        for (id, entry) in authorized {
+            if !entry.generation.load(Ordering::Acquire) { continue; }
+            text.push_str(id);
+            text.push('\n');
+            if text.len() > MAX_SLOT_BYTES { return Err(AppDataError::Io); }
+        }
+        let receipt = policy.store.write(1, text.as_bytes())?;
+        Ok(AuthorizationReceipt { persisted: true, directory_synced: receipt.directory_synced })
+    }
+    /// Called by the trusted parent after the user has approved this installed identity.
+    pub fn authorize(&self, package_id: &str) -> Result<AuthorizationReceipt> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if authorized.get(package_id).is_some_and(|entry| entry.fingerprint.is_some() || !entry.generation.load(Ordering::Acquire)) { return Err(AppDataError::Denied); }
+        let inserted = !authorized.contains_key(package_id);
+        authorized.entry(package_id.to_owned()).or_default();
+        match self.persist(&authorized) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                if inserted { authorized.remove(package_id); }
+                Err(error)
+            }
+        }
+    }
+    /// Grants access to the shared public directory. This is independent from private storage.
+    pub fn authorize_public(&self, package_id: &str) -> Result<AuthorizationReceipt> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if authorized.get(package_id).is_some_and(|entry| !entry.generation.load(Ordering::Acquire)) {
+            return Err(AppDataError::Denied);
+        }
+        let inserted = !authorized.contains_key(package_id);
+        authorized.entry(package_id.to_owned()).or_default();
+        match self.persist_public(&authorized) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => { if inserted { authorized.remove(package_id); } Err(error) }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn authorize_bound(&self, package_id: &str, fingerprint: [u8; 32]) -> Result<AuthorizationReceipt> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if let Some(entry) = authorized.get(package_id) {
+            if !entry.generation.load(Ordering::Acquire) || entry.fingerprint != Some(fingerprint) { return Err(AppDataError::Denied); }
+            return self.persist(&authorized);
+        }
+        authorized.insert(package_id.to_owned(), PackageAuthorization { fingerprint: Some(fingerprint), ..Default::default() });
+        match self.persist(&authorized) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => { authorized.remove(package_id); Err(error) }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn binding_status(&self, package_id: &str, fingerprint: [u8; 32]) -> Result<PackageBinding> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        Ok(match authorized.get(package_id) {
+            None => PackageBinding::Missing,
+            Some(entry) if entry.generation.load(Ordering::Acquire) && entry.fingerprint == Some(fingerprint) => PackageBinding::Matched,
+            Some(_) => PackageBinding::Conflict,
+        })
+    }
+    pub fn grant(&self, package_id: &str, slots: &[u8]) -> Result<AppDataGrant> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        let entry = authorized.get_mut(package_id).ok_or(AppDataError::Denied)?;
+        if !entry.generation.load(Ordering::Acquire) || entry.fingerprint.is_some() { return Err(AppDataError::Denied); }
+        let grants = &mut entry.grants;
+        grants.retain(|grant| grant.strong_count() != 0);
+        if grants.len() >= 64 { return Err(AppDataError::Io); }
+        let grant = self.root.grant_package(package_id, slots)?;
+        grants.push(Arc::downgrade(&grant.shared));
+        Ok(grant)
+    }
+    /// Creates a parent-owned capability bound to an already authorized package identity.
+    #[cfg(target_os = "linux")]
+    pub fn file_session(self: &Arc<Self>, package_id: &str) -> Result<PrivateFileSession> {
+        self.file_session_checked(package_id, None)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn file_session_bound(self: &Arc<Self>, package_id: &str, fingerprint: [u8; 32]) -> Result<PrivateFileSession> {
+        self.file_session_checked(package_id, Some(fingerprint))
+    }
+    /// Creates the application's private capability without a user permission decision.
+    /// The package must be selected by the trusted parent; package ID is not an installer identity.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn default_private_session(self: &Arc<Self>, package_id: &str, fingerprint: [u8; 32]) -> Result<PrivateFileSession> {
+        if !valid_package_id(package_id) { return Err(AppDataError::Denied); }
+        let mut private = self.private.lock().map_err(|_| AppDataError::Denied)?;
+        let entry = private.entry(package_id.to_owned()).or_default();
+        entry.sessions.retain(|session| session.strong_count() != 0);
+        if entry.sessions.len() >= 64 { return Err(AppDataError::Io); }
+        let active = Arc::new(Mutex::new(true));
+        entry.sessions.push(Arc::downgrade(&active));
+        Ok(PrivateFileSession { authority: self.clone(), package_id: package_id.to_owned(), generation: entry.generation.clone(), fingerprint: Some(fingerprint), active })
+    }
+    /// Creates a parent-owned capability for the shared public directory.
+    #[cfg(target_os = "linux")]
+    pub fn public_session(self: &Arc<Self>, package_id: &str) -> Result<PublicFileSession> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        let entry = authorized.get_mut(package_id).ok_or(AppDataError::Denied)?;
+        if !entry.generation.load(Ordering::Acquire) { return Err(AppDataError::Denied); }
+        entry.sessions.retain(|session| session.strong_count() != 0);
+        if entry.sessions.len() >= 64 { return Err(AppDataError::Io); }
+        let active = Arc::new(Mutex::new(true));
+        entry.sessions.push(Arc::downgrade(&active));
+        Ok(PublicFileSession { authority: self.clone(), package_id: package_id.to_owned(), generation: entry.generation.clone(), active })
+    }
+    #[cfg(target_os = "linux")]
+    fn file_session_checked(self: &Arc<Self>, package_id: &str, fingerprint: Option<[u8; 32]>) -> Result<PrivateFileSession> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        let entry = authorized.get_mut(package_id).ok_or(AppDataError::Denied)?;
+        if !entry.generation.load(Ordering::Acquire) || entry.fingerprint != fingerprint { return Err(AppDataError::Denied); }
+        entry.sessions.retain(|session| session.strong_count() != 0);
+        if entry.sessions.len() >= 64 { return Err(AppDataError::Io); }
+        let active = Arc::new(Mutex::new(true));
+        entry.sessions.push(Arc::downgrade(&active));
+        Ok(PrivateFileSession { authority: self.clone(), package_id: package_id.to_owned(), generation: entry.generation.clone(), fingerprint, active })
+    }
+    /// These parent-only methods require a trusted installed identity, never a guest-supplied ID.
+    /// All operations share the authority lock so quota checks and revocation are serialized.
+    #[cfg(target_os = "linux")]
+    fn with_files<T>(&self, package_id: &str, generation: Option<&AtomicBool>, operation: impl FnOnce(&platform::Directory) -> Result<T>) -> Result<T> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        let private = self.private.lock().map_err(|_| AppDataError::Denied)?;
+        let active = |entry: &PackageAuthorization| entry.generation.load(Ordering::Acquire)
+            && generation.is_none_or(|g| std::ptr::eq(entry.generation.as_ref(), g));
+        if !authorized.get(package_id).is_some_and(active)
+            && !(generation.is_some() && private.get(package_id).is_some_and(active)) { return Err(AppDataError::Denied); }
+        let package = platform::Directory::open(&self.root.root, &package_directory_name(package_id))?;
+        let files = package.child("files", true)?;
+        operation(&files)
+    }
+    #[cfg(target_os = "linux")]
+    pub fn create_file_directory(&self, package_id: &str, path: &str) -> Result<bool> {
+        self.create_file_directory_checked(package_id, path, None)
+    }
+    #[cfg(target_os = "linux")]
+    fn create_file_directory_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<bool> {
+        self.with_files(package_id, generation, |files| {
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            let (_, entries) = files.usage()?;
+            if entries >= MAX_PRIVATE_ENTRIES { return Err(AppDataError::Io); }
+            parent.child(name, true)?;
+            Ok(parent.sync())
+        })
+    }
+    /// An empty path lists the app's private root; all other paths are relative directories.
+    #[cfg(target_os = "linux")]
+    pub fn list_file_directory(&self, package_id: &str, path: &str) -> Result<Vec<PrivateFileEntry>> {
+        self.list_file_directory_checked(package_id, path, None)
+    }
+    #[cfg(target_os = "linux")]
+    fn list_file_directory_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<Vec<PrivateFileEntry>> {
+        self.with_files(package_id, generation, |files| {
+            if path.is_empty() { return files.list(); }
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            parent.child(name, false)?.list()
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub fn delete_file_directory(&self, package_id: &str, path: &str) -> Result<bool> {
+        self.delete_file_directory_checked(package_id, path, None)
+    }
+    #[cfg(target_os = "linux")]
+    fn delete_file_directory_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<bool> {
+        self.with_files(package_id, generation, |files| {
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            parent.remove_directory(name)?;
+            Ok(parent.sync())
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub fn read_file(&self, package_id: &str, path: &str) -> Result<Vec<u8>> {
+        self.read_file_checked(package_id, path, None)
+    }
+    #[cfg(target_os = "linux")]
+    fn read_file_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<Vec<u8>> {
+        self.with_files(package_id, generation, |files| {
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            let mut file = parent.read_private_file(name)?;
+            let before = platform::stamp_private(&file)?;
+            let mut bytes = vec![0; before.length() as usize];
+            file.read_exact(&mut bytes).map_err(io_error)?;
+            file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+            let mut verify = vec![0; bytes.len()];
+            file.read_exact(&mut verify).map_err(io_error)?;
+            if bytes != verify { return Err(AppDataError::Io); }
+            parent.unchanged_private(name, &file, &before)?;
+            Ok(bytes)
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub fn write_file(&self, package_id: &str, path: &str, bytes: &[u8]) -> Result<AppDataWrite> {
+        self.write_file_checked(package_id, path, bytes, None)
+    }
+    #[cfg(target_os = "linux")]
+    fn write_file_checked(&self, package_id: &str, path: &str, bytes: &[u8], generation: Option<&AtomicBool>) -> Result<AppDataWrite> {
+        self.with_files(package_id, generation, |files| {
+            if bytes.len() > MAX_PRIVATE_FILE_BYTES { return Err(AppDataError::InvalidArgument); }
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            let previous = match parent.read_private_file(name) {
+                Ok(file) => Some(platform::stamp_private(&file)?.length() as usize),
+                Err(AppDataError::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+            let (used, entries) = files.usage()?;
+            if used.saturating_sub(previous.unwrap_or(0)).saturating_add(bytes.len()) > MAX_PRIVATE_TOTAL_BYTES
+                || (previous.is_none() && entries >= MAX_PRIVATE_ENTRIES) { return Err(AppDataError::Io); }
+            let (temporary, mut file) = parent.new_temp()?;
+            let result = (|| {
+                file.write_all(bytes).map_err(io_error)?;
+                file.sync_all().map_err(io_error)?;
+                parent.check_private_target(name)?;
+                parent.replace(&temporary, name)
+            })();
+            drop(file);
+            if let Err(error) = result { parent.remove_temp(&temporary); return Err(error); }
+            Ok(AppDataWrite { length: bytes.len(), directory_synced: parent.sync() })
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub fn delete_file(&self, package_id: &str, path: &str) -> Result<bool> {
+        self.delete_file_checked(package_id, path, None)
+    }
+    #[cfg(target_os = "linux")]
+    fn delete_file_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<bool> {
+        self.with_files(package_id, generation, |files| {
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            let file = parent.read_private_file(name)?;
+            let before = platform::stamp_private(&file)?;
+            parent.unchanged_private(name, &file, &before)?;
+            parent.delete(name)?;
+            Ok(parent.sync())
+        })
+    }
+    /// Atomically moves a regular file without replacing an existing destination.
+    /// The returned flag reports whether both affected directories were synced.
+    #[cfg(target_os = "linux")]
+    pub fn rename_file(&self, package_id: &str, from: &str, to: &str) -> Result<bool> {
+        self.rename_file_checked(package_id, from, to, None)
+    }
+    #[cfg(target_os = "linux")]
+    fn with_public_files<T>(&self, package_id: &str, generation: Option<&AtomicBool>, operation: impl FnOnce(&platform::Directory) -> Result<T>) -> Result<T> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        let active = |entry: &PackageAuthorization| entry.generation.load(Ordering::Acquire)
+            && generation.is_none_or(|g| std::ptr::eq(entry.generation.as_ref(), g));
+        if !authorized.get(package_id).is_some_and(active) { return Err(AppDataError::Denied); }
+        let files = platform::Directory::open(&self.root.root, public_directory_name())?;
+        operation(&files)
+    }
+    #[cfg(target_os = "linux")]
+    fn public_create_directory_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<bool> {
+        self.with_public_files(package_id, generation, |files| {
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            let (_, entries) = files.usage()?;
+            if entries >= MAX_PRIVATE_ENTRIES { return Err(AppDataError::Io); }
+            parent.child(name, true)?;
+            Ok(parent.sync())
+        })
+    }
+    #[cfg(target_os = "linux")]
+    fn public_list_directory_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<Vec<PrivateFileEntry>> {
+        self.with_public_files(package_id, generation, |files| {
+            if path.is_empty() { return files.list(); }
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            parent.child(name, false)?.list()
+        })
+    }
+    #[cfg(target_os = "linux")]
+    fn public_delete_directory_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<bool> {
+        self.with_public_files(package_id, generation, |files| {
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            parent.remove_directory(name)?;
+            Ok(parent.sync())
+        })
+    }
+    #[cfg(target_os = "linux")]
+    fn public_read_file_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<Vec<u8>> {
+        self.with_public_files(package_id, generation, |files| {
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            let mut file = parent.read_private_file(name)?;
+            let before = platform::stamp_private(&file)?;
+            let mut bytes = vec![0; before.length() as usize];
+            file.read_exact(&mut bytes).map_err(io_error)?;
+            file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+            let mut verify = vec![0; bytes.len()];
+            file.read_exact(&mut verify).map_err(io_error)?;
+            if bytes != verify { return Err(AppDataError::Io); }
+            parent.unchanged_private(name, &file, &before)?;
+            Ok(bytes)
+        })
+    }
+    #[cfg(target_os = "linux")]
+    fn public_write_file_checked(&self, package_id: &str, path: &str, bytes: &[u8], generation: Option<&AtomicBool>) -> Result<AppDataWrite> {
+        self.with_public_files(package_id, generation, |files| {
+            if bytes.len() > MAX_PRIVATE_FILE_BYTES { return Err(AppDataError::InvalidArgument); }
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            let previous = match parent.read_private_file(name) {
+                Ok(file) => Some(platform::stamp_private(&file)?.length() as usize),
+                Err(AppDataError::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+            let (used, entries) = files.usage()?;
+            if used.saturating_sub(previous.unwrap_or(0)).saturating_add(bytes.len()) > MAX_PRIVATE_TOTAL_BYTES
+                || (previous.is_none() && entries >= MAX_PRIVATE_ENTRIES) { return Err(AppDataError::Io); }
+            let (temporary, mut file) = parent.new_temp()?;
+            let result = (|| {
+                file.write_all(bytes).map_err(io_error)?;
+                file.sync_all().map_err(io_error)?;
+                parent.check_private_target(name)?;
+                parent.replace(&temporary, name)
+            })();
+            drop(file);
+            if let Err(error) = result { parent.remove_temp(&temporary); return Err(error); }
+            Ok(AppDataWrite { length: bytes.len(), directory_synced: parent.sync() })
+        })
+    }
+    #[cfg(target_os = "linux")]
+    fn public_delete_file_checked(&self, package_id: &str, path: &str, generation: Option<&AtomicBool>) -> Result<bool> {
+        self.with_public_files(package_id, generation, |files| {
+            let components = validate_private_path(path)?;
+            let (parent, name) = files.parent(&components)?;
+            let file = parent.read_private_file(name)?;
+            let before = platform::stamp_private(&file)?;
+            parent.unchanged_private(name, &file, &before)?;
+            parent.delete(name)?;
+            Ok(parent.sync())
+        })
+    }
+    #[cfg(target_os = "linux")]
+    fn public_rename_file_checked(&self, package_id: &str, from: &str, to: &str, generation: Option<&AtomicBool>) -> Result<bool> {
+        self.with_public_files(package_id, generation, |files| {
+            let source = validate_private_path(from)?;
+            let destination = validate_private_path(to)?;
+            let (from_dir, from_name) = files.parent(&source)?;
+            let (to_dir, to_name) = files.parent(&destination)?;
+            let file = from_dir.read_private_file(from_name)?;
+            let before = platform::stamp_private(&file)?;
+            from_dir.unchanged_private(from_name, &file, &before)?;
+            from_dir.rename_no_replace(from_name, &to_dir, to_name)?;
+            Ok(from_dir.sync() && to_dir.sync())
+        })
+    }
+    #[cfg(target_os = "linux")]
+    fn rename_file_checked(&self, package_id: &str, from: &str, to: &str, generation: Option<&AtomicBool>) -> Result<bool> {
+        self.with_files(package_id, generation, |files| {
+            let source = validate_private_path(from)?;
+            let destination = validate_private_path(to)?;
+            let (from_dir, from_name) = files.parent(&source)?;
+            let (to_dir, to_name) = files.parent(&destination)?;
+            let file = from_dir.read_private_file(from_name)?;
+            let before = platform::stamp_private(&file)?;
+            from_dir.unchanged_private(from_name, &file, &before)?;
+            from_dir.rename_no_replace(from_name, &to_dir, to_name)?;
+            let source_synced = from_dir.sync();
+            let destination_synced = to_dir.sync();
+            Ok(source_synced && destination_synced)
+        })
+    }
+    /// Denies new grants and waits for in-flight I/O on every existing grant.
+    pub fn revoke(&self, package_id: &str) -> Result<AuthorizationReceipt> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        self.revoke_locked(package_id, &mut authorized)
+    }
+    /// Revokes only public-directory access; private storage is unaffected.
+    #[cfg(target_os = "linux")]
+    pub fn revoke_public(&self, package_id: &str) -> Result<AuthorizationReceipt> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if let Some(entry) = authorized.get_mut(package_id) {
+            entry.generation.store(false, Ordering::Release);
+            for session in entry.sessions.drain(..).filter_map(|session| session.upgrade()) {
+                *session.lock().unwrap_or_else(|poison| poison.into_inner()) = false;
+            }
+        }
+        let receipt = self.persist_public(&authorized)?;
+        if self.public_policy.is_none() || receipt.directory_synced { authorized.remove(package_id); }
+        Ok(receipt)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn authorization_snapshot(&self, package_id: &str) -> Result<Option<AuthorizationSnapshot>> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        Ok(authorized.get(package_id).map(|entry| AuthorizationSnapshot {
+            fingerprint: entry.fingerprint, generation: entry.generation.clone(),
+        }))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn revoke_snapshot(&self, package_id: &str, snapshot: &AuthorizationSnapshot) -> Result<AuthorizationReceipt> {
+        let mut authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if !authorized.get(package_id).is_some_and(|entry| Arc::ptr_eq(&entry.generation, &snapshot.generation)) {
+            return Err(AppDataError::Denied);
+        }
+        self.revoke_locked(package_id, &mut authorized)
+    }
+    fn revoke_locked(&self, package_id: &str, authorized: &mut BTreeMap<String, PackageAuthorization>) -> Result<AuthorizationReceipt> {
+        if let Some(entry) = authorized.get_mut(package_id) {
+            entry.generation.store(false, Ordering::Release);
+            for shared in entry.grants.drain(..).filter_map(|grant| grant.upgrade()) {
+                AppDataGrant { shared }.revoke();
+            }
+        }
+        let receipt = self.persist(authorized)?;
+        if self.policy.is_none() || receipt.directory_synced { authorized.remove(package_id); }
+        Ok(receipt)
+    }
+    #[cfg(test)]
+    pub fn fail_next_policy_commit(&self) { self.policy.as_ref().unwrap().store.fail_next_commit(); }
+    #[cfg(test)]
+    pub fn fail_next_policy_directory_sync(&self) { self.policy.as_ref().unwrap().store.fail_next_directory_sync(); }
+}
+impl Drop for PackageStorageAuthority {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        for entry in self.private.get_mut().unwrap_or_else(|poison| poison.into_inner()).values() { entry.generation.store(false, Ordering::Release); }
+        let authorized = self.authorized.get_mut().unwrap_or_else(|poison| poison.into_inner());
+        for entry in authorized.values() { entry.generation.store(false, Ordering::Release); }
+        for entry in self.public_authorized.get_mut().unwrap_or_else(|poison| poison.into_inner()).values() { entry.generation.store(false, Ordering::Release); }
+        for shared in authorized.values_mut().flat_map(|entry| entry.grants.drain(..)).filter_map(|grant| grant.upgrade()) {
+            AppDataGrant { shared }.revoke();
+        }
+        let public = self.public_authorized.get_mut().unwrap_or_else(|poison| poison.into_inner());
+        for entry in public.values_mut() {
+            for session in entry.sessions.drain(..).filter_map(|session| session.upgrade()) {
+                *session.lock().unwrap_or_else(|poison| poison.into_inner()) = false;
+            }
+        }
+    }
+}
+/// A parent-owned capability for one running application generation.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct PrivateFileSession {
+    authority: Arc<PackageStorageAuthority>,
+    package_id: String,
+    generation: Arc<AtomicBool>,
+    fingerprint: Option<[u8; 32]>,
+    active: Arc<Mutex<bool>>,
+}
+#[cfg(target_os = "linux")]
+impl PrivateFileSession {
+    pub(crate) fn belongs_to(&self, package_id: &str) -> bool { self.package_id == package_id }
+    pub(crate) fn matches_fingerprint(&self, fingerprint: [u8; 32]) -> bool { self.fingerprint == Some(fingerprint) }
+    pub(crate) fn check(&self) -> Result<()> {
+        self.run(|a, id, g| a.with_files(id, Some(g), |_| Ok(())))
+    }
+    fn run<T>(&self, operation: impl FnOnce(&PackageStorageAuthority, &str, &AtomicBool) -> Result<T>) -> Result<T> {
+        let active = self.active.lock().map_err(|_| AppDataError::Denied)?;
+        if !*active { return Err(AppDataError::Denied); }
+        operation(&self.authority, &self.package_id, &self.generation)
+    }
+    /// Waits for in-flight operations and invalidates every clone of this session.
+    pub fn close(&self) { *self.active.lock().unwrap_or_else(|poison| poison.into_inner()) = false; }
+    pub fn create_directory(&self, path: &str) -> Result<bool> {
+        self.run(|a, id, g| a.create_file_directory_checked(id, path, Some(g)))
+    }
+    pub fn list_directory(&self, path: &str) -> Result<Vec<PrivateFileEntry>> {
+        self.run(|a, id, g| a.list_file_directory_checked(id, path, Some(g)))
+    }
+    pub fn delete_directory(&self, path: &str) -> Result<bool> {
+        self.run(|a, id, g| a.delete_file_directory_checked(id, path, Some(g)))
+    }
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.run(|a, id, g| a.read_file_checked(id, path, Some(g)))
+    }
+    pub fn write_file(&self, path: &str, bytes: &[u8]) -> Result<AppDataWrite> {
+        self.run(|a, id, g| a.write_file_checked(id, path, bytes, Some(g)))
+    }
+    pub fn delete_file(&self, path: &str) -> Result<bool> {
+        self.run(|a, id, g| a.delete_file_checked(id, path, Some(g)))
+    }
+    pub fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        self.run(|a, id, g| a.rename_file_checked(id, from, to, Some(g)))
+    }
+}
+/// A parent-owned capability for the shared public directory.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct PublicFileSession {
+    authority: Arc<PackageStorageAuthority>,
+    package_id: String,
+    generation: Arc<AtomicBool>,
+    active: Arc<Mutex<bool>>,
+}
+#[cfg(target_os = "linux")]
+impl PublicFileSession {
+    pub(crate) fn belongs_to(&self, package_id: &str) -> bool { self.package_id == package_id }
+    pub(crate) fn check(&self) -> Result<()> {
+        self.run(|a, id, g| a.with_public_files(id, Some(g), |_| Ok(())))
+    }
+    fn run<T>(&self, operation: impl FnOnce(&PackageStorageAuthority, &str, &AtomicBool) -> Result<T>) -> Result<T> {
+        let active = self.active.lock().map_err(|_| AppDataError::Denied)?;
+        if !*active { return Err(AppDataError::Denied); }
+        operation(&self.authority, &self.package_id, &self.generation)
+    }
+    pub fn close(&self) { *self.active.lock().unwrap_or_else(|poison| poison.into_inner()) = false; }
+    pub fn create_directory(&self, path: &str) -> Result<bool> {
+        self.run(|a, id, g| a.public_create_directory_checked(id, path, Some(g)))
+    }
+    pub fn list_directory(&self, path: &str) -> Result<Vec<PrivateFileEntry>> {
+        self.run(|a, id, g| a.public_list_directory_checked(id, path, Some(g)))
+    }
+    pub fn delete_directory(&self, path: &str) -> Result<bool> {
+        self.run(|a, id, g| a.public_delete_directory_checked(id, path, Some(g)))
+    }
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.run(|a, id, g| a.public_read_file_checked(id, path, Some(g)))
+    }
+    pub fn write_file(&self, path: &str, bytes: &[u8]) -> Result<AppDataWrite> {
+        self.run(|a, id, g| a.public_write_file_checked(id, path, bytes, Some(g)))
+    }
+    pub fn delete_file(&self, path: &str) -> Result<bool> {
+        self.run(|a, id, g| a.public_delete_file_checked(id, path, Some(g)))
+    }
+    pub fn rename_file(&self, from: &str, to: &str) -> Result<bool> {
+        self.run(|a, id, g| a.public_rename_file_checked(id, from, to, Some(g)))
     }
 }
 /// Structural trusted-catalog validation; performs no I/O and grants no authority.
@@ -331,6 +1084,29 @@ fn key_directory_name(key: &str) -> String {
     }
     name
 }
+// Lowercase base32 is injective and portable on case-insensitive filesystems. The separate
+// prefix prevents collisions with legacy key directories, even for attacker-chosen identities.
+fn package_directory_name(id: &str) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut name = String::with_capacity(4 + (id.len() * 8).div_ceil(5));
+    name.push_str("app-");
+    let mut bits = 0u32;
+    let mut count = 0u32;
+    for byte in id.bytes() {
+        bits = (bits << 8) | u32::from(byte);
+        count += 8;
+        while count >= 5 {
+            count -= 5;
+            name.push(ALPHABET[((bits >> count) & 31) as usize] as char);
+        }
+        bits &= (1 << count) - 1;
+    }
+    if count != 0 {
+        name.push(ALPHABET[(bits << (5 - count)) as usize] as char);
+    }
+    name
+}
+fn public_directory_name() -> &'static str { "public-files-v1" }
 fn temp_name() -> String {
     format!(
         ".ming-data-{}-{}",
@@ -343,10 +1119,10 @@ fn temp_name() -> String {
 mod platform {
     use super::*;
     use std::{
-        ffi::CString,
+        ffi::{CStr, CString},
         fs::Metadata,
         os::{
-            fd::{AsRawFd, FromRawFd},
+            fd::{AsRawFd, FromRawFd, IntoRawFd},
             unix::{ffi::OsStrExt, fs::MetadataExt},
         },
         path::Component,
@@ -396,9 +1172,9 @@ mod platform {
         }
         Ok(())
     }
-    fn file_stamp(m: Metadata) -> Result<Stamp> {
+    fn file_stamp_with_limit(m: Metadata, max_bytes: usize) -> Result<Stamp> {
         if !m.is_file()
-            || m.len() > MAX_SLOT_BYTES as u64
+            || m.len() > max_bytes as u64
             || m.nlink() != 1
             || m.uid() != unsafe { libc::geteuid() }
             || m.mode() & 0o077 != 0
@@ -416,8 +1192,14 @@ mod platform {
             nlink: m.nlink(),
         })
     }
+    fn file_stamp(m: Metadata) -> Result<Stamp> {
+        file_stamp_with_limit(m, MAX_SLOT_BYTES)
+    }
     pub fn stamp(file: &File) -> Result<Stamp> {
         file_stamp(file.metadata().map_err(io_error)?)
+    }
+    pub fn stamp_private(file: &File) -> Result<Stamp> {
+        file_stamp_with_limit(file.metadata().map_err(io_error)?, MAX_PRIVATE_FILE_BYTES)
     }
     impl Root {
         pub fn open(root: &Path) -> Result<Self> {
@@ -464,6 +1246,130 @@ mod platform {
         }
     }
     impl Directory {
+        pub fn child(&self, name: &str, create: bool) -> Result<Self> {
+            private_directory(&self.0)?;
+            let name_c = CString::new(name).map_err(|_| AppDataError::InvalidArgument)?;
+            let created = if create {
+                let status = unsafe { libc::mkdirat(self.0.as_raw_fd(), name_c.as_ptr(), 0o700) };
+                if status != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                    return Err(io_error(std::io::Error::last_os_error()));
+                }
+                status == 0
+            } else { false };
+            let file = open_at(&self.0, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            private_directory(&file)?;
+            if created { self.0.sync_all().map_err(io_error)?; }
+            Ok(Self(file))
+        }
+        pub fn parent<'a>(&self, components: &[&'a str]) -> Result<(Self, &'a str)> {
+            let (name, ancestors) = components.split_last().ok_or(AppDataError::InvalidArgument)?;
+            let mut current = Self(open_at(&self.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?);
+            for component in ancestors { current = current.child(component, false)?; }
+            Ok((current, *name))
+        }
+        pub fn list(&self) -> Result<Vec<PrivateFileEntry>> {
+            private_directory(&self.0)?;
+            let file = open_at(&self.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let raw = file.into_raw_fd();
+            let stream = unsafe { libc::fdopendir(raw) };
+            if stream.is_null() { unsafe { libc::close(raw); } return Err(AppDataError::Io); }
+            let result = (|| {
+                let mut entries = Vec::new();
+                let mut count = 0;
+                loop {
+                    unsafe { *libc::__errno_location() = 0; }
+                    let entry = unsafe { libc::readdir(stream) };
+                    if entry.is_null() {
+                        if unsafe { *libc::__errno_location() } != 0 { return Err(AppDataError::Io); }
+                        break;
+                    }
+                    let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_str().map_err(|_| AppDataError::Io)?;
+                    if name == "." || name == ".." { continue; }
+                    count += 1;
+                    if count > MAX_PRIVATE_ENTRIES { return Err(AppDataError::Io); }
+                    let child = open_at(&self.0, name, libc::O_RDONLY, 0)?;
+                    let metadata = child.metadata().map_err(io_error)?;
+                    let is_directory = metadata.is_dir();
+                    if is_directory { private_directory(&child)?; } else { file_stamp_with_limit(metadata, MAX_PRIVATE_FILE_BYTES)?; }
+                    if name.starts_with(".ming-data-") { continue; }
+                    validate_private_path(name).map_err(|_| AppDataError::Io)?;
+                    entries.push(PrivateFileEntry { name: name.to_owned(), is_directory });
+                }
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(entries)
+            })();
+            unsafe { libc::closedir(stream); }
+            result
+        }
+        pub fn remove_directory(&self, name: &str) -> Result<()> {
+            let _directory = self.child(name, false)?;
+            let name = CString::new(name).map_err(|_| AppDataError::InvalidArgument)?;
+            if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+                Ok(())
+            } else {
+                Err(io_error(std::io::Error::last_os_error()))
+            }
+        }
+        pub fn rename_no_replace(&self, from: &str, destination: &Directory, to: &str) -> Result<()> {
+            private_directory(&self.0)?;
+            private_directory(&destination.0)?;
+            let from = CString::new(from).map_err(|_| AppDataError::InvalidArgument)?;
+            let to = CString::new(to).map_err(|_| AppDataError::InvalidArgument)?;
+            let result = unsafe {
+                libc::syscall(libc::SYS_renameat2, self.0.as_raw_fd(), from.as_ptr(),
+                    destination.0.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE)
+            };
+            if result == 0 { Ok(()) } else { Err(io_error(std::io::Error::last_os_error())) }
+        }
+        pub fn usage(&self) -> Result<(usize, usize)> {
+            fn walk(dir: &Directory, depth: usize, bytes: &mut usize, entries: &mut usize) -> Result<()> {
+                if depth > MAX_PRIVATE_PATH_DEPTH { return Err(AppDataError::Io); }
+                private_directory(&dir.0)?;
+                let file = open_at(&dir.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                let raw = file.into_raw_fd();
+                let stream = unsafe { libc::fdopendir(raw) };
+                if stream.is_null() { unsafe { libc::close(raw); } return Err(AppDataError::Io); }
+                let result = (|| {
+                    loop {
+                        unsafe { *libc::__errno_location() = 0; }
+                        let entry = unsafe { libc::readdir(stream) };
+                        if entry.is_null() {
+                            if unsafe { *libc::__errno_location() } != 0 { return Err(AppDataError::Io); }
+                            break;
+                        }
+                        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_str().map_err(|_| AppDataError::Io)?;
+                        if name == "." || name == ".." { continue; }
+                        *entries = entries.checked_add(1).ok_or(AppDataError::Io)?;
+                        if *entries > MAX_PRIVATE_ENTRIES { return Err(AppDataError::Io); }
+                        let child = open_at(&dir.0, name, libc::O_RDONLY, 0)?;
+                        let metadata = child.metadata().map_err(io_error)?;
+                        if metadata.is_dir() {
+                            private_directory(&child)?;
+                            walk(&Directory(child), depth + 1, bytes, entries)?;
+                        } else {
+                            let stamp = file_stamp_with_limit(metadata, MAX_PRIVATE_FILE_BYTES)?;
+                            *bytes = bytes.checked_add(stamp.length() as usize).ok_or(AppDataError::Io)?;
+                            if *bytes > MAX_PRIVATE_TOTAL_BYTES { return Err(AppDataError::Io); }
+                        }
+                    }
+                    Ok(())
+                })();
+                unsafe { libc::closedir(stream); }
+                result
+            }
+            let (mut bytes, mut entries) = (0, 0);
+            walk(self, 0, &mut bytes, &mut entries)?;
+            Ok((bytes, entries))
+        }
+        pub fn lock_policy(&self) -> Result<File> {
+            private_directory(&self.0)?;
+            let file = open_at(&self.0, ".policy-lock", libc::O_RDWR | libc::O_CREAT, 0o600)?;
+            stamp(&file)?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(AppDataError::Io);
+            }
+            Ok(file)
+        }
         pub fn open(root: &Root, key: &str) -> Result<Self> {
             let dir = &root.0;
             private_directory(dir)?;
@@ -485,6 +1391,28 @@ mod platform {
             let file = open_at(&self.0, name, libc::O_RDONLY, 0)?;
             stamp(&file)?;
             Ok(file)
+        }
+        pub fn read_private_file(&self, name: &str) -> Result<File> {
+            private_directory(&self.0)?;
+            let file = open_at(&self.0, name, libc::O_RDONLY, 0)?;
+            stamp_private(&file)?;
+            Ok(file)
+        }
+        pub fn unchanged_private(&self, name: &str, file: &File, before: &Stamp) -> Result<()> {
+            if stamp_private(file)? != *before { return Err(AppDataError::Io); }
+            let current = self.read_private_file(name)?;
+            if stamp_private(&current)? != *before { return Err(AppDataError::Io); }
+            Ok(())
+        }
+        pub fn check_private_target(&self, name: &str) -> Result<()> {
+            match self.read_private_file(name) {
+                Ok(file) => {
+                    let before = stamp_private(&file)?;
+                    self.unchanged_private(name, &file, &before)
+                }
+                Err(AppDataError::NotFound) => Ok(()),
+                Err(error) => Err(error),
+            }
         }
         pub fn unchanged(&self, name: &str, file: &File, before: &Stamp) -> Result<()> {
             if stamp(file)? != *before {

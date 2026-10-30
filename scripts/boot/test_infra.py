@@ -152,6 +152,14 @@ class InfraTests(unittest.TestCase):
         self.assertEqual(module.decode(sample)[0],{'seconds':3,'microseconds':42,'type':1,'code':272,'value':1})
         with self.assertRaises(ValueError):module.decode(sample[:-1])
 
+    def test_virtual_evdev_identity_accepts_current_data_disk_generation(self):
+        import importlib.util
+        path=Path(__file__).with_name('evdev_observer.py')
+        spec=importlib.util.spec_from_file_location('observer_identity_test',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        self.assertTrue(module.task_owned_cmdline('console=ttyS0 rdinit=/init mingos.data_uuid=b4ee0135-c979-4bb9-aace-2b7aae417a5f mingos.data_serial=MINGDATAb4ee0135c979'))
+        self.assertTrue(module.task_owned_cmdline('rdinit=/init mingos.data_uuid=6472be15-4656-4898-afac-95c1531a8a72 mingos.data_serial=MINGDATA6472be154656'))
+        self.assertFalse(module.task_owned_cmdline('console=ttyS0 rdinit=/init'))
+
     def test_virtual_evdev_bound_stops_across_multiple_ready_fds(self):
         import importlib.util,time
         from unittest import mock
@@ -203,6 +211,95 @@ class InfraTests(unittest.TestCase):
             stream.path.write_text(''.join(json.dumps(row)+'\n' for row in rows));stream.poll(qmp)
             self.assertTrue(plan.complete)
             self.assertEqual([len(args['events']) for command,args in qmp.calls if command=='input-send-event'],[2,1,1])
+
+    def test_guest_stream_requires_fault_receipt_to_match_bundle_configuration(self):
+        from vm import GuestStream
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            config = {"schemaVersion": 1, "profile": "strict-worker-sigkill-v1", "app": 2,
+                      "generation": 1, "signal": "SIGKILL", "maxWaitSeconds": 60}
+            receipt = dict(config, pid=71, cgroup="/mingos/app-2-g-1", revision=7,
+                           status="sent", monotonicNs=123456)
+            stream = GuestStream(root / "guest.jsonl", None, fault_config=config)
+            stream.path.write_text("\n".join(json.dumps(row) for row in (
+                {"type": "guest-start", "bootId": "boot-1"},
+                {"type": "fault-injection", "receipt": receipt},
+            )) + "\n")
+            stream.poll(None)
+            self.assertEqual(stream.fault_receipt, receipt)
+            bad = GuestStream(root / "bad.jsonl", None, fault_config=config)
+            bad.path.write_text(json.dumps({"type": "fault-injection", "receipt": dict(receipt, app=1)}) + "\n")
+            with self.assertRaisesRegex(ValueError, "fault receipt"):
+                bad.poll(None)
+
+    def test_fault_profile_blocks_input_until_receipt_and_failed_worker_state(self):
+        from vm import GuestStream
+        class Transport:
+            def __init__(self): self.calls = []
+            def execute(self, command, args=None): self.calls.append((command, args)); return {}
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            config = {"schemaVersion": 1, "profile": "strict-worker-sigkill-v1", "app": 2,
+                      "generation": 1, "signal": "SIGKILL", "maxWaitSeconds": 60}
+            receipt = dict(config, pid=71, cgroup="/mingos/app-2-g-1", revision=7,
+                           status="sent", monotonicNs=123456)
+            plan = InputPlan({"schemaVersion": 1, "requireApps": [1], "steps": [{
+                "name": "dock", "events": [{"kind": "key", "qcode": "a", "down": False}], "expect": {}
+            }]}, root / "inputs.jsonl", 10)
+            running = self.state()
+            failed = self.state(); failed["revision"] += 1
+            failed["apps"].append({"app": 2, "generation": 1, "workerPid": 71, "state": "failed",
+                                   "sourceSequence": 3, "presentedSourceSequence": 3, "inputReady": False})
+            stream = GuestStream(root / "guest.jsonl", plan, fault_config=config)
+            stream.path.write_text("\n".join(json.dumps(row) for row in (
+                {"type": "guest-start", "bootId": "boot-1"},
+                {"type": "desktop-state", "state": running},
+                {"type": "fault-injection", "receipt": receipt},
+                {"type": "desktop-state", "state": failed},
+            )) + "\n")
+            qmp = Transport(); stream.poll(qmp)
+            self.assertEqual([call[0] for call in qmp.calls], ["input-send-event"])
+            self.assertEqual(stream.fault_failure_state, failed)
+
+    def test_fault_profile_pointer_receipt_cannot_bypass_input_gate(self):
+        from vm import GuestStream
+        class Transport:
+            def __init__(self): self.calls = []
+            def execute(self, command, args=None): self.calls.append((command, args)); return {}
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            config = {"schemaVersion": 1, "profile": "strict-worker-sigkill-v1", "app": 2,
+                      "generation": 1, "signal": "SIGKILL", "maxWaitSeconds": 60}
+            plan = InputPlan({"schemaVersion": 1, "requireApps": [1], "steps": [{
+                "name": "dock", "events": [{"kind": "pointer", "x": 120, "y": 200}], "expect": {}
+            }]}, root / "inputs.jsonl", 10, split_transactions=True, pointer_handshake=True)
+            state = self.state()
+            stream = GuestStream(root / "guest.jsonl", plan, fault_config=config)
+            stream.path.write_text("\n".join(json.dumps(row) for row in (
+                {"type": "guest-start", "bootId": "boot-1"},
+                {"type": "process-start", "name": "desktop", "pid": 50},
+                {"type": "desktop-state", "state": state, "desktopPid": 50, "diagnosticStderrOffset": 100},
+                {"type": "desktop-pointer-receipt", "bootId": "boot-1", "sessionId": "session-1", "desktopPid": 50,
+                 "receipt": {"pointer": 36, "surface": 15, "entered": True, "x": 120.1, "y": 200.2, "sequence": 1, "logOffset": 101}},
+            )) + "\n")
+            qmp = Transport(); stream.poll(qmp)
+            self.assertEqual(qmp.calls, [])
+
+    def test_fault_profile_requires_valid_receipt_before_normal_result(self):
+        from vm import fault_result
+        config = {"schemaVersion": 1, "profile": "strict-worker-sigkill-v1", "app": 2,
+                  "generation": 1, "signal": "SIGKILL", "maxWaitSeconds": 60}
+        receipt = dict(config, pid=71, cgroup="/mingos/app-2-g-1", revision=7,
+                       status="sent", monotonicNs=123456)
+        failure = self.state(); failure["apps"].append({"app": 2, "generation": 1, "workerPid": 71,
+                                                         "state": "failed", "sourceSequence": 3,
+                                                         "presentedSourceSequence": 3, "inputReady": False})
+        self.assertIsNone(fault_result(None, None))
+        self.assertEqual(fault_result(config, receipt, failure), receipt)
+        with self.assertRaisesRegex(ValueError, "missing fault receipt"):
+            fault_result(config, None, failure)
+        with self.assertRaisesRegex(ValueError, "missing failed worker state"):
+            fault_result(config, receipt, None)
 
     def test_cold_boot_checks_identity_disk_and_previous_marker(self):
         first = {"status": "normal-desktop-poweroff", "bootId": "one", "bundleIdentity": "same",

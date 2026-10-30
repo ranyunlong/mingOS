@@ -70,6 +70,18 @@ struct Worker {
 }
 impl Worker {
     fn new(wat: &str, sdk: u32, fuel: u64, cap: Option<u64>) -> Self {
+        Self::with_request_limit(wat, sdk, fuel, cap, None)
+    }
+    fn persistent(wat: &str, sdk: u32, fuel: u64, max_requests: u64) -> Self {
+        Self::with_request_limit(wat, sdk, fuel, Some(fuel), Some(max_requests))
+    }
+    fn with_request_limit(
+        wat: &str,
+        sdk: u32,
+        fuel: u64,
+        cap: Option<u64>,
+        max_requests: Option<u64>,
+    ) -> Self {
         let mut child = Command::new(host())
             .arg("__worker")
             .stdin(Stdio::piped())
@@ -99,6 +111,9 @@ impl Worker {
         if let Some(cap) = cap {
             init["fuelCapacity"] = cap.into();
         }
+        if let Some(max_requests) = max_requests {
+            init["maxRequests"] = max_requests.into();
+        }
         worker.send(init);
         worker
     }
@@ -123,6 +138,87 @@ impl Drop for Worker {
     }
 }
 const ONE_WAIT: &str = r#"(module(import "ming_v2" "event_next"(func $wait(param i32 i32)(result i32)))(memory(export "memory")1)(func(export "_start")i32.const 0 i32.const 16 call $wait drop))"#;
+const FILE_LENGTH_CACHE: &str = r#"(module
+    (import "ming_v1" "file_open" (func $open (param i32) (result i32)))
+    (import "ming_v1" "file_length" (func $length (param i32) (result i32)))
+    (import "ming_v1" "file_close" (func $close (param i32) (result i32)))
+    (func (export "_start")
+        i32.const 1 call $length drop
+        i32.const 1 call $length drop
+        i32.const 1 call $open drop
+        i32.const 1 call $length drop
+        i32.const 1 call $length drop
+        i32.const 1 call $close drop
+        i32.const 1 call $length drop))"#;
+const FILE_LENGTH_LIMIT: &str = r#"(module
+    (import "ming_v1" "file_length" (func $length (param i32) (result i32)))
+    (func (export "_start")
+        i32.const 1 call $length drop
+        i32.const 1 call $length drop
+        i32.const 1 call $length drop))"#;
+const FILE_LENGTH_CACHE_BOUND: &str = r#"(module
+    (import "ming_v1" "file_length" (func $length (param i32) (result i32)))
+    (func (export "_start") (local $handle i32)
+        i32.const 1 local.set $handle
+        block $done loop $query
+            local.get $handle call $length drop
+            local.get $handle i32.const 1 i32.add local.tee $handle
+            i32.const 66 i32.lt_u br_if $query
+        end end
+        i32.const 1 call $length drop))"#;
+#[test]
+fn real_persistent_worker_caches_file_length_and_invalidates_after_open_and_close() {
+    let mut worker = Worker::persistent(FILE_LENGTH_CACHE, 2, 10000, 7);
+    for (id, method, value) in [
+        (1, "file_length", -2),
+        (2, "file_open", 1),
+        (3, "file_length", 7),
+        (4, "file_close", 0),
+        (5, "file_length", 9),
+    ] {
+        let call = worker.recv();
+        assert_eq!(call["type"], "call", "{call}");
+        assert_eq!(call["id"], id, "{call}");
+        assert_eq!(call["method"], method, "{call}");
+        worker.send(json!({"id": id, "value": value}));
+    }
+    let result = worker.recv();
+    assert_eq!(result["type"], "result", "{result}");
+}
+
+#[test]
+fn real_persistent_worker_counts_cached_file_length_calls_against_its_request_limit() {
+    let mut worker = Worker::persistent(FILE_LENGTH_LIMIT, 2, 10000, 2);
+    let call = worker.recv();
+    assert_eq!(call["type"], "call", "{call}");
+    assert_eq!(call["id"], 1, "{call}");
+    assert_eq!(call["method"], "file_length", "{call}");
+    worker.send(json!({"id": 1, "value": -2}));
+    let error = worker.recv();
+    assert_eq!(error["type"], "error", "{error}");
+    assert!(error.to_string().contains("REQUEST_LIMIT: requests=3"), "{error}");
+}
+
+#[test]
+fn real_persistent_worker_evicts_old_file_length_cache_entries() {
+    let mut worker = Worker::persistent(FILE_LENGTH_CACHE_BOUND, 2, 10000, 66);
+    for handle in 1..=65 {
+        let call = worker.recv();
+        assert_eq!(call["type"], "call", "{call}");
+        assert_eq!(call["id"], handle, "{call}");
+        assert_eq!(call["method"], "file_length", "{call}");
+        assert_eq!(call["args"], json!([handle]), "{call}");
+        worker.send(json!({"id": handle, "value": -2}));
+    }
+    let evicted = worker.recv();
+    assert_eq!(evicted["type"], "call", "{evicted}");
+    assert_eq!(evicted["id"], 66, "{evicted}");
+    assert_eq!(evicted["method"], "file_length", "{evicted}");
+    assert_eq!(evicted["args"], json!([1]), "{evicted}");
+    worker.send(json!({"id": 66, "value": -2}));
+    let result = worker.recv();
+    assert_eq!(result["type"], "result", "{result}");
+}
 #[test]
 fn real_worker_accumulates_credit_and_consumes_more_than_initial_burst() {
     let wat = r#"(module(import "ming_v2" "event_next"(func $wait(param i32 i32)(result i32)))(memory(export "memory")1)

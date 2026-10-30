@@ -64,3 +64,16 @@ fn valid_catalog_resolves_packages_relative_to_its_own_directory() {
     assert_eq!(c.autostart, vec![7]);
     assert_eq!(c.apps[0].manifest_path, dir.path().join("app/app.json"));
 }
+
+#[test]
+fn catalog_rejects_distinct_entries_with_the_same_package_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a", "b"] {
+        fs::create_dir(dir.path().join(name)).unwrap();
+        fs::write(dir.path().join(name).join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        fs::write(dir.path().join(name).join("app.json"), r#"{"schemaVersion":1,"id":"dev.example.same","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+    }
+    let catalog = dir.path().join("catalog.json");
+    fs::write(&catalog, r#"{"schemaVersion":1,"apps":[{"id":1,"title":"A","manifest":"a/app.json"},{"id":2,"title":"B","manifest":"b/app.json"}],"autostart":[]}"#).unwrap();
+    assert!(load_catalog(&catalog).is_err());
+}

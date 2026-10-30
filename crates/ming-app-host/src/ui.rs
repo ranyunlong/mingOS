@@ -4,14 +4,26 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 pub type InputEvent = [i32; 4];
+// Fixed parent-owned receipts. No guest timestamps or payloads enter this state.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TerminalReplyKind {
+    Close,
+    Cancel,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WorkerLifecycle {
+    pub terminal_reply_written: Option<(Instant, TerminalReplyKind)>,
+    pub result_accepted: Option<Instant>,
+    pub reaped: Option<Instant>,
+}
 #[derive(Clone, Debug)]
 pub struct ViewBridge {
     pub latest: Arc<Mutex<Option<RenderedFrame>>>,
     pub cancel: Arc<AtomicBool>,
     close: Arc<AtomicBool>,
-    worker_result_accepted: Arc<Mutex<bool>>,
+    worker_lifecycle: Arc<Mutex<WorkerLifecycle>>,
     text_input: Arc<Mutex<crate::text_input::InputChannel>>,
     accepted_input_frame: Arc<Mutex<Option<(u64, u32, u32)>>>,
     resize: Arc<Mutex<Option<InputEvent>>>,
@@ -27,7 +39,7 @@ impl ViewBridge {
                 latest: Arc::new(Mutex::new(None)),
                 cancel: Arc::new(AtomicBool::new(false)),
                 close: Arc::new(AtomicBool::new(false)),
-                worker_result_accepted: Arc::new(Mutex::new(false)),
+                worker_lifecycle: Arc::new(Mutex::new(WorkerLifecycle::default())),
                 text_input: Arc::new(Mutex::new(crate::text_input::InputChannel::new())),
                 accepted_input_frame: Arc::new(Mutex::new(None)),
                 resize: Arc::new(Mutex::new(None)),
@@ -49,15 +61,30 @@ impl ViewBridge {
     pub fn request_close(&self) {
         self.close.store(true, Ordering::SeqCst);
     }
-    // Parent-only receipt; accepting it never clears an earlier explicit cancellation.
+    // Accepting a Result never clears an earlier explicit cancellation.
     pub(crate) fn accept_worker_result(&self) {
-        *self.worker_result_accepted.lock().expect("worker result state") = true;
+        self.worker_lifecycle.lock().expect("worker lifecycle")
+            .result_accepted.get_or_insert_with(Instant::now);
     }
-    pub(crate) fn cancel_if_executing(&self) {
-        // Keep the check and cancellation in one critical section with Result acceptance.
-        let accepted = self.worker_result_accepted.lock().expect("worker result state");
-        if !*accepted {
+    pub(crate) fn terminal_reply_written(&self, kind: TerminalReplyKind) {
+        self.worker_lifecycle.lock().expect("worker lifecycle")
+            .terminal_reply_written.get_or_insert_with(|| (Instant::now(), kind));
+    }
+    pub(crate) fn worker_reaped(&self) {
+        self.worker_lifecycle.lock().expect("worker lifecycle")
+            .reaped.get_or_insert_with(Instant::now);
+    }
+    pub(crate) fn worker_lifecycle(&self) -> WorkerLifecycle {
+        *self.worker_lifecycle.lock().expect("worker lifecycle")
+    }
+    pub(crate) fn cancel_if_executing(&self) -> (Instant, bool) {
+        // Serialize the decision and cancel store with Result acceptance.
+        let lifecycle = self.worker_lifecycle.lock().expect("worker lifecycle");
+        if lifecycle.result_accepted.is_none() {
             self.cancel.store(true, Ordering::SeqCst);
+            (Instant::now(), true)
+        } else {
+            (Instant::now(), false)
         }
     }
     pub fn resize(&self, w: i32, h: i32) {

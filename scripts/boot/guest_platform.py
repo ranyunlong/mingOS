@@ -62,6 +62,39 @@ class Platform:
             self.mount_data(identifier, serial)
         path = Path("/etc/mingos/probe.json")
         if path.exists(): self.probes = json.loads(path.read_text())
+        self.seed_public_storage()
+
+    def seed_public_storage(self):
+        config_path = Path("/etc/mingos/public-storage-seed.json")
+        if not config_path.exists():
+            return
+        if not self.mounted:
+            raise RuntimeError("public storage seed requires mounted data disk")
+        config = json.loads(config_path.read_text())
+        if config != {"packageIds": ["dev.ming.public-kernel-probe"],
+                      "profile": "data-text-public-probe", "schemaVersion": 1}:
+            raise RuntimeError("unexpected public storage seed")
+        root = Path("/data/mingos")
+        policy = self.owned_directory(root / "system-public-storage-policy-v1")
+        public = self.owned_directory(root / "public-files-v1")
+        expected = b"ming-public-storage-policy-v1\ndev.ming.public-kernel-probe\n"
+        target = policy / "slot-1"
+        if target.exists() or target.is_symlink():
+            info = target.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+                raise RuntimeError("unsafe public storage policy")
+            if target.read_bytes() != expected:
+                raise RuntimeError("public storage policy mismatch")
+        else:
+            temp = policy / (".seed-" + self.boot_id)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as output:
+                output.write(expected); output.flush(); os.fsync(output.fileno())
+            os.replace(temp, target)
+            fd = os.open(policy, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(fd)
+            finally: os.close(fd)
+        self.emit("public-storage-preauthorized", packageIds=config["packageIds"], policy=str(target), publicRoot=str(public))
 
     def mount_data(self, identifier, serial):
         import uuid

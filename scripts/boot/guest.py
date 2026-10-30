@@ -8,10 +8,11 @@ import subprocess
 import time
 import traceback
 from pathlib import Path
-from infra import STATE_PATH, validate_state
+from infra import STATE_PATH, validate_fault_injection, validate_state
 from guest_platform import Platform
 from bounded_log import BoundedLog, LogLimitExceeded
 from wayland_receipt import PointerReceipt
+from worker_resources import process_table
 
 LOG = Path("/run/evidence")
 LOG.mkdir(parents=True, exist_ok=True)
@@ -40,20 +41,9 @@ def command(argv):
     emit("command", argv=argv, code=result.returncode, stdout=result.stdout, stderr=result.stderr)
     if result.returncode: raise RuntimeError("guest command failed: " + repr(argv))
 
-def process_table():
-    records = []
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdecimal(): continue
-        try:
-            argv = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
-            if "ming-app-host" not in argv: continue
-            records.append(dict(pid=int(proc.name), argv=argv, status=(proc / "status").read_text()))
-        except (FileNotFoundError, PermissionError, ProcessLookupError): pass
-    return records
-
 def main():
     global channel
-    desktop = weston = seat = observer = platform = None
+    desktop = weston = seat = observer = fault_injector = platform = None
     streams = []
     error = None
     desktop_code = None
@@ -63,6 +53,8 @@ def main():
     stderr_source = stderr_capture = None
     stderr_limited = False
     diagnostic = {}
+    fault_config = fault_receipt = None
+    fault_receipt_path = LOG / "fault-injection.json"
     ready_capture_deadline = None
     pointer_parser = None
     def relay_state():
@@ -125,6 +117,10 @@ def main():
         platform.strict_before()
         diag_path = Path("/etc/mingos/input-diagnostics.json")
         diagnostic = json.loads(diag_path.read_text()) if diag_path.exists() else {}
+        fault_config_path = Path("/etc/mingos/fault-injection.json")
+        if fault_config_path.exists():
+            from fault_injector import completed_receipt, read_json
+            fault_config = validate_fault_injection(read_json(fault_config_path, 16384))
         pointer_parser = PointerReceipt() if diagnostic.get("pointerHandshake") else None
         flush_logs()
         emit("drm-devices", cards=[str(p) for p in Path("/dev/dri").glob("*")])
@@ -168,9 +164,18 @@ def main():
         session = json.loads(Path("/etc/mingos/session.json").read_text())
         argv = ["/opt/mingos/ming-app-host", "desktop", "/opt/mingos/catalog.json", "--renderer", "cpu"] + session["extraArgs"]
         desktop = launch(argv, "desktop", desktop_debug=True)
+        if fault_config:
+            fault_injector = launch(["python3", "-B", "/etc/mingos/fault_injector.py", "--config",
+                                     str(fault_config_path), "--state-file", STATE_PATH, "--receipt",
+                                     str(fault_receipt_path)], "fault-injector")
         last_process_sample = 0
         while desktop.poll() is None:
             drain_stderr(); relay_state(); flush_logs()
+            if fault_injector:
+                fault_receipt = completed_receipt(fault_injector, fault_config, fault_receipt_path)
+                if fault_receipt is not None:
+                    emit("fault-injection", receipt=fault_receipt)
+                    fault_injector = None
             if observer and observer.poll() is not None: raise RuntimeError("virtual input observer exited during desktop")
             if diagnostic.get("readyCaptureSeconds") and state and state["phase"] == "ready" and ready_capture_deadline is None:
                 ready_capture_deadline = time.monotonic() + diagnostic["readyCaptureSeconds"]
@@ -178,7 +183,7 @@ def main():
             if ready_capture_deadline is not None and time.monotonic() >= ready_capture_deadline:
                 raise RuntimeError("diagnostic-only ready capture window completed without normal desktop exit")
             if time.monotonic() >= last_process_sample + 1:
-                emit("process-table", processes=process_table()); last_process_sample = time.monotonic()
+                emit("process-table", processes=process_table(resources=bool(diagnostic))); last_process_sample = time.monotonic()
             if weston.poll() is not None: raise RuntimeError("Weston exited during desktop")
             time.sleep(0.1)
         drain_stderr()
@@ -186,6 +191,7 @@ def main():
         relay_state()
         emit("desktop-exit", code=desktop_code)
         if desktop_code != 0: raise RuntimeError("desktop exit: " + str(desktop_code))
+        if fault_config and fault_receipt is None: raise RuntimeError("fault injector did not complete")
         active = [p for p in process_table() if "__worker" in p["argv"]]
         emit("desktop-workers-stopped", active=active)
         if active: raise RuntimeError("Kotlin workers still active; resource probe forbidden")
@@ -195,7 +201,7 @@ def main():
         error = repr(caught)
         emit("guest-error", error=error, traceback=traceback.format_exc())
     finally:
-        for proc, label in ((desktop, "desktop"), (weston, "weston"), (seat, "seatd"), (observer, "input-observer")):
+        for proc, label in ((desktop, "desktop"), (weston, "weston"), (seat, "seatd"), (observer, "input-observer"), (fault_injector, "fault-injector")):
             try: stop(proc, label)
             except Exception as caught:
                 error = error or repr(caught)

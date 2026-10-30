@@ -34,7 +34,12 @@ def checked_session(review, payload):
     if any(arg.split("=", 1)[0] in ("--backend", "--renderer", "--snapshot", "--events") for arg in extra):
         raise ValueError("session cannot override native CPU presentation or inject test events")
     if mode == "bounded":
-        if len(extra) != 2 or extra[0] != "--duration-ms" or not extra[1].isdigit() or not 1 <= int(extra[1]) <= 60000:
+        if review.get("profile") == "public-probe":
+            expected = ["--duration-ms", "15000", "--isolation", "strict", "--data-root", "/data/mingos",
+                        "--state-file", "/run/evidence/desktop-state.json"]
+            if extra != expected:
+                raise ValueError("bounded public probe review requires exact data-root/isolation/state args")
+        elif len(extra) != 2 or extra[0] != "--duration-ms" or not extra[1].isdigit() or not 1 <= int(extra[1]) <= 60000:
             raise ValueError("bounded review requires --duration-ms 1..60000")
     elif not extra or not review.get("budgetEvidence"):
         raise ValueError("long-lived session requires exact main-thread args and budgetEvidence")
@@ -43,7 +48,7 @@ def checked_session(review, payload):
 def validate_reviewed_input(review, path):
     expected = review.get("inputScriptSha256")
     if expected is None:
-        if review.get("profile") == "data-text":
+        if review.get("profile") in ("data-text", "data-text-private-probe", "data-text-public-probe"):
             raise ValueError("data-text input script review hash required")
         return
     if path is None or sha256(path) != expected:

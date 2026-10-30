@@ -105,6 +105,48 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
             break;
         }
     }
+    if(arrayLength(&p)>877u && p[877u]!=0u) {
+        let dw=min(i32(p[0])-16,600);
+        let dx=(i32(p[0])-dw)/2;
+        let dy=(i32(p[1])-208)/2;
+        let cx=x-dx;
+        let cy=y-dy;
+        if(cx>=0 && cx<dw && cy>=0 && cy<208) {
+            color=select(0xfffafbfcu,0xffc8ced6u,cx==0 || cy==0 || cx==dw-1 || cy==207);
+            for(var n=0u;n<p[879u];n++) {
+                let base=880u+n*97u;
+                if(text_at(base+1u,p[base],cx-12,cy-12-i32(n)*14,dw-24)) {color=INK;}
+            }
+            if(cx>=dw-192 && cx<dw-112 && cy>=168 && cy<196) {
+                color=0xffe2e5e9u;
+                let deny=array<u32,6>(68u,69u,78u,89u,32u,32u);
+                let close=array<u32,6>(67u,76u,79u,83u,69u,32u);
+                let cancel=array<u32,6>(67u,65u,78u,67u,69u,76u);
+                let tx=cx-(dw-192)-22;
+                let ty=cy-178;
+                if(tx>=0 && tx<36 && ty>=0 && ty<7) {
+                    var code=deny[u32(tx/6)];
+                    if(p[878u]==1u || p[878u]>=4u) {code=close[u32(tx/6)];}
+                    if(p[878u]==2u || p[878u]==3u) {code=cancel[u32(tx/6)];}
+                    if(ink(code,tx%6,ty)) {color=INK;}
+                }
+            }
+            if(p[878u]!=1u && p[878u]<4u && cx>=dw-100 && cx<dw-20 && cy>=168 && cy<196) {
+                color=BLUE;
+                let allow=array<u32,6>(65u,76u,76u,79u,87u,32u);
+                let revoke=array<u32,6>(82u,69u,86u,79u,75u,69u);
+                let retry=array<u32,6>(82u,69u,84u,82u,89u,32u);
+                let tx=cx-(dw-100)-22;
+                let ty=cy-178;
+                if(tx>=0 && tx<36 && ty>=0 && ty<7) {
+                    var code=allow[u32(tx/6)];
+                    if(p[878u]==2u) {code=revoke[u32(tx/6)];}
+                    if(p[878u]==3u) {code=retry[u32(tx/6)];}
+                    if(ink(code,tx%6,ty)) {color=0xffffffffu;}
+                }
+            }
+        }
+    }
     output[at]=color;
 }
 

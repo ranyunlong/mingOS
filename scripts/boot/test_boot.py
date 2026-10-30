@@ -88,6 +88,21 @@ class BootBoundaryTests(unittest.TestCase):
                 with self.subTest(extra=extra), self.assertRaises(ValueError):
                     checked_session(dict(review, extraArgs=extra), base)
 
+    def test_public_probe_bounded_session_requires_data_root_and_state_file(self):
+        with tempfile.TemporaryDirectory() as work:
+            base = Path(work)
+            (base / "ming-app-host").write_bytes(b"host")
+            (base / "catalog.json").write_text("{}")
+            review = {"reviewed": True, "reviewer": "main-thread", "profile": "public-probe",
+                      "sessionMode": "bounded", "hostSha256": sha256(base / "ming-app-host"),
+                      "catalogSha256": sha256(base / "catalog.json"),
+                      "extraArgs": ["--duration-ms", "15000", "--isolation", "strict",
+                                    "--data-root", "/data/mingos", "--state-file",
+                                    "/run/evidence/desktop-state.json"]}
+            self.assertEqual(checked_session(review, base), review)
+            with self.assertRaisesRegex(ValueError, "data-root"):
+                checked_session(dict(review, extraArgs=["--duration-ms", "15000"]), base)
+
     def test_qemu_only_uses_task_files_no_host_devices_or_network(self):
         command = qemu_command(Path("/bundle"), Path("/out"), paused=True)
         self.assertIn("-S", command)

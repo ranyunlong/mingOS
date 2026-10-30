@@ -8,11 +8,29 @@ import subprocess
 import time
 from pathlib import Path
 from bootlib import Qmp, qemu_command, sha256, validate_bundle, validate_reviewed_input
-from infra import InputPlan, STATE_PATH, classify_guest, validate_state
+from infra import InputPlan, STATE_PATH, classify_guest, state_ready, validate_fault_injection, validate_fault_receipt, validate_state
+
+
+def fault_result(fault_config, receipt, failure_state=None):
+    if fault_config is None:
+        return None
+    if receipt is None:
+        raise ValueError("missing fault receipt")
+    receipt = validate_fault_receipt(receipt, fault_config)
+    if failure_state is None:
+        raise ValueError("missing failed worker state")
+    apps = {app["app"]: app for app in failure_state["apps"]}
+    failed = apps.get(fault_config["app"])
+    if (not state_ready(failure_state, [1]) or failed is None
+        or failed["generation"] != fault_config["generation"] or failed["state"] != "failed"):
+        raise ValueError("fault failure state mismatch")
+    return receipt
+
 
 class GuestStream:
-    def __init__(self, path, plan):
+    def __init__(self, path, plan, fault_config=None):
         self.path, self.plan = path, plan
+        self.fault_config = validate_fault_injection(fault_config) if fault_config else None
         self.offset, self.buffer = 0, b""
         self.records = []
         self.boot_id = None
@@ -21,9 +39,21 @@ class GuestStream:
         self.desktop_pid = None
         self.desktop_log_offset = self.desktop_capture_offset = 0
         self.pointer_receipt = None
+        self.fault_receipt = None
+        self.fault_failure_state = None
 
     def pointer_context(self):
         return {"desktopPid": self.desktop_pid, "logOffset": max(self.desktop_log_offset, self.desktop_capture_offset), "receipt": self.pointer_receipt}
+
+    def advance_plan(self, state, qmp):
+        if not self.plan or (self.fault_config and (self.fault_receipt is None or self.fault_failure_state is None)):
+            return
+        before = self.plan.index
+        self.plan.advance(state, qmp, self.pointer_context())
+        if self.plan.index > before and state["phase"] == "ready":
+            name = "input-confirmed-%02d.ppm" % self.plan.index
+            qmp.execute("screendump", {"filename": str(self.path.parent / name)})
+            self.input_captures.append(name)
 
     def poll(self, qmp):
         if not self.path.exists(): return
@@ -47,7 +77,13 @@ class GuestStream:
                 if not self.state or event.get("bootId") != self.boot_id or event.get("sessionId") != self.state["sessionId"] or event.get("desktopPid") != self.desktop_pid:
                     raise ValueError("pointer receipt identity mismatch")
                 self.pointer_receipt = dict(event["receipt"], bootId=event["bootId"], sessionId=event["sessionId"], desktopPid=event["desktopPid"])
-                if self.plan: self.plan.advance(self.state, qmp, self.pointer_context())
+                self.advance_plan(self.state, qmp)
+            elif kind == "fault-injection":
+                if self.fault_config is None or self.fault_receipt is not None:
+                    raise ValueError("unexpected fault receipt")
+                self.fault_receipt = validate_fault_receipt(event.get("receipt"), self.fault_config)
+                if self.state:
+                    self.advance_plan(self.state, qmp)
             elif kind == "desktop-state":
                 if self.boot_id is None: raise ValueError("state before guest boot identity")
                 value = event["state"]
@@ -61,13 +97,13 @@ class GuestStream:
                     if type(captured) is not int or captured < self.desktop_capture_offset: raise ValueError("state diagnostic log offset regressed")
                     self.desktop_capture_offset = captured
                 self.state = value
-                if self.plan:
-                    before = self.plan.index
-                    self.plan.advance(value, qmp, self.pointer_context())
-                    if self.plan.index > before and value["phase"] == "ready":
-                        name = "input-confirmed-%02d.ppm" % self.plan.index
-                        qmp.execute("screendump", {"filename": str(self.path.parent / name)})
-                        self.input_captures.append(name)
+                if self.fault_config and self.fault_failure_state is None:
+                    apps = {app["app"]: app for app in value["apps"]}
+                    failed = apps.get(self.fault_config["app"])
+                    if (state_ready(value, [1]) and failed is not None
+                        and failed["generation"] == self.fault_config["generation"] and failed["state"] == "failed"):
+                        self.fault_failure_state = value
+                self.advance_plan(value, qmp)
             if kind not in ("log", "desktop-state", "process-table"):
                 self.records.append(event)
         if len(self.buffer) > 1024 * 1024: raise ValueError("guest evidence line exceeds bound")
@@ -89,12 +125,15 @@ def main():
     if not 10 <= args.timeout <= 1800: parser.error("timeout must be 10..1800 seconds")
     if bool(args.work_root) != bool(args.data_manifest): parser.error("work-root/data-manifest must be used together")
     manifest = None
+    fault_config = None
     if not args.probe_paused:
         if not args.bundle or not args.review: parser.error("kernel boot requires bundle and main-thread review")
         manifest = validate_bundle(args.bundle, sha256(args.review))
         review = json.loads(args.review.read_text())
         if review.get("reviewed") is not True or not review.get("reviewer") or review != manifest["sessionReview"]:
             raise ValueError("main-thread review absent/changed")
+        if manifest.get("faultInjection") is not None:
+            fault_config = validate_fault_injection(manifest["faultInjection"])
         validate_reviewed_input(review, args.input_script)
         if args.data_manifest or args.input_script:
             if manifest.get("infraApiVersion") != 1: raise ValueError("data/input requires infrastructure API v1 bundle")
@@ -132,7 +171,7 @@ def main():
         save()
         if args.dry_run: print(json.dumps(report, indent=2)); return 0
         qmp = proc = None
-        stream = GuestStream(args.output / "guest.jsonl", plan)
+        stream = GuestStream(args.output / "guest.jsonl", plan, fault_config=fault_config)
         timed_out = False
         try:
             with (args.output / "qemu.stdout.log").open("wb") as out, (args.output / "qemu.stderr.log").open("wb") as err:
@@ -180,6 +219,9 @@ def main():
                     report["kernelPowerdown"] = "reboot: Power down" in serial
                     if report["status"] == "normal-desktop-poweroff" and (proc.returncode != 0 or not report["kernelPowerdown"]):
                         report["status"] = "guest-failed"
+                    if report["status"] == "normal-desktop-poweroff":
+                        report["faultInjectionReceipt"] = fault_result(fault_config, stream.fault_receipt, stream.fault_failure_state)
+                        report["faultFailureState"] = stream.fault_failure_state
                     if plan and not plan.complete: raise RuntimeError("input script unfinished")
                 report["bootId"] = stream.boot_id
                 report["lastState"] = stream.state

@@ -11,12 +11,21 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+fn private_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    directory
+}
 fn package(root: &Path, name: &str, source: &str, sdk: u32) -> std::path::PathBuf {
     let dir = root.join(name);
     fs::create_dir(&dir).unwrap();
     fs::write(dir.join("main.wasm"), wat::parse_str(source).unwrap()).unwrap();
     let manifest = dir.join("app.json");
-    fs::write(&manifest,json!({"schemaVersion":1,"id":"dev.ming.data-test","version":"0.1.0","sdkVersion":sdk,"entry":"main.wasm"}).to_string()).unwrap();
+    fs::write(&manifest,json!({"schemaVersion":1,"id":format!("dev.ming.data-{name}"),"version":"0.1.0","sdkVersion":sdk,"entry":"main.wasm"}).to_string()).unwrap();
     manifest
 }
 fn run(args: Vec<std::ffi::OsString>) -> (bool, String) {
@@ -107,6 +116,159 @@ fn sdk5_and_bad_signatures_and_unknown_data_imports_are_denied() {
         assert!(text.contains(error), "{text}");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_file_import_is_versioned_and_denies_missing_session_before_access() {
+    let d = tempfile::tempdir().unwrap();
+    let request = r#"{"op":"list","path":"","offset":0,"limit":1}"#;
+    let data: String = request.bytes().map(|byte| format!("\\{byte:02x}")).collect();
+    let import = r#"(import "ming_private_files_v1" "call" (func $files (param i32 i32 i32 i32) (result i32)))"#;
+    let wat = format!(r#"(module {import}
+        (import "ming_v1" "log" (func $log (param i32 i32) (result i32)))
+        (memory (export "memory") 3)
+        (data (i32.const 0) "{data}")
+        (func (export "_start")
+          i32.const 1 i32.const 0 i32.const {length} i32.const 65536 i32.const 90000 call $files call $log drop
+          i32.const 2 i32.const 0 i32.const {length} i32.const 65536 i32.const 89999 call $files call $log drop
+          i32.const 3 i32.const -1 i32.const 1 i32.const 65536 i32.const 90000 call $files call $log drop))"#, length=request.len());
+    let p = package(d.path(), "sdk6-files", &wat, 6);
+    let (ok, text) = run(vec!["run".into(), p.into_os_string()]);
+    assert!(ok, "{text}");
+    let result: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(result["requests"], 4);
+    assert_eq!(result["events"][0]["value"], -1);
+    assert_eq!(result["events"][1]["value"], -2);
+    assert_eq!(result["events"][2]["value"], -2);
+    let p = package(d.path(), "sdk5-files", &wat, 5);
+    let (ok, text) = run(vec!["run".into(), p.into_os_string()]);
+    assert!(!ok);
+    assert!(text.contains("IMPORT_DENIED"), "{text}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_file_binary_import_checks_sdk_ranges_and_default_denial() {
+    let d = tempfile::tempdir().unwrap();
+    let bytes = [1, 4, 0, 0, 0, b'f', b'i', b'l', b'e', 0, 0, 0, 0, 1, 0, 0, 0];
+    let data: String = bytes.iter().map(|byte| format!("\\{byte:02x}")).collect();
+    let wat = format!(r#"(module
+      (import "ming_private_files_v2" "call" (func $files (param i32 i32 i32 i32) (result i32)))
+      (import "ming_v1" "log" (func $log (param i32 i32) (result i32)))
+      (memory (export "memory") 3)
+      (data (i32.const 0) "{data}")
+      (func (export "_start")
+        i32.const 1 i32.const 0 i32.const {length} i32.const 65536 i32.const 65536 call $files call $log drop
+        i32.const 2 i32.const 0 i32.const {length} i32.const 65536 i32.const 65535 call $files call $log drop
+        i32.const 3 i32.const -1 i32.const 1 i32.const 65536 i32.const 65536 call $files call $log drop))"#, length=bytes.len());
+    let p = package(d.path(), "sdk6-binary-files", &wat, 6);
+    let (ok, text) = run(vec!["run".into(), p.into_os_string()]);
+    assert!(ok, "{text}");
+    let result: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(result["events"][0]["value"], -1);
+    assert_eq!(result["events"][1]["value"], -2);
+    assert_eq!(result["events"][2]["value"], -2);
+    let p = package(d.path(), "sdk5-binary-files", &wat, 5);
+    let (ok, text) = run(vec!["run".into(), p.into_os_string()]);
+    assert!(!ok);
+    assert!(text.contains("IMPORT_DENIED"), "{text}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_file_binary_import_converts_and_rejects_malformed_parent_replies() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use std::{io::BufReader, sync::mpsc};
+    let request = [7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+    let data: String = request.iter().map(|byte| format!("\\{byte:02x}")).collect();
+    for malformed in [false, true] {
+        let expected = if malformed { -4 } else { 1 };
+        let wasm = wat::parse_str(format!(r#"(module
+            (import "ming_private_files_v2" "call" (func $files (param i32 i32 i32 i32) (result i32)))
+            (memory (export "memory") 3)
+            (data (i32.const 0) "{data}")
+            (func (export "_start")
+              i32.const 0 i32.const {length} i32.const 65536 i32.const 65536 call $files
+              i32.const {expected} i32.ne if unreachable end
+              {check}))"#, length=request.len(), check=if malformed { "" } else { "i32.const 65536 i32.load8_u i32.const 1 i32.ne if unreachable end i32.const 65539 i32.load8_u i32.const 97 i32.ne if unreachable end" })).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ming-app-host"))
+            .arg("__worker").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            while let Ok(Some(value)) = ming_app_host::protocol::read_json::<Value>(&mut output, 100_000) {
+                if tx.send(value).is_err() { break; }
+            }
+        });
+        ming_app_host::protocol::write_json(&mut input, &json!({"wasm":STANDARD.encode(&wasm),"fuel":100000,"memoryBytes":262144,"sdkVersion":6})).unwrap();
+        let call = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(call["method"], "private_file_call");
+        let request: Value = serde_json::from_str(call["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(request, json!({"op":"list","path":"","offset":0,"limit":1}));
+        let list = if malformed { "[]" } else { r#"[{"name":"a","isDirectory":false}]"# };
+        ming_app_host::protocol::write_json(&mut input, &json!({"id":call["id"],"value":1,"payload":STANDARD.encode(list)})).unwrap();
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result["type"], "result", "{result}");
+        assert_eq!(result["exitCode"], 0);
+        drop(input);
+        assert!(child.wait().unwrap().success());
+        reader.join().unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_file_import_round_trips_and_rejects_malformed_parent_reply() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use std::{io::BufReader, sync::mpsc};
+    let request = r#"{"op":"list","path":"","offset":0,"limit":1}"#;
+    let data: String = request.bytes().map(|byte| format!("\\{byte:02x}")).collect();
+    let wasm = wat::parse_str(format!(r#"(module
+        (import "ming_private_files_v1" "call" (func $files (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 3)
+        (data (i32.const 0) "{data}")
+        (func (export "_start")
+          i32.const 0 i32.const {length} i32.const 65536 i32.const 90000 call $files
+          i32.const 0 i32.le_s if unreachable end
+          i32.const 65536 i32.load8_u i32.const 123 i32.ne if unreachable end))"#, length=request.len())).unwrap();
+    for malformed in [false, true] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ming-app-host"))
+            .arg("__worker").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            while let Ok(Some(value)) = ming_app_host::protocol::read_json::<Value>(&mut output, 100_000) {
+                if tx.send(value).is_err() { break; }
+            }
+        });
+        ming_app_host::protocol::write_json(&mut input, &json!({"wasm":STANDARD.encode(&wasm),"fuel":100000,"memoryBytes":262144,"sdkVersion":6,"fuelCapacity":100000})).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap()["type"], "ready");
+        let call = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(call["method"], "private_file_call");
+        assert_eq!(call["payload"], request);
+        assert!(call.get("remaining_fuel").is_none());
+        let reply = if malformed { json!({"id":call["id"],"value":-1,"payload":"unexpected"}) }
+                    else { json!({"id":call["id"],"value":0}) };
+        ming_app_host::protocol::write_json(&mut input, &reply).unwrap();
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        if malformed {
+            assert_eq!(result["type"], "error");
+            assert!(result.to_string().contains("PROTOCOL_PRIVATE_FILE"), "{result}");
+        } else {
+            assert_eq!(result["type"], "result");
+            assert_eq!(result["exitCode"], 0);
+        }
+        drop(input);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline { let _ = child.kill(); let _ = child.wait(); panic!("worker not reaped"); }
+            thread::sleep(Duration::from_millis(5));
+        }
+        reader.join().unwrap();
+    }
+}
 fn catalog(root: &Path, apps: Value, autostart: Value) -> std::path::PathBuf {
     let p = root.join("catalog.json");
     fs::write(
@@ -155,7 +317,7 @@ fn trusted_catalog_data_fields_are_strict_and_cannot_alias() {
 #[test]
 fn desktop_data_root_must_be_prepared_absolute_and_private() {
     use ming_app_host::desktop_catalog::DesktopOptions;
-    let d = tempfile::tempdir().unwrap();
+    let d = private_tempdir();
     assert!(
         DesktopOptions::parse([
             "x".into(),
@@ -340,7 +502,7 @@ fn parent_grants_bulk_isolation_cleanup_receipts_and_generation_reopen() {
 #[test]
 fn parent_root_retains_authority_while_revoked_old_generation_stays_denied() {
     use ming_app_host::app_data::{AppDataError, AppDataRoot};
-    let d = tempfile::tempdir().unwrap();
+    let d = private_tempdir();
     let root = AppDataRoot::open(d.path()).unwrap();
     let first = root.grant("parent-assigned", &[1]).unwrap();
     let old = first.clone();
@@ -360,7 +522,7 @@ fn parent_root_retains_authority_while_revoked_old_generation_stays_denied() {
 #[test]
 fn desktop_missing_root_or_missing_catalog_grant_is_denied() {
     for root_enabled in [false, true] {
-        let d = tempfile::tempdir().unwrap();
+        let d = private_tempdir();
         let source = format!(
             r#"(module {IMPORTS}(memory(export "memory")1)(func(export "_start")
  i32.const 1 i32.const 1 call $size call $log drop

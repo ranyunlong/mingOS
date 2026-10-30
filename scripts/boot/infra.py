@@ -9,6 +9,33 @@ from pathlib import Path
 API_VERSION = 1
 STATE_PATH = "/run/evidence/desktop-state.json"
 
+FAULT_PROFILE = "strict-worker-sigkill-v1"
+
+def validate_fault_injection(config):
+    if not isinstance(config, dict) or set(config) != {
+        "schemaVersion", "profile", "app", "generation", "signal", "maxWaitSeconds"
+    }:
+        raise ValueError("fault injection schema")
+    if (config["schemaVersion"] != 1 or config["profile"] != FAULT_PROFILE
+        or config["app"] != 2 or config["generation"] != 1
+        or config["signal"] != "SIGKILL" or not integer(config["maxWaitSeconds"], 1, 60)):
+        raise ValueError("fault injection contract")
+    return config
+
+
+def validate_fault_receipt(receipt, config):
+    config = validate_fault_injection(config)
+    expected_fields = set(config) | {"pid", "cgroup", "revision", "status", "monotonicNs"}
+    if not isinstance(receipt, dict) or set(receipt) != expected_fields:
+        raise ValueError("fault receipt schema")
+    if any(receipt[key] != value for key, value in config.items()):
+        raise ValueError("fault receipt configuration mismatch")
+    if (not integer(receipt["pid"], 2) or receipt["cgroup"] != "/mingos/app-%d-g-%d" % (config["app"], config["generation"])
+        or not integer(receipt["revision"], 1) or receipt["status"] != "sent"
+        or not integer(receipt["monotonicNs"], 1)):
+        raise ValueError("fault receipt target")
+    return receipt
+
 def contained(root, name):
     if not isinstance(name, str) or not name or any(c in name for c in "\\:,=\0"):
         raise ValueError("invalid owned relative path")

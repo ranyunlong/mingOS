@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "name": "source-v2",
+  "probeSource": "probes/linux-isolation-source-v2/probe.rs",
+  "exampleSource": "crates/ming-app-host/examples/isolation_probe_v2.rs",
+  "cargoLock": "Cargo.lock",
+  "rustToolchain": "rust-toolchain.toml",
+  "sourceSha256": "66ac6e993b65e65219dc840adf500846b2d3a3bdd92bdd2c708fb5f6dc3aabbb",
+  "exampleSha256": "2548ff95fd5c31fd885161e17c4089db17db17c757d2ba4553b9c2ddd5cd7df1",
+  "cargoLockSha256": "b47494d6e51f55d4034ad86041735756c378845540119992709d2308b30c2b8b",
+  "rustToolchainSha256": "d13306be0ecda81ce779baa290ffb417380d525928477f16200884b5169cca33",
+  "artifacts": {
+    "mingos-isolation-probe": "f70072ef5f115d2ceb5523accdb7e478d152d548f99415fe7ad7e77c0a133bd7",
+    "vm-prepare.sh": "7b7140efb3b9c073dd38db9382ccbcf3794626603e5f5afb2b6475eae9d769fe"
+  }
+}

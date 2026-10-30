@@ -20,6 +20,7 @@ anyhow = "1"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10.9"
 png = "0.18"
 getrandom = "0.4"
 winit = { version = "=0.30.13", optional = true, default-features = false, features = ["rwh_06","x11","wayland","wayland-dlopen"] }
@@ -30,6 +31,7 @@ wasmtime = { version = "=50.0.0", default-features = false, features = ["anyhow"
 libc = "0.2"
 
 [dev-dependencies]
+naga = { version = "=27.0.3", features = ["wgsl-in"] }
 tempfile = "3"
 wat = "1"
 

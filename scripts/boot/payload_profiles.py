@@ -71,3 +71,81 @@ def verify_data_text(payload, review, catalog):
             info = read_object(package/'build-info.json')
             require(all(info.get(k) == v for k, v in hashes.items()), 'text build-info mismatch')
     return catalog
+
+def verify_data_text_private_probe(payload, review, catalog):
+    require(isinstance(catalog, dict) and catalog.get('schemaVersion') == 1, 'catalog schema')
+    apps, start = catalog.get('apps'), catalog.get('autostart')
+    require(isinstance(apps, list) and len(apps) == 3 and all(isinstance(a, dict) for a in apps), 'three apps required')
+    require(isinstance(start, list) and len(start) == 3 and all(type(x) is int for x in start)
+            and set(start) == {1, 2, 3}, 'autostart must be apps 1/2/3')
+    require(all(type(app.get('id')) is int for app in apps)
+            and {app['id'] for app in apps} == {1, 2, 3}, 'app identities')
+    existing = [app for app in apps if app['id'] in (1, 2)]
+    verify_data_text(payload, review, {'schemaVersion': 1, 'apps': existing, 'autostart': [1, 2]})
+    probe = next(app for app in apps if app['id'] == 3)
+    require(probe == {'id': 3, 'title': 'Private Probe', 'manifest': 'packages/private/app.json'},
+            'private probe catalog entry')
+    manifest = checked_path(payload, probe['manifest'])
+    package = read_object(manifest)
+    require(package == {'schemaVersion': 1, 'id': 'dev.ming.private-kernel-probe',
+                        'version': '0.1.0', 'sdkVersion': 6, 'entry': 'main.wasm'},
+            'private probe identity and no permission declaration')
+    wasm = checked_path(payload, 'packages/private/main.wasm')
+    with wasm.open('rb') as source:
+        require(source.read(8) == b'\0asm\x01\0\0\0', 'private probe Wasm header')
+    require(review.get('privateProbeSha256') == {'manifest': sha256(manifest), 'wasm': sha256(wasm)},
+            'private probe review hashes')
+    return catalog
+
+def verify_data_text_public_probe(payload, review, catalog):
+    require(isinstance(catalog, dict) and catalog.get('schemaVersion') == 1, 'catalog schema')
+    apps, start = catalog.get('apps'), catalog.get('autostart')
+    require(isinstance(apps, list) and len(apps) == 3 and all(isinstance(a, dict) for a in apps), 'three apps required')
+    require(isinstance(start, list) and len(start) == 3 and all(type(x) is int for x in start)
+            and set(start) == {1, 2, 3}, 'autostart must be apps 1/2/3')
+    require(all(type(app.get('id')) is int for app in apps) and {app['id'] for app in apps} == {1, 2, 3}, 'app identities')
+    existing = [app for app in apps if app['id'] in (1, 2)]
+    verify_data_text(payload, review, {'schemaVersion': 1, 'apps': existing, 'autostart': [1, 2]})
+    probe = next(app for app in apps if app['id'] == 3)
+    require(probe == {'id': 3, 'title': 'Public Probe', 'manifest': 'packages/public/app.json'},
+            'public probe catalog entry')
+    manifest = checked_path(payload, probe['manifest'])
+    package = read_object(manifest)
+    require(package == {'schemaVersion': 1, 'id': 'dev.ming.public-kernel-probe',
+                        'version': '0.1.0', 'sdkVersion': 6, 'entry': 'main.wasm',
+                        'publicStorage': True}, 'public probe identity and permission declaration')
+    wasm = checked_path(payload, 'packages/public/main.wasm')
+    with wasm.open('rb') as source:
+        require(source.read(8) == b'\0asm\x01\0\0\0', 'public probe Wasm header')
+    require(review.get('publicProbeSha256') == {'manifest': sha256(manifest), 'wasm': sha256(wasm)},
+            'public probe review hashes')
+    require(review.get('publicPreauthorization') == {
+        'packageId': 'dev.ming.public-kernel-probe',
+        'policy': 'guest-seeded-public-grant-v1',
+    }, 'public preauthorization review')
+    return catalog
+
+def verify_public_probe(payload, review, catalog):
+    require(review.get('sessionMode') == 'bounded' and review.get('extraArgs') == [
+        '--duration-ms', '15000', '--isolation', 'strict', '--data-root', '/data/mingos',
+        '--state-file', '/run/evidence/desktop-state.json'], 'bounded public probe session required')
+    require(catalog == {
+        'schemaVersion': 1,
+        'apps': [{'id': 1, 'title': 'Public Probe', 'manifest': 'packages/public/app.json'}],
+        'autostart': [1],
+    }, 'single public probe catalog required')
+    manifest = checked_path(payload, 'packages/public/app.json')
+    package = read_object(manifest)
+    require(package == {'schemaVersion': 1, 'id': 'dev.ming.public-kernel-probe',
+                        'version': '0.1.0', 'sdkVersion': 6, 'entry': 'main.wasm',
+                        'publicStorage': True}, 'public probe identity and permission declaration')
+    wasm = checked_path(payload, 'packages/public/main.wasm')
+    with wasm.open('rb') as source:
+        require(source.read(8) == b'\0asm\x01\0\0\0', 'public probe Wasm header')
+    require(review.get('publicProbeSha256') == {'manifest': sha256(manifest), 'wasm': sha256(wasm)},
+            'public probe review hashes')
+    require(review.get('publicPreauthorization') == {
+        'packageId': 'dev.ming.public-kernel-probe',
+        'policy': 'guest-seeded-public-grant-v1',
+    }, 'public preauthorization review')
+    return catalog

@@ -57,3 +57,46 @@ v21已结束，30项中26项通过、4项失败；除Counter自然Outcome/readba
 v22新增Counter单独关闭步骤，但将instrumentedQualification设为false激活了普通诊断的短采集窗口；流程未到对照点，不能用于归因。失败bundle/原始日志/私有盘均保留。v23恢复原v21采集配置后完成八步：Counter单独关闭的Result、native成功退出、finally/dispose和10→11 readback通过；Text1单独关闭与Text2随后关闭仍各自APP_CANCELLED，后者frameClock.closes=0。因此不能仅凭Counter成功就把关闭改为排队，也不能用这次修改过的八步profile宣告原七步资格通过。
 
 本轮未改生产Host/SDK、Wasm或任何worker限额。v23无QMP强制退出，三worker均reap/cgroup pids0，guest sync/unmount/kernelPowerdown；自然Outcome要求仍因Text失败而未通过。v19导出原快照SHA再次核对不变，原盘未挂载。诊断证据见[独立核查](../artifacts/kernel-recovery-20261026/independent-review-v23.json)。下一份诊断需要同一父侧Instant记录Close请求与SDK回复写出时间，并采集有界worker CPU/cgroup样本，避免跨时钟原点相减或靠延长限额掩盖问题。
+
+
+## 第一轮本地诊断准备（2026-10-26，本机未重放 kernel）
+
+为下一轮 v23 后续诊断补充 guest worker CPU/cgroup 收据，沿用现有每秒一次的诊断进程表，
+记录累计 CPU tick、限流计数、当前配额和 guest monotonic 采样窗口。读取大小受限，校验
+PID/starttime/cgroup 身份变化，读取失败显式保留；不会因采样失败把 worker 从残留检查中删除。
+新模块已加入 bundle 打包与源码 SHA 清单；未改变 Host、SDK、Wasm 或任何资源/关闭期限。
+字段与边界见 [Boot 诊断说明](../scripts/boot/README.md)，执行项见
+[关闭边界诊断计划](superpowers/plans/2026-10-26-kernel-close-diagnostics.md)。
+
+该轮工作区没有历史 `artifacts/` 冻结 Host/Kotlin/bundle/数据盘证据，也没有 Rust 工具链和
+MingOS Linux/QEMU 工具镜像。沙箱外访问固定 Rust 1.99.1 官方发行站仍连接超时。
+本轮仅生成新的本地测试证据，不表示历史证据已恢复。父侧共用 Instant 的 Close 请求/SDK 回复/Result
+时间线与真实 kernel 复验尚未执行，v23 的 APP_CANCELLED 与输入重复问题仍未解决。
+
+
+## 第二轮本机推进：正常 Close 在服务预算等待中被误取消
+
+新回归确认 supervisor 在非 cooperative SDK 服务延迟中将 `bridge.closed()` 当作
+`APP_CANCELLED`；正常 Close 也满足该条件，可能中断尚未写出的 SDK 回复。现在该分支只由
+真正的 `cancel` 标志中断，原延迟、Strict2s/Off200ms、fuel 和 Result 接受保护均保持。
+此缺陷已单独 RED/GREEN 验证，但不能据此将历史 v23 全场景改为通过。
+
+本机固定 Rust 镜像已恢复。Linux 默认 features 库测试 196/196、帧时钟宿主 7/7 通过；
+持续会话集成 10/11，固定 1800ms shutdown 的故障隔离用例失败在强制重编译的原 HEAD 对照中同样复现，
+保留失败，不报整组通过。AppData 两项测试仅补齐夹具 Unix0700 前提，生产目录权限边界未改。
+
+真实 Text 按当前 Kotlin 源码重新编译并绑定输入，非旧 v19 产物。CPU offscreen 快速输入与自然关闭通过；
+三实例关闭/启动新代诊断 23/23 通过：兄弟 PID9/generation1 保持，Text PID10/generation1 关闭后
+启动 PID14/generation2，两代文字 `mingos`/`again` 精确；三实例 error=null、Close1/Cancel0、全部回收。
+证据见 [本机诊断计划与结果](superpowers/plans/2026-10-26-kernel-close-diagnostics.md) 和
+[三实例审计](../artifacts/close-service-budget-20261026/native-relaunch/independent-audit.json)。
+
+本轮使用 Linux CPU offscreen、合成 Host actions，不是严格 guest/QMP/Dock 输入、Counter 数据盘、
+Wayland 按键重复或真实硬件验收。QEMU 工具镜像恢复与严格 kernel 重放仍需完成，原 v23 恢复资格仍为 RED。
+
+
+第二轮补充：Counter 的新建私有 Linux 卷已完成两个独立进程的 0→1→2 写入/readback，
+19/19 独立检查及最终4B文件只读核对通过，finally/dispose、Close1/Cancel0 和 worker 回收均确认。
+这不替代原数据盘与 kernel 冷启动资格。QEMU 工具镜像在已校验内核包后仍遇到 QEMU/Weston 等下载失败；
+构建器要求的冻结 `mingos-isolation-probe`、`vm-prepare.sh` 也不在仓库/Git历史中，详见
+[缺失产物清单](../artifacts/close-service-budget-20261026/missing-frozen-probes.json)。原哈希校验条件保留，严格复验尚未执行。

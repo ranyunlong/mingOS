@@ -1,5 +1,5 @@
 //! GPU post-processing of a GPU-resident content-only root. Metadata upload only.
-use super::desktop_shell::{self as shell, ShellApp, ShellAppState, ShellWindow};
+use super::desktop_shell::{self as shell, ShellApp, ShellAppState, ShellWindow, StoragePrompt};
 use super::{FramePixels, GpuFrame, GpuSession, GpuStats, GpuTiming, RenderedFrame, gpu::Gpu};
 use anyhow::{Result, bail};
 use std::{sync::Arc, time::Instant};
@@ -42,6 +42,7 @@ impl GpuDesktopShell {
         root: &RenderedFrame,
         windows: &[ShellWindow],
         apps: &[ShellApp],
+        prompt: Option<&StoragePrompt>,
     ) -> Result<RenderedFrame> {
         // All shape/identity validation ran in DesktopShell::draw. Backend and
         // device checks must also precede with_gpu's terminal error boundary.
@@ -52,7 +53,7 @@ impl GpuDesktopShell {
             bail!("GPU_SESSION_MISMATCH");
         }
         let start = Instant::now();
-        let parameters = pack(root, windows, apps);
+        let parameters = pack(root, windows, apps, prompt);
         let pack_micros = start.elapsed().as_micros();
         let execute = Instant::now();
         let buffer = self.session.with_gpu(|gpu| {
@@ -135,10 +136,11 @@ impl GpuDesktopShell {
     }
 }
 
-// Fixed, bounded layout: header[4], windows[4][36], apps[4][16], ASCII[95][7].
+// Base layout: header[4], windows[4][36], apps[4][16], ASCII[95][7].
+// An optional bounded prompt extends the metadata only while visible.
 // Contains only coordinates, flags, character codes and font::glyph rows.
-fn pack(root: &RenderedFrame, windows: &[ShellWindow], apps: &[ShellApp]) -> Vec<u32> {
-    let mut p = vec![0; 877];
+fn pack(root: &RenderedFrame, windows: &[ShellWindow], apps: &[ShellApp], prompt: Option<&StoragePrompt>) -> Vec<u32> {
+    let mut p = vec![0; if prompt.is_some() { 1656 } else { 877 }];
     p[..4].copy_from_slice(&[
         root.width as u32,
         root.height as u32,
@@ -189,11 +191,23 @@ fn pack(root: &RenderedFrame, windows: &[ShellWindow], apps: &[ShellApp]) -> Vec
         for (j, c) in title.iter().enumerate() {
             p[base + 5 + j] = u32::from(*c);
         }
+        p[base + 13] = u32::from(cfg!(target_os = "linux"));
     }
     for code in 32..=126u8 {
         let base = 212 + (code as usize - 32) * 7;
         for (row, bits) in super::font::glyph(code as char).into_iter().enumerate() {
             p[base + row] = u32::from(bits);
+        }
+    }
+    if let Some(prompt) = prompt {
+        let lines = prompt.lines((root.width as i32 - 16).min(600));
+        p[877] = 1;
+        p[878] = prompt.mode;
+        p[879] = lines.len() as u32;
+        for (i, line) in lines.iter().enumerate() {
+            let base = 880 + i * 97;
+            p[base] = line.len() as u32;
+            for (j, byte) in line.iter().enumerate() { p[base + 1 + j] = u32::from(*byte); }
         }
     }
     p
@@ -206,6 +220,13 @@ mod tests {
     use crate::graphics::{compositor::Compositor, desktop_shell::DesktopShell};
     use anyhow::Context;
     use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn trusted_shell_shader_parses_and_validates() {
+        let module = naga::front::wgsl::parse_str(include_str!("desktop_shell.wgsl")).unwrap();
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module).unwrap();
+    }
 
     #[test]
     #[ignore = "requires hardware GPU; offscreen compatibility with the production presenter shader"]

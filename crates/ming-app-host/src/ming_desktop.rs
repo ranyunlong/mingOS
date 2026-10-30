@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -102,19 +102,65 @@ struct Instance {
     pid: Arc<AtomicU32>,
     sequence: u64,
     closing: Option<Instant>,
+    lifecycle_logged: crate::ui::WorkerLifecycle,
+    deadline_cancel_logged: bool,
     pointer: PointerSample,
     keys: KeyLatch,
     isolation: Option<supervisor::StrictLaunch>,
     #[cfg(feature = "gpu")]
     gpu: Option<crate::graphics::GpuSession>,
 }
+#[cfg(target_os = "linux")]
+struct PendingDesktopStorage {
+    app: u16,
+    pending: DesktopStorageDecision,
+    prompt: crate::graphics::desktop_shell::StoragePrompt,
+    composed: Option<u64>,
+    presented: bool,
+}
+#[cfg(target_os = "linux")]
+enum DesktopStorageDecision {
+    Management(crate::storage_consent::StorageManagement),
+    Public(crate::storage_consent::PendingPublicConsent),
+    Information,
+}
+impl Instance {
+    fn lifecycle_trace(&mut self) -> Vec<(Instant, &'static str, &'static str)> {
+        let current = self.bridge.worker_lifecycle();
+        let logged = std::mem::replace(&mut self.lifecycle_logged, current);
+        let mut events = Vec::new();
+        if logged.terminal_reply_written.is_none()
+            && let Some((at, kind)) = current.terminal_reply_written
+        {
+            let detail = match kind {
+                crate::ui::TerminalReplyKind::Close => "close",
+                crate::ui::TerminalReplyKind::Cancel => "cancel",
+            };
+            events.push((at, "terminal-reply-written", detail));
+        }
+        if logged.result_accepted.is_none() && let Some(at) = current.result_accepted {
+            events.push((at, "result-accepted", ""));
+        }
+        if logged.reaped.is_none() && let Some(at) = current.reaped {
+            events.push((at, "worker-reaped", ""));
+        }
+        events
+    }
+}
+
 pub(crate) struct Session {
     app_data: crate::desktop_catalog::DesktopDataConfig,
+    #[cfg(target_os = "linux")]
+    storage_authority: Option<Arc<crate::app_data::PackageStorageAuthority>>,
+    #[cfg(target_os = "linux")]
+    pending_storage: Option<PendingDesktopStorage>,
     pub options: DesktopOptions,
     pub catalog: Catalog,
     pub scene: DesktopScene,
     instances: Vec<Instance>,
     pending_autostart: VecDeque<u16>,
+    #[cfg(target_os = "linux")]
+    public_denied: BTreeSet<u16>,
     startup_limit: usize,
     records: Vec<AppRecord>,
     trace: Vec<Trace>,
@@ -181,11 +227,17 @@ impl Session {
         let startup_limit = autostart_parallelism(options.isolation == crate::desktop_catalog::IsolationMode::Strict && options.duration_ms == 0, thread::available_parallelism().map_or(1, |n| n.get()));
         Ok(Self {
             app_data,
+            #[cfg(target_os = "linux")]
+            storage_authority: None,
+            #[cfg(target_os = "linux")]
+            pending_storage: None,
             options,
             catalog,
             scene,
             instances: Vec::new(),
             pending_autostart: VecDeque::new(),
+            #[cfg(target_os = "linux")]
+            public_denied: BTreeSet::new(),
             startup_limit,
             records: Vec::new(),
             trace: Vec::new(),
@@ -224,10 +276,10 @@ impl Session {
             next_isolation_uid: 20000,
         })
     }
-    fn log(&mut self, app: u16, window: u64, generation: u64, kind: &'static str, detail: String) {
+    fn log_at(&mut self, at: Instant, app: u16, window: u64, generation: u64, kind: &'static str, detail: String) {
         if self.trace.len() < 512 {
             self.trace.push(Trace {
-                at_ms: self.started.elapsed().as_millis(),
+                at_ms: at.saturating_duration_since(self.started).as_millis(),
                 app,
                 window,
                 generation,
@@ -237,6 +289,9 @@ impl Session {
         } else {
             self.dropped_trace += 1;
         }
+    }
+    fn log(&mut self, app: u16, window: u64, generation: u64, kind: &'static str, detail: String) {
+        self.log_at(Instant::now(), app, window, generation, kind, detail);
     }
     pub fn start(&mut self) -> Result<()> {
         if self.options.isolation == crate::desktop_catalog::IsolationMode::Strict && self.options.duration_ms == 0 {
@@ -249,6 +304,8 @@ impl Session {
         Ok(())
     }
     fn take_pending_autostart(&mut self) -> Option<u16> {
+        #[cfg(target_os = "linux")]
+        if self.pending_storage.is_some() { return None; }
         if self.pending_autostart.is_empty() || self.closing.is_some() {
             return None;
         }
@@ -317,6 +374,8 @@ impl Session {
         if self.closing.is_some() {
             return None;
         }
+        #[cfg(target_os = "linux")]
+        if self.pending_storage.is_some() { return None; }
         self.instances
             .iter()
             .find(|instance| {
@@ -345,6 +404,116 @@ impl Session {
     pub fn changed(&mut self) {
         self.dirty = true;
         self.sink_ready = false;
+        #[cfg(target_os = "linux")]
+        if let Some(pending) = &mut self.pending_storage { pending.composed = None; pending.presented = false; }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn storage_prompt(&self) -> Option<&crate::graphics::desktop_shell::StoragePrompt> {
+        self.pending_storage.as_ref().map(|pending| &pending.prompt)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn storage_prompt_composed(&mut self, sequence: u64) {
+        if let Some(pending) = &mut self.pending_storage { pending.composed = Some(sequence); }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn storage_prompt_hit(&self, x: i32, y: i32) -> Option<bool> {
+        let pending = self.pending_storage.as_ref()?;
+        if !pending.presented || !self.sink_ready { return None; }
+        let replacement = matches!(&pending.pending, DesktopStorageDecision::Information);
+        let geometry = crate::graphics::desktop_shell::storage_prompt_geometry(self.options.width, self.options.height, replacement)?;
+        if geometry.deny.contains(x, y) { Some(false) }
+        else if geometry.allow.is_some_and(|r| r.contains(x, y)) { Some(true) }
+        else { None }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn respond_storage_prompt(&mut self, allow: bool) -> Result<()> {
+        let pending = self.pending_storage.as_ref().context("DESKTOP_STORAGE_NO_PROMPT")?;
+        if !pending.presented || !self.sink_ready { bail!("DESKTOP_STORAGE_NOT_PRESENTED"); }
+        if allow && matches!(&pending.pending, DesktopStorageDecision::Information) { bail!("DESKTOP_STORAGE_CONFLICT"); }
+        let pending = self.pending_storage.take().expect("checked pending");
+        let app = pending.app;
+        match pending.pending {
+            DesktopStorageDecision::Management(management) => {
+                if allow {
+                    match management.revoke() {
+                        Ok(receipt) if receipt.persisted && receipt.directory_synced => {
+                            self.log(app, 0, 0, "storage_revoked", String::new());
+                        }
+                        result => {
+                            self.log(app, 0, 0, "storage_revoke_not_saved", format!("{result:?}"));
+                            let prompt = crate::graphics::desktop_shell::StoragePrompt::management(management.app_id(), management.fingerprint().as_deref(), true)?;
+                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Management(management), prompt, composed: None, presented: false });
+                            self.changed();
+                            return Ok(());
+                        }
+                    }
+                }
+                self.changed();
+                self.launch_pending_autostart()?;
+                return Ok(());
+            }
+            DesktopStorageDecision::Information => {
+                self.changed();
+                self.launch_pending_autostart()?;
+                return Ok(());
+            }
+            DesktopStorageDecision::Public(pending) => {
+                if allow {
+                    match pending.allow() {
+                        Ok(granted) if granted.receipt.is_some_and(|receipt| receipt.persisted && receipt.directory_synced) => {
+                            self.log(app, 0, 0, "public_storage_granted", String::new());
+                        }
+                        Ok(_) | Err(_) => {
+                            let entry = self.catalog.apps.iter().find(|entry| entry.id == app).context("DESKTOP_UNKNOWN_APP")?;
+                            let package = crate::package::load_package(&entry.manifest_path).context("DESKTOP_PUBLIC_STORAGE_PACKAGE")?;
+                            let authority = self.storage_authority.as_ref().context("DESKTOP_STORAGE_AUTHORITY")?.clone();
+                            let consent = crate::storage_consent::PublicStorageConsent::new(authority);
+                            let pending = match consent.request(&package.manifest.id)? {
+                                crate::storage_consent::PublicConsentRequest::Prompt(pending) => pending,
+                                crate::storage_consent::PublicConsentRequest::Allowed(_) => bail!("DESKTOP_PUBLIC_STORAGE_NOT_DURABLE"),
+                            };
+                            let prompt = crate::graphics::desktop_shell::StoragePrompt::public_retry(&package.manifest.id)?;
+                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Public(pending), prompt, composed: None, presented: false });
+                            self.changed();
+                            return Ok(());
+                        }
+                    }
+                }
+                if !allow {
+                    self.public_denied.insert(app);
+                }
+                self.changed();
+                self.launch(app)?;
+                return Ok(());
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_storage_management(&mut self, app: u16) -> Result<()> {
+        if self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen { bail!("DESKTOP_STORAGE_UNAVAILABLE"); }
+        let entry = self.catalog.apps.iter().find(|entry| entry.id == app).context("DESKTOP_UNKNOWN_APP")?;
+        let package = crate::package::load_package(&entry.manifest_path).ok();
+        if self.storage_authority.is_none() && let Some(root) = self.app_data.root.clone() {
+            self.storage_authority = crate::app_data::PackageStorageAuthority::open_persistent(root).ok().map(Arc::new);
+        }
+        let (pending, prompt) = match (package, self.storage_authority.as_ref()) {
+            (Some(package), Some(authority)) => {
+                let consent = crate::storage_consent::StorageConsent::new(authority.clone());
+                match consent.management(&package.manifest.id) {
+                    Ok(Some(management)) => {
+                        let prompt = crate::graphics::desktop_shell::StoragePrompt::management(management.app_id(), management.fingerprint().as_deref(), management.revocation_pending())?;
+                        (DesktopStorageDecision::Management(management), prompt)
+                    }
+                    Ok(None) => (DesktopStorageDecision::Information, crate::graphics::desktop_shell::StoragePrompt::status(Some(&package.manifest.id), true)?),
+                    Err(_) => (DesktopStorageDecision::Information, crate::graphics::desktop_shell::StoragePrompt::status(Some(&package.manifest.id), false)?),
+                }
+            }
+            (package, _) => (DesktopStorageDecision::Information, crate::graphics::desktop_shell::StoragePrompt::status(package.as_ref().map(|p| p.manifest.id.as_str()), false)?),
+        };
+        self.pending_storage = Some(PendingDesktopStorage { app, pending, prompt, composed: None, presented: false });
+        self.reset_input()?;
+        self.changed();
+        Ok(())
     }
     fn effects(&mut self, effects: Vec<Effect>) -> Result<()> {
         for effect in effects {
@@ -366,11 +535,18 @@ impl Session {
                     }
                 }
                 Effect::Close(id) => {
+                    let mut close_trace = None;
                     if let Some(a) = self.instances.iter_mut().find(|a| a.window == Some(id)) {
+                        let at = Instant::now();
                         a.bridge.request_close();
-                        a.closing = Some(Instant::now());
+                        a.closing = Some(at);
                         a.window = None;
                         self.records[a.record].status = "closing";
+                        let record = &self.records[a.record];
+                        close_trace = Some((at, record.app, record.window, record.generation));
+                    }
+                    if let Some((at, app, window, generation)) = close_trace {
+                        self.log_at(at, app, window, generation, "close-request", String::new());
                     }
                 }
                 Effect::Focus(_) | Effect::Visibility { .. } => {}
@@ -402,11 +578,51 @@ impl Session {
             .find(|e| e.id == app)
             .cloned()
             .context("DESKTOP_UNKNOWN_APP")?;
+        #[cfg(target_os = "linux")]
+        let (granted, public_granted) = if let Some(root) = self.app_data.root.clone() {
+            let package = crate::package::load_package(&entry.manifest_path).context("DESKTOP_STORAGE_PACKAGE")?;
+            if package.manifest.id != entry.package_id { bail!("DESKTOP_PACKAGE_ID_CHANGED"); }
+            if package.storage_fingerprint() != entry.package_fingerprint { bail!("DESKTOP_PACKAGE_CHANGED"); }
+            if package.manifest.sdk_version >= 6 {
+                if self.storage_authority.is_none() {
+                    self.storage_authority = Some(Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(root).context("DESKTOP_STORAGE_AUTHORITY")?));
+                }
+                let session = self.storage_authority.as_ref().expect("initialized").default_private_session_for_package(&package).context("DESKTOP_PRIVATE_STORAGE")?;
+                let public = if package.manifest.public_storage && !self.public_denied.remove(&app) {
+                    let authority = self.storage_authority.as_ref().expect("initialized").clone();
+                    let consent = crate::storage_consent::PublicStorageConsent::new(authority);
+                    match consent.request(&package.manifest.id)? {
+                        crate::storage_consent::PublicConsentRequest::Allowed(granted) => Some((granted.app_id, granted.session)),
+                        crate::storage_consent::PublicConsentRequest::Prompt(pending) if !self.options.offscreen => {
+                            let prompt = crate::graphics::desktop_shell::StoragePrompt::public_request(&package.manifest.id)?;
+                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Public(pending), prompt, composed: None, presented: false });
+                            self.reset_input()?;
+                            self.changed();
+                            return Ok(());
+                        }
+                        crate::storage_consent::PublicConsentRequest::Prompt(_) => None,
+                    }
+                } else { None };
+                (Some(crate::storage_consent::GrantedStorage { package, session, receipt: None }), public)
+            } else { (None, None) }
+        } else { (None, None) };
+        self.launch_resolved(entry, #[cfg(target_os = "linux")] granted, #[cfg(target_os = "linux")] public_granted)
+    }
+    fn launch_resolved(&mut self, entry: crate::desktop_catalog::CatalogEntry, #[cfg(target_os = "linux")] granted: Option<crate::storage_consent::GrantedStorage>, #[cfg(target_os = "linux")] public_granted: Option<(String, crate::app_data::PublicFileSession)>) -> Result<()> {
+        let app = entry.id;
         let grant = match (&self.app_data.root, self.app_data.grants.get(&app)) {
             (Some(root), Some(binding)) => Some(root.grant(&binding.data_key, &binding.slots).context("DESKTOP_DATA_OPEN")?),
             _ => None,
         };
         let app_data = supervisor::AppDataService::new(grant);
+        #[cfg(target_os = "linux")]
+        let app_data = match granted { Some(granted) => app_data.with_private_files_for_package(granted.session, granted.package), None => app_data };
+        #[cfg(target_os = "linux")]
+        let app_data = match public_granted { Some((package_id, session)) => {
+            let package = crate::package::load_package(&entry.manifest_path).context("DESKTOP_PUBLIC_STORAGE_PACKAGE")?;
+            if package.manifest.id != package_id { bail!("DESKTOP_PUBLIC_STORAGE_ID_CHANGED"); }
+            app_data.with_public_files_for_package(session, package)
+        }, None => app_data };
         #[cfg(feature = "gpu")]
         let context = if let Some(root) = &self.gpu {
             Some(root.fork_render_context()?)
@@ -480,6 +696,8 @@ impl Session {
             pid,
             sequence: 0,
             closing: None,
+            lifecycle_logged: Default::default(),
+            deadline_cancel_logged: false,
             pointer: PointerSample::default(),
             keys: KeyLatch::default(),
             isolation: isolation.clone(),
@@ -514,6 +732,8 @@ impl Session {
         if matches!(action, DesktopAction::Shutdown) {
             return self.begin_shutdown();
         }
+        #[cfg(target_os = "linux")]
+        if self.pending_storage.is_some() { bail!("DESKTOP_STORAGE_PROMPT_ACTIVE"); }
         let app = action.app();
         if matches!(action, DesktopAction::Launch { .. }) {
             self.pending_autostart.retain(|pending| *pending != app);
@@ -805,6 +1025,8 @@ impl Session {
         Ok(())
     }
     fn ready(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.pending_storage.is_some() { return false; }
         self.pending_autostart.is_empty() && self.sink_ready
             && self.instances.iter().all(|a| {
                 a.closing.is_none()
@@ -824,14 +1046,25 @@ impl Session {
         };
         let mut updates = Vec::new();
         let mut completed = Vec::new();
+        let mut diagnostic_trace = Vec::new();
         for (i, a) in self.instances.iter_mut().enumerate() {
             self.records[a.record].worker_pid = a.pid.load(Ordering::SeqCst);
             self.records[a.record].isolation = a.isolation.as_ref().map(|s|s.snapshot());
             self.records[a.record].app_data = a.app_data.snapshot();
-            if a.closing
-                .is_some_and(|at| at.elapsed() >= close_grace)
-            {
-                a.bridge.cancel_if_executing();
+            for (at, kind, detail) in a.lifecycle_trace() {
+                let record = &self.records[a.record];
+                diagnostic_trace.push((at, record.app, record.window, record.generation, kind, detail.into()));
+            }
+            if a.closing.is_some_and(|at| at.elapsed() >= close_grace) {
+                let (at, cancelled) = a.bridge.cancel_if_executing();
+                // Keep checking on each poll; bound only the diagnostic emission.
+                if !a.deadline_cancel_logged {
+                    let record = &self.records[a.record];
+                    diagnostic_trace.push((at, record.app, record.window, record.generation,
+                        if cancelled { "close-deadline-cancel" } else { "close-deadline-skipped" },
+                        if cancelled { format!("graceMs={}", close_grace.as_millis()) } else { "result-accepted".into() }));
+                    a.deadline_cancel_logged = true;
+                }
             }
             if a.window.is_some() {
                 let f = a
@@ -853,6 +1086,9 @@ impl Session {
                     completed.push((i, Err(anyhow!("DESKTOP_WORKER_CHANNEL_CLOSED"))))
                 }
             }
+        }
+        for (at, app, window, generation, kind, detail) in diagnostic_trace {
+            self.log_at(at, app, window, generation, kind, detail);
         }
         let pids: Vec<_> = self
             .instances
@@ -880,6 +1116,12 @@ impl Session {
         for (index, result) in completed.into_iter().rev() {
             let mut a = self.instances.remove(index);
             let join = a.worker.take().map(|w| w.join());
+            // Acceptance/reap can happen after the snapshot above and before the
+            // final channel receive. Joining makes this last snapshot complete.
+            for (at, kind, detail) in a.lifecycle_trace() {
+                let record = &self.records[a.record];
+                self.log_at(at, record.app, record.window, record.generation, kind, detail.into());
+            }
             a.app_data.revoke();
             let was_closing = a.closing.is_some();
             if let Some(id) = a.window.take() {
@@ -928,6 +1170,7 @@ impl Session {
                 record.status,
                 record.error.clone().unwrap_or_default(),
             );
+            self.log(app, window, generation, "worker-result", error.clone());
             self.log(app, window, generation, status, error);
             self.changed();
         }
@@ -1016,6 +1259,11 @@ impl Session {
         ));
         self.sink_ready = true;
         self.dirty = false;
+        #[cfg(target_os = "linux")]
+        if let Some(pending) = &mut self.pending_storage {
+            pending.presented = !offscreen && pending.composed == Some(sequence);
+            pending.composed = None;
+        }
         let ready: Vec<_> = self.views().into_iter().filter(|v| v.input_ready).collect();
         for v in ready {
             if let Some(a) = self.instances.iter().find(|a| a.window == Some(v.id)) {
@@ -1042,6 +1290,8 @@ impl Session {
         Ok(())
     }
     pub fn begin_shutdown(&mut self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        { self.pending_storage = None; }
         self.pending_autostart.clear();
         if self.closing.is_none() {
             self.closing = Some(Instant::now());
@@ -1228,6 +1478,241 @@ pub fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<De
 #[cfg(test)]
 mod input_backpressure_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_and_legacy_storage_authorities_share_the_root_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = crate::app_data::AppDataRoot::open(temp.path()).unwrap();
+        let default = crate::app_data::PackageStorageAuthority::open_default_private(root.clone()).unwrap();
+        assert!(crate::app_data::PackageStorageAuthority::open_persistent(root.clone()).is_err());
+        drop(default);
+        let legacy = crate::app_data::PackageStorageAuthority::open_persistent(root.clone()).unwrap();
+        assert!(crate::app_data::PackageStorageAuthority::open_default_private(root.clone()).is_err());
+        drop(legacy);
+        assert!(crate::app_data::PackageStorageAuthority::open_default_private(root).is_ok());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_private_storage_does_not_depend_on_legacy_permission_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = crate::app_data::AppDataRoot::open(&data).unwrap();
+        let legacy = crate::app_data::PackageStorageAuthority::open_persistent(root.clone()).unwrap();
+        legacy.authorize("dev.example.old").unwrap();
+        drop(legacy);
+        let policy = data.join("system-private-storage-policy-v1/slot-1");
+        std::fs::write(&policy, b"invalid legacy policy").unwrap();
+        assert!(crate::app_data::PackageStorageAuthority::open_persistent(root).is_err());
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(temp.path().join("app.json"), r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let catalog_path = temp.path().join("catalog.json");
+        std::fs::write(&catalog_path, r#"{"schemaVersion":1,"apps":[{"id":1,"title":"Example","manifest":"app.json"}],"autostart":[1]}"#).unwrap();
+        let catalog = crate::desktop_catalog::load_catalog(&catalog_path).unwrap();
+        let options = DesktopOptions::parse([catalog_path.into_os_string(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.start().unwrap();
+        assert_eq!(session.instances.len(), 1);
+        assert!(session.storage_prompt().is_none());
+        assert_eq!(std::fs::read(policy).unwrap(), b"invalid legacy policy");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replaced_package_with_same_identity_is_rejected_before_private_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let module = temp.path().join("main.wasm");
+        std::fs::write(&module, wat::parse_str("(module)").unwrap()).unwrap();
+        std::fs::write(temp.path().join("app.json"), r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let catalog_path = temp.path().join("catalog.json");
+        std::fs::write(&catalog_path, r#"{"schemaVersion":1,"apps":[{"id":1,"title":"Example","manifest":"app.json"}],"autostart":[1]}"#).unwrap();
+        let catalog = crate::desktop_catalog::load_catalog(&catalog_path).unwrap();
+        std::fs::write(&module, wat::parse_str("(module (func))").unwrap()).unwrap();
+        let options = DesktopOptions::parse([catalog_path.into_os_string(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        let error = session.start().unwrap_err();
+        assert!(format!("{error:#}").contains("DESKTOP_PACKAGE_CHANGED"), "{error:#}");
+        assert!(session.instances.is_empty());
+        assert!(session.storage_authority.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn changed_package_identity_is_rejected_before_worker_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.alpha","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let catalog_path = temp.path().join("catalog.json");
+        std::fs::write(&catalog_path, r#"{"schemaVersion":1,"apps":[{"id":1,"title":"Example","manifest":"app.json"}],"autostart":[1]}"#).unwrap();
+        let catalog = crate::desktop_catalog::load_catalog(&catalog_path).unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.beta","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let options = DesktopOptions::parse([catalog_path.into_os_string(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        let error = session.start().unwrap_err();
+        assert!(format!("{error:#}").contains("DESKTOP_PACKAGE_ID_CHANGED"), "{error:#}");
+        assert!(session.instances.is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn storage_management_reports_missing_authorization_and_unavailable_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Example".into(), package_fingerprint: crate::package::load_package(&manifest).unwrap().storage_fingerprint(), manifest_path: manifest, package_id: "dev.example.app".into() }], autostart: vec![] };
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), temp.path().as_os_str().to_owned()]).unwrap();
+        let mut session = Session::new(options, catalog.clone(), #[cfg(feature="gpu")] None).unwrap();
+        session.begin_storage_management(1).unwrap();
+        assert!(session.storage_prompt().unwrap().lines(600).iter().any(|line| line == b"NO AUTHORIZATION"));
+        assert!(session.respond_storage_prompt(false).is_err());
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.respond_storage_prompt(false).unwrap();
+        assert!(session.storage_prompt().is_none());
+        drop(session);
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into()]).unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.begin_storage_management(1).unwrap();
+        assert!(session.storage_prompt().unwrap().lines(600).iter().any(|line| line == b"STORAGE UNAVAILABLE"));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn storage_management_requires_presented_frame_and_retries_failed_revoke() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let root = crate::app_data::AppDataRoot::open(&data).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(root).unwrap());
+        authority.authorize_package(&package).unwrap();
+        let files = authority.file_session_for_package(&package).unwrap();
+        files.write_file("note", b"kept").unwrap();
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Example".into(), package_fingerprint: crate::package::load_package(&manifest).unwrap().storage_fingerprint(), manifest_path: manifest, package_id: "dev.example.app".into() }], autostart: vec![] };
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.storage_authority = Some(authority.clone());
+        session.begin_storage_management(1).unwrap();
+        assert!(session.respond_storage_prompt(true).is_err());
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        authority.fail_next_policy_commit();
+        session.respond_storage_prompt(true).unwrap();
+        assert_eq!(files.read_file("note"), Err(crate::app_data::AppDataError::Denied));
+        assert!(session.storage_prompt().unwrap().lines(600).iter().any(|line| line == b"REVOCATION NOT SAVED"));
+        assert!(session.respond_storage_prompt(true).is_err());
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.respond_storage_prompt(true).unwrap();
+        assert!(session.storage_prompt().is_none());
+        authority.authorize_package(&package).unwrap();
+        assert_eq!(authority.file_session_for_package(&package).unwrap().read_file("note").unwrap(), b"kept");
+        assert!(session.instances.is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn declared_private_storage_launch_does_not_request_consent() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Example".into(), package_fingerprint: crate::package::load_package(&manifest).unwrap().storage_fingerprint(), manifest_path: manifest, package_id: "dev.example.app".into() }], autostart: vec![1] };
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.start().unwrap();
+        assert!(session.storage_prompt().is_none());
+        assert_eq!(session.instances.len(), 1);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_storage_request_prompts_before_worker_and_denial_starts_without_capability() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.public","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","publicStorage":true}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Public".into(), package_fingerprint: package.storage_fingerprint(), manifest_path: manifest, package_id: package.manifest.id.clone() }], autostart: vec![1] };
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.start().unwrap();
+        assert!(session.storage_prompt().is_some());
+        assert!(session.instances.is_empty());
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.respond_storage_prompt(false).unwrap();
+        assert!(session.storage_prompt().is_none());
+        assert_eq!(session.instances.len(), 1);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_storage_request_allow_does_not_mark_app_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.public","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","publicStorage":true}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Public".into(), package_fingerprint: package.storage_fingerprint(), manifest_path: manifest, package_id: package.manifest.id.clone() }], autostart: vec![1] };
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.start().unwrap();
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.respond_storage_prompt(true).unwrap();
+        assert_eq!(session.instances.len(), 1);
+        let reply = session.instances[0].app_data.dispatch_public_files(
+            6,
+            1,
+            &[],
+            Some(r#"{"op":"write","path":"shared.txt","data":"c2hhcmVk"}"#),
+        );
+        assert_eq!(reply.value, 6);
+        assert_eq!(reply.payload.as_deref(), Some("1"));
+        assert_eq!(
+            session
+                .storage_authority
+                .as_ref()
+                .unwrap()
+                .public_session("dev.example.public")
+                .unwrap()
+                .read_file("shared.txt")
+                .unwrap(),
+            b"shared"
+        );
+    }
     #[test]
     fn full_application_queue_drops_only_that_event_and_keeps_sibling_available() {
         let options = DesktopOptions::parse(
@@ -1290,6 +1775,8 @@ mod input_backpressure_tests {
                 pid: Arc::new(AtomicU32::new(0)),
                 sequence: 1,
                 closing: None,
+            lifecycle_logged: Default::default(),
+            deadline_cancel_logged: false,
                 pointer: PointerSample::default(),
                 keys: KeyLatch::default(),
                 isolation: None,
@@ -1432,6 +1919,7 @@ mod close_grace_tests {
             app:1, window:None, record:0, bridge:bridge.clone(), events, result,
             worker:None, pid:Arc::new(AtomicU32::new(0)), sequence:0,
             closing:Some(Instant::now()-Duration::from_millis(250)),
+            lifecycle_logged:Default::default(), deadline_cancel_logged:false,
             pointer:PointerSample::default(), keys:KeyLatch::default(), isolation:None,
             app_data:supervisor::AppDataService::default(), #[cfg(feature="gpu")] gpu:None,
         });
@@ -1487,6 +1975,123 @@ mod close_grace_tests {
         session.poll().unwrap();
         assert!(bridge.cancel.load(Ordering::SeqCst));
     }
+    #[test]
+    fn lifecycle_result_receipt_keeps_first_timestamp_across_clones() {
+        let (bridge, _events) = ViewBridge::new();
+        bridge.accept_worker_result();
+        let first = bridge.worker_lifecycle().result_accepted.unwrap();
+        bridge.clone().accept_worker_result();
+        assert_eq!(bridge.worker_lifecycle().result_accepted, Some(first));
+    }
+    #[test]
+    fn lifecycle_completion_flushes_receipt_created_after_result_receive() {
+        let (mut session, bridge, _keepalive) = closing_session(crate::desktop_catalog::IsolationMode::Off);
+        session.instances[0].closing = None;
+        let (tx, rx) = mpsc::sync_channel(0);
+        session.instances[0].result = rx;
+        session.instances[0].worker = Some(thread::spawn(move || {
+            // A rendezvous forces acceptance after poll's initial snapshot.
+            tx.send(Err(anyhow::anyhow!("TEST_COMPLETION"))).unwrap();
+            bridge.terminal_reply_written(crate::ui::TerminalReplyKind::Close);
+            bridge.accept_worker_result();
+            bridge.worker_reaped();
+        }));
+        let limit = Instant::now() + Duration::from_secs(2);
+        while !session.instances.is_empty() {
+            assert!(Instant::now() < limit);
+            session.poll().unwrap();
+            thread::yield_now();
+        }
+        let kinds: Vec<_> = session.trace.iter().map(|event| event.kind).collect();
+        assert_eq!(kinds, ["terminal-reply-written", "result-accepted", "worker-reaped", "worker-result", "failed"]);
+        assert!(session.records[0].completed);
+    }
+    #[test]
+    fn lifecycle_deadline_keeps_checking_but_logs_once() {
+        let (mut session, bridge, _keepalive) = closing_session(crate::desktop_catalog::IsolationMode::Off);
+        session.poll().unwrap();
+        assert!(bridge.cancel.swap(false, Ordering::SeqCst));
+        session.poll().unwrap();
+        assert!(bridge.cancel.load(Ordering::SeqCst), "Logging must not gate the existing deadline check");
+        assert_eq!(session.trace.iter().filter(|event| event.kind == "close-deadline-cancel").count(), 1);
+    }
+
+    #[test]
+    fn lifecycle_receipts_share_origin_identity_and_log_only_once() {
+        let (mut session, bridge, _keepalive) = closing_session(crate::desktop_catalog::IsolationMode::Off);
+        session.records[0].window = 37;
+        session.records[0].generation = 4;
+        bridge.terminal_reply_written(crate::ui::TerminalReplyKind::Close);
+        bridge.accept_worker_result();
+        bridge.worker_reaped();
+        let first = bridge.worker_lifecycle();
+        // Clones retain the first receipt, including the original terminal kind.
+        bridge.clone().terminal_reply_written(crate::ui::TerminalReplyKind::Cancel);
+        bridge.clone().worker_reaped();
+        session.poll().unwrap();
+        session.poll().unwrap();
+        let events: Vec<_> = session.trace.iter().map(|event| (event.kind, event.detail.as_str())).collect();
+        assert_eq!(events, [("terminal-reply-written", "close"), ("result-accepted", ""),
+            ("worker-reaped", ""), ("close-deadline-skipped", "result-accepted")]);
+        assert!(session.trace.iter().all(|event| (event.app, event.window, event.generation) == (1, 37, 4)));
+        for (event, at) in session.trace.iter().zip([
+            first.terminal_reply_written.unwrap().0, first.result_accepted.unwrap(), first.reaped.unwrap(),
+        ]) {
+            assert_eq!(event.at_ms, at.saturating_duration_since(session.started).as_millis());
+        }
+        assert_eq!(bridge.worker_lifecycle().reaped, first.reaped);
+        assert!(!bridge.cancel.load(Ordering::SeqCst));
+        assert!(!session.records[0].completed, "Receipts cannot fabricate completion");
+    }
+    #[test]
+    fn lifecycle_trace_cap_counts_drops_without_repeated_emission() {
+        let (mut session, bridge, _keepalive) = closing_session(crate::desktop_catalog::IsolationMode::Off);
+        for _ in 0..512 {
+            session.log(1, 0, 1, "test-fill", String::new());
+        }
+        bridge.terminal_reply_written(crate::ui::TerminalReplyKind::Cancel);
+        bridge.accept_worker_result();
+        bridge.worker_reaped();
+        session.poll().unwrap();
+        session.poll().unwrap();
+        assert_eq!(session.trace.len(), 512);
+        assert_eq!(session.dropped_trace, 4);
+    }
+    #[test]
+    fn lifecycle_failed_completion_does_not_invent_result_or_reap() {
+        let (mut session, _bridge, tx) = closing_session(crate::desktop_catalog::IsolationMode::Off);
+        session.instances[0].closing = None;
+        tx.send(Err(anyhow::anyhow!("TEST_FAILURE"))).unwrap();
+        session.poll().unwrap();
+        assert_eq!(session.trace.iter().map(|event| event.kind).collect::<Vec<_>>(), ["worker-result", "failed"]);
+    }
+
+    #[test]
+    fn lifecycle_deadline_timestamp_orders_with_concurrent_result_acceptance() {
+        for _ in 0..32 {
+            let (bridge, _events) = ViewBridge::new();
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let worker = {
+                let bridge = bridge.clone();
+                let gate = gate.clone();
+                thread::spawn(move || {
+                    gate.wait();
+                    bridge.accept_worker_result();
+                })
+            };
+            gate.wait();
+            let (decision_at, cancelled) = bridge.cancel_if_executing();
+            worker.join().unwrap();
+            let accepted_at = bridge.worker_lifecycle().result_accepted.unwrap();
+            assert_eq!(bridge.cancel.load(Ordering::SeqCst), cancelled);
+            if cancelled {
+                assert!(decision_at <= accepted_at);
+            } else {
+                assert!(accepted_at <= decision_at);
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -1501,7 +2106,7 @@ mod startup_policy_tests {
         s.instances[0].closing = None;
         s.records[0].status = "starting";
         s.records[0].isolation = Some(supervisor::IsolationStatus { requested:"strict", prepared:true, limits:Some(supervisor::IsolationLimits { memory_bytes:512<<20, pids:64, cpu_max:crate::linux_isolation::STARTUP_CPU_MAX.into() }), ..Default::default() });
-        s.catalog.apps.push(crate::desktop_catalog::CatalogEntry { id:2, title:"Second".into(), manifest_path:"unused".into() });
+        s.catalog.apps.push(crate::desktop_catalog::CatalogEntry { id:2, title:"Second".into(), manifest_path:"unused".into(), package_id:"dev.example.second".into(), #[cfg(target_os = "linux")] package_fingerprint:[0; 32] });
         (s,tx)
     }
     #[test] fn strict_startup_reserves_one_cpu_and_off_keeps_parallel_boot() {

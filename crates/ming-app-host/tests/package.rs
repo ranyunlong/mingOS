@@ -35,3 +35,39 @@ fn accepts_only_supported_manifest_and_local_wasm_entry() {
         );
     }
 }
+
+#[test]
+fn private_storage_is_explicit_and_requires_sdk_six() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    let file = dir.path().join("app.json");
+    let mut manifest = json!({"schemaVersion":1,"id":"dev.ming.app","version":"0.1.0","sdkVersion":6,"entry":"main.wasm"});
+    fs::write(&file, manifest.to_string()).unwrap();
+    assert!(!load_package(&file).unwrap().manifest.private_storage);
+    manifest["privateStorage"] = json!(true);
+    fs::write(&file, manifest.to_string()).unwrap();
+    assert!(load_package(&file).unwrap().manifest.private_storage);
+    manifest["sdkVersion"] = json!(5);
+    fs::write(&file, manifest.to_string()).unwrap();
+    assert!(load_package(&file).is_err());
+    manifest["privateStorage"] = json!("yes");
+    fs::write(&file, manifest.to_string()).unwrap();
+    assert!(load_package(&file).is_err());
+}
+
+#[test]
+fn public_storage_request_is_explicit_and_requires_sdk_six() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    let file = dir.path().join("app.json");
+    let mut manifest = json!({"schemaVersion":1,"id":"dev.ming.app","version":"0.1.0","sdkVersion":6,"entry":"main.wasm"});
+    fs::write(&file, manifest.to_string()).unwrap();
+    assert!(!load_package(&file).unwrap().manifest.public_storage);
+    manifest["publicStorage"] = json!(true);
+    fs::write(&file, manifest.to_string()).unwrap();
+    let requested = load_package(&file).unwrap();
+    assert!(requested.manifest.public_storage);
+    manifest["sdkVersion"] = json!(5);
+    fs::write(&file, manifest.to_string()).unwrap();
+    assert!(load_package(&file).is_err());
+}

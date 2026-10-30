@@ -15,6 +15,9 @@ pub struct CatalogEntry {
     pub id: u16,
     pub title: String,
     pub manifest_path: PathBuf,
+    pub package_id: String,
+    #[cfg(target_os = "linux")]
+    pub(crate) package_fingerprint: [u8; 32],
 }
 #[derive(Clone, Debug)]
 pub struct Catalog {
@@ -89,6 +92,7 @@ pub(crate) fn load_catalog_with_data(path: &Path) -> Result<(Catalog, BTreeMap<u
         .unwrap_or(Path::new("."));
     let mut apps = Vec::new();
     let mut bindings = BTreeMap::new();
+    let mut package_ids = BTreeSet::new();
     for app in disk.apps {
         let manifest = if app.manifest.is_absolute() {
             app.manifest
@@ -96,6 +100,7 @@ pub(crate) fn load_catalog_with_data(path: &Path) -> Result<(Catalog, BTreeMap<u
             parent.join(app.manifest)
         };
         let package = load_package(&manifest).context("DESKTOP_CATALOG_PACKAGE")?;
+        if !package_ids.insert(package.manifest.id.clone()) { bail!("DESKTOP_PACKAGE_ID_SHARED"); }
         if package.manifest.sdk_version < 2 {
             bail!("DESKTOP_GRAPHICAL_PACKAGE_REQUIRED");
         }
@@ -107,6 +112,9 @@ pub(crate) fn load_catalog_with_data(path: &Path) -> Result<(Catalog, BTreeMap<u
             id: app.id,
             title: app.title,
             manifest_path: manifest,
+            #[cfg(target_os = "linux")]
+            package_fingerprint: package.storage_fingerprint(),
+            package_id: package.manifest.id,
         });
     }
     Ok((Catalog {

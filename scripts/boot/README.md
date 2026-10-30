@@ -74,3 +74,30 @@ python -B -m unittest discover -s scripts/boot -p test_boot.py -v
 工具预检入口仍为 preflight.py、build-tools.py、inspect-tools.py、check-runtime.py、vm.py --probe-paused。工作区 Dockerfile 的日志压缩修订未重建；当前已验证工具镜像对应冻结输入 tools-build-20261025-localbase/inputs/。原 image 曾外部消失，已从保留 BuildKit 缓存恢复同一 ID。不要据容器 df 判断宿主空间，不清理其他任务资源。
 
 下一步由主线程完成 7D 后冻结新 payload/会话接口，再更新 review、生成新版本 bundle，开展 QMP 输入、长期预算、同 bundle 冷启动、持久数据和 Linux UID/namespaces/seccomp/cgroup 验证。
+
+
+## 关闭诊断的 worker 资源收据（2026-10-26）
+
+新源码在启用 input diagnostics 的 profile 中，沿用每秒一次的 `process-table`，为
+`__worker` 记录增加 `resources`。普通 profile 和关机前残留 worker 检查保持原字段与完整枚举。
+`worker_resources.py` 随新 bundle 打包并计入 `scriptSha256`；历史冻结 bundle 不受影响。
+当前只完成本地测试，尚未构建或启动包含此变更的新 kernel bundle。
+
+- `sampleStartMonotonicNs` / `sampleEndMonotonicNs`：guest 的 monotonic 采样窗口；各文件不是原子快照。
+- `process.pid` / `startTicks`：识别 PID 复用；`userTicks` / `systemTicks` 是累计 CPU tick，单位由
+  `clockTicksPerSecond` 明确给出。比较样本还须匹配同一 boot、PID、startTicks 和 cgroup。
+- `cgroup.cpuStat`：原始累计 `usage_usec`、`user_usec`、`system_usec`、`nr_periods`、
+  `nr_throttled`、`throttled_usec`，区分 CPU 使用量和限流时间；`cpuMax` 只读当前 quota/period，
+  单位微秒，`quotaUsec=null` 表示 `max`。不能把限流累计值直接当作本次 Close 的延迟。
+- `status=sampled` 才表示读取成功。`outside-owned-cgroup`、`identity-changed`、
+  `unavailable`（带异常类型）和 `invalid-data` 显式保留未知；不得用缺失样本或零值代替回收证据。
+
+采样仅访问 `/mingos/app-<app>-g-<generation>` 对应的 owned cgroup，每个资源文件最多读取
+4096 字节及 1 字节溢出探测。采样前后复核进程启动标识和 cgroup 路径；采样失败不删除进程表中的 worker。
+这些时间戳不能直接减去 Rust 自有 `Instant` 原点。父侧共用时钟的 Close/SDK/Result 时间线仍须补齐。
+
+本地完整回归（需要 Python 3.11+；本轮使用 3.12.14）：
+
+~~~sh
+python3 -B -m unittest discover -s scripts/boot -p 'test_*.py'
+~~~

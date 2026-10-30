@@ -23,10 +23,18 @@ Future bundle has infraApiVersion=1. Include virtio_blk/ext4 module closure and 
 Optional QEMU disk is verified before launch. Expected UUID/serial are fixed mingos.data_uuid/mingos.data_serial kernel parameters. Guest resolves only matching virtio by-id, checks ext4 UUID, mounts nodev,nosuid at /data/mingos. Atomic fsync/readback marker .mingos-boot/current.json contains bootId/counter; previous/current exported. Sync/unmount before poweroff. Guest never formats a device.
 
 ~~~text
-bundle.py --payload DIR --review JSON --output NEW_DIR [--isolation-probes FROZEN_DIR]
+bundle.py --payload DIR --review JSON --output NEW_DIR [--isolation-probes FROZEN_DIR] [--isolation-profile legacy-v1|source-v2]
 ~~~
 
-Strict diagnostic probes require exact strictProbeSha256 in a NEW review and hard-pinned frozen hashes. vm runs before desktop; vm-resources only after desktop exit and absence of active Kotlin workers. Probe output/cleanup markers remain diagnostic evidence, not final OS/Kotlin strict claims.
+The default legacy-v1 path retains the historical hard-coded probe hashes. The
+new source-v2 path requires strictProbeProfile: "source-v2" in the review,
+source/example/Cargo.lock/toolchain hashes frozen in
+probes/linux-isolation-source-v2/profile.json, and a built probe hash; review
+JSON cannot supply replacement hashes. The checked-in source-v2 profile remains
+build-pending until its offline Rust artifact is produced and independently
+reviewed. vm runs before desktop; vm-resources only after desktop exit and
+absence of active Kotlin workers. Probe output/cleanup markers remain diagnostic
+evidence, not final OS/Kotlin strict claims.
 
 ## State-file: matches main
 

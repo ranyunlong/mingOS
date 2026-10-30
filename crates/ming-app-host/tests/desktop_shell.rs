@@ -47,6 +47,37 @@ fn pixel(f: &RenderedFrame, x: usize, y: usize) -> u32 {
 }
 
 #[test]
+fn trusted_storage_prompt_covers_content_and_has_stable_hit_targets() {
+    use ming_app_host::graphics::desktop_shell::{StoragePrompt, storage_prompt_geometry};
+    let prompt = StoragePrompt::new("dev.example.app", "1.2.3", &"a".repeat(64), false).unwrap();
+    for (width, height) in [(320, 240), (640, 480)] {
+        let src = root(width, height);
+        let out = DesktopShell::cpu().draw_with_storage_prompt(&src, &[], &[], Some(&prompt)).unwrap();
+        let geometry = storage_prompt_geometry(width as i32, height as i32, false).unwrap();
+        assert_ne!(pixel(&out, geometry.dialog.x as usize + 3, geometry.dialog.y as usize + 3), 0xff123456);
+        assert!(geometry.dialog.contains(geometry.deny.x, geometry.deny.y));
+        let allow = geometry.allow.unwrap();
+        assert!(geometry.dialog.contains(allow.x, allow.y));
+        assert!(!geometry.deny.contains(allow.x, allow.y));
+        assert_eq!(out.sequence, src.sequence);
+    }
+    let replacement = storage_prompt_geometry(320, 240, true).unwrap();
+    assert!(replacement.allow.is_none());
+    assert!(StoragePrompt::new("../bad", "1.2.3", &"a".repeat(64), false).is_err());
+    assert!(StoragePrompt::new("dev.example.app", "1.2.3", "bad", false).is_err());
+}
+
+#[test]
+fn public_storage_prompt_is_distinct_from_private_storage() {
+    use ming_app_host::graphics::desktop_shell::{StoragePrompt, storage_prompt_geometry};
+    let prompt = StoragePrompt::public_request("dev.example.app").unwrap();
+    let source = root(640, 480);
+    let rendered = DesktopShell::cpu().draw_with_storage_prompt(&source, &[], &[], Some(&prompt)).unwrap();
+    let geometry = storage_prompt_geometry(640, 480, false).unwrap();
+    assert_ne!(pixel(&rendered, geometry.dialog.x as usize + 3, geometry.dialog.y as usize + 3), pixel(&source, geometry.dialog.x as usize + 3, geometry.dialog.y as usize + 3));
+}
+
+#[test]
 fn top_title_covers_lower_content_and_keeps_receipt() {
     let src = root(640, 480);
     let windows = [window(1, 1, 30, 40, true), window(2, 2, 80, 100, true)];
@@ -382,6 +413,13 @@ fn hardware_gpu_matches_scalar_oracle_without_implicit_readback() -> anyhow::Res
     }
     let (held_frame, held_pixels) = held.unwrap();
     assert_eq!(held_frame.read_pixels()?.as_slice(), held_pixels.as_slice());
+    for replacement in [false, true] {
+        let prompt = ming_app_host::graphics::desktop_shell::StoragePrompt::new(
+            "dev.example.application", "1.2.3", &"a".repeat(64), replacement)?;
+        let expected = cpu.draw_with_storage_prompt(&cpu_source, &[], &[], Some(&prompt))?;
+        let actual = gpu.draw_with_storage_prompt(&source, &[], &[], Some(&prompt))?;
+        assert_eq!(actual.read_pixels()?.as_slice(), expected.cpu_pixels().unwrap());
+    }
     assert_eq!(session.stats()?.readback_bytes, 0);
     assert_eq!(session.stats()?.render_submissions, 0);
     assert_eq!(

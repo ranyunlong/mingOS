@@ -17,3 +17,16 @@ v11诊断证明Counter的finally/dispose/final logs均已执行，父进程解�
 诊断先保留为历史；生产修复通过后再生成新的冻结包。原v8/v9、追加replay和v11 RED不改称通过。窗口/Dock恢复测试仍等待此根因修复。
 
 补充：Result接受后的native退出阶段沿用桌面既有300000ms进度看门狗。它不是整个进程必须2秒退出的硬实时承诺；Close2s/200ms只约束尚未接受Result的执行阶段。原生故障探针使用1秒测试配置，不是生产超时值。
+
+
+后续快速收尾修复：真实SDK5 worker已接收Cancel后仍可能在看门狗下次10ms采样前退出，
+旧完成判断只读watcher标记而交付成功。最终交付现在同时检查原始显式cancel标志，
+不将普通Close作为Cancel，不改变已接受Result后的期限保护。原问题130次中64次复现，修复后130/130；
+完整范围与未通过项见[持续会话验证](../../persistent-recovery-verification.md)。
+
+
+2026-10-27 关闭时间线补充：父侧共享状态同时保留首次 SDK5+ 终态回复写出、Result 接受和 Child 回收的 Instant。
+Result 接受与期限取消仍使用同一 Mutex；取消决策时间也在锁内采集，避免解锁后的接受造成日志顺序误导。
+桌面保留 Close 请求起点，并在轮询及最终 join 后读取收据，每代只记录一次，沿用 trace512 上限。
+收据不等于自然成功，最终 Outcome、显式取消、ExitStatus、故障分类与 watchdog 继续按原路径检查。
+完整含义与验证范围见[关闭生命周期时间线](../../close-lifecycle-verification.md)。

@@ -57,3 +57,11 @@
 - [严格隔离 Linux 开发系统冷启动验收](boot-system-verification.md)：同bundle同盘两次实际kernel启动，SDK数据/文本、自然退出、隔离与关机的原始证据。
 
 - [可信系统镜像与实际冷启动](system-image-verification.md)：静态可信Module、原Wasm/SDK边界、完整kernel和同盘双启动证据。
+
+- [持续会话取消与异常恢复验证](persistent-recovery-verification.md)：快速收尾取消修复、真实worker130项、Kotlin/多代trap/RPC限额资格及原时序RED边界。
+
+- [关闭生命周期时间线](close-lifecycle-verification.md)：统一父侧时钟的 Close、SDK5+ 回复写出、Result 接受、期限决策与原生回收收据。
+
+- [AppData写入进程崩溃与恢复验证](app-data-process-crash-verification.md)：生产存储API的8个SIGKILL场景、16个子进程回收、完整文件与孤儿元数据审计。
+
+- [交付主线恢复检查点](boot-delivery-recovery-20261027.md)：离线工具镜像、当前系统Host、kernel候选输入和仍缺的原冻结输入。

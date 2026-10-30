@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, BufWriter, Read, Write};
 
 pub fn read_json<T: DeserializeOwned>(
     reader: &mut impl BufRead,
@@ -25,9 +25,12 @@ pub fn read_json<T: DeserializeOwned>(
 }
 
 pub fn write_json(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
-    serde_json::to_writer(&mut *writer, value)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
+    // Coalesce serializer fragments before touching an unbuffered pipe, while
+    // bounding temporary storage and flushing every complete protocol line.
+    let mut buffered = BufWriter::with_capacity(8192, writer);
+    serde_json::to_writer(&mut buffered, value)?;
+    buffered.write_all(b"\n")?;
+    buffered.flush()?;
     Ok(())
 }
 
@@ -41,6 +44,8 @@ pub struct Init {
     pub sdk_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuel_capacity: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<IsolationPolicy>,
 }

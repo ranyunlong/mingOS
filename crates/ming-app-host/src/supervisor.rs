@@ -141,6 +141,14 @@ pub struct Outcome {
 #[derive(Clone, Default)]
 pub(crate) struct AppDataService {
     grant: Option<crate::app_data::AppDataGrant>,
+    #[cfg(target_os = "linux")]
+    private_files: Option<crate::private_file_rpc::PrivateFileRpc>,
+    #[cfg(target_os = "linux")]
+    private_files_package: Option<Arc<crate::package::Package>>,
+    #[cfg(target_os = "linux")]
+    public_files: Option<crate::private_file_rpc::PublicFileRpc>,
+    #[cfg(target_os = "linux")]
+    public_files_package: Option<Arc<crate::package::Package>>,
     telemetry: Arc<Mutex<AppDataStats>>,
 }
 #[derive(Clone, Debug, Default, Serialize)]
@@ -166,7 +174,41 @@ impl AppDataService {
     pub(crate) fn new(grant: Option<crate::app_data::AppDataGrant>) -> Self {
         Self { grant, ..Self::default() }
     }
-    pub(crate) fn revoke(&self) { if let Some(grant) = &self.grant { grant.revoke(); } }
+    pub(crate) fn revoke(&self) {
+        if let Some(grant) = &self.grant { grant.revoke(); }
+        #[cfg(target_os = "linux")]
+        if let Some(files) = &self.private_files { files.close(); }
+        #[cfg(target_os = "linux")]
+        if let Some(files) = &self.public_files { files.close(); }
+    }
+    #[cfg(all(feature = "desktop", target_os = "linux"))]
+    pub(crate) fn with_private_files_for_package(mut self, session: crate::app_data::PrivateFileSession, package: crate::package::Package) -> Self {
+        self.private_files = Some(crate::private_file_rpc::PrivateFileRpc::new(session));
+        self.private_files_package = Some(Arc::new(package));
+        self
+    }
+    #[cfg(all(feature = "desktop", target_os = "linux"))]
+    pub(crate) fn with_public_files_for_package(mut self, session: crate::app_data::PublicFileSession, package: crate::package::Package) -> Self {
+        self.public_files = Some(crate::private_file_rpc::PublicFileRpc::new(session));
+        self.public_files_package = Some(Arc::new(package));
+        self
+    }
+    fn dispatch_private_files(&self, sdk: u32, id: u64, args: &[i32], payload: Option<&str>) -> Reply {
+        let error = |value| Reply { id, value, payload: None, fuel_grant: None };
+        if sdk < 6 { return error(-1); }
+        if !args.is_empty() || payload.is_none() { return error(-2); }
+        #[cfg(target_os = "linux")]
+        if let Some(files) = &self.private_files { return files.dispatch(id, payload.unwrap()); }
+        error(-1)
+    }
+    pub(crate) fn dispatch_public_files(&self, sdk: u32, id: u64, args: &[i32], payload: Option<&str>) -> Reply {
+        let error = |value| Reply { id, value, payload: None, fuel_grant: None };
+        if sdk < 6 { return error(-1); }
+        if !args.is_empty() || payload.is_none() { return error(-2); }
+        #[cfg(target_os = "linux")]
+        if let Some(files) = &self.public_files { return files.dispatch(id, payload.unwrap()); }
+        error(-1)
+    }
     #[cfg(feature = "desktop")]
     pub(crate) fn snapshot(&self) -> Option<AppDataStats> {
         self.grant.as_ref().map(|_| self.telemetry.lock().unwrap_or_else(|e| e.into_inner()).clone())
@@ -272,6 +314,26 @@ fn run_inner(
     }
     let started = Instant::now();
     let package = load_package(&options.manifest_path)?;
+    #[cfg(target_os = "linux")]
+    if app_data.private_files.as_ref().is_some_and(|files| !files.belongs_to(&package.manifest.id)) {
+        bail!("PRIVATE_FILES_IDENTITY_MISMATCH");
+    }
+    #[cfg(target_os = "linux")]
+    if app_data.private_files.is_some() && app_data.private_files_package.as_deref() != Some(&package) {
+        bail!("PRIVATE_FILES_PACKAGE_CHANGED");
+    }
+    #[cfg(target_os = "linux")]
+    if app_data.private_files.as_ref().is_some_and(|files| !files.belongs_to_package(&package)) {
+        bail!("PRIVATE_FILES_PACKAGE_NOT_AUTHORIZED");
+    }
+    #[cfg(target_os = "linux")]
+    if app_data.public_files.as_ref().is_some_and(|files| !files.belongs_to(&package.manifest.id)) {
+        bail!("PUBLIC_FILES_IDENTITY_MISMATCH");
+    }
+    #[cfg(target_os = "linux")]
+    if app_data.public_files.is_some() && app_data.public_files_package.as_deref().is_none_or(|bound| bound.manifest.id != package.manifest.id) {
+        bail!("PUBLIC_FILES_PACKAGE_CHANGED");
+    }
     let sdk = package.manifest.sdk_version;
     let module_source = if crate::system_modules::lookup(sdk, &package.bytes).is_some() { "system-image" } else { "jit" };
     let mut broker = Broker::new_with_sdk(&options.grants, sdk)?;
@@ -285,6 +347,12 @@ fn run_inner(
     broker.set_renderer(options.renderer)?;
     let mut input_events: VecDeque<_> = options.input_events.iter().copied().collect();
     // Resolve all fallible executable lookup before creating owned isolation leaves.
+    #[cfg(test)]
+    let worker_executable = match std::env::var_os("MING_TEST_PRIVATE_WORKER") {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_exe()?,
+    };
+    #[cfg(not(test))]
     let worker_executable = std::env::current_exe()?;
     let mut kernel = if let Some(config) = &isolation {
         let limits = crate::linux_isolation::Limits::new(512 << 20, 64)?;
@@ -408,6 +476,7 @@ fn run_inner(
                 memory_bytes: options.memory_bytes,
                 sdk_version: sdk,
                 fuel_capacity: persistent.then_some(options.fuel),
+                max_requests: persistent.then_some(options.max_requests),
                 isolation: isolation_policy.clone(),
             },
         )?;
@@ -487,7 +556,12 @@ fn run_inner(
                         state.parked = persistent && cooperative;
                     }
                     let service_started = Instant::now();
-                    let mut reply = if method.starts_with("app_data_") {
+                    let mut terminal_reply = None;
+                    let mut reply = if method == "private_file_call" {
+                        app_data.dispatch_private_files(sdk, id, &args, payload.as_deref())
+                    } else if method == "public_file_call" {
+                        app_data.dispatch_public_files(sdk, id, &args, payload.as_deref())
+                    } else if method.starts_with("app_data_") {
                         app_data.dispatch(sdk, id, &method, &args, payload.as_deref())
                     } else if sdk >= 6
                         && method == "input_poll"
@@ -586,11 +660,14 @@ fn run_inner(
                             broker.check_render_backend()?;
                             match event {
                                 Ok(Some(event)) => {
-                                    terminal_wait_seen |= matches!(
-                                        event.kind,
-                                        crate::frame_clock::EventKind::Close
-                                            | crate::frame_clock::EventKind::Cancel
-                                    );
+                                    if matches!(event.kind, crate::frame_clock::EventKind::Close | crate::frame_clock::EventKind::Cancel) {
+                                        terminal_wait_seen = true;
+                                        terminal_reply = Some(if event.kind == crate::frame_clock::EventKind::Close {
+                                            crate::ui::TerminalReplyKind::Close
+                                        } else {
+                                            crate::ui::TerminalReplyKind::Cancel
+                                        });
+                                    }
                                     Reply {
                                         id,
                                         fuel_grant: None,
@@ -724,23 +801,7 @@ fn run_inner(
                             service_budget.charge(service_started.elapsed(), started.elapsed());
                         if !delay.is_zero() {
                             progress.lock().expect("progress mutex").parked = true;
-                            let until = Instant::now()
-                                .checked_add(delay)
-                                .context("SERVICE_BUDGET_OVERFLOW")?;
-                            while Instant::now() < until {
-                                if options
-                                    .live
-                                    .as_ref()
-                                    .is_some_and(|v| v.cancel.load(Ordering::SeqCst) || v.closed())
-                                {
-                                    bail!("APP_CANCELLED");
-                                }
-                                thread::sleep(
-                                    until
-                                        .saturating_duration_since(Instant::now())
-                                        .min(Duration::from_millis(10)),
-                                );
-                            }
+                            wait_service_budget(delay, options.live.as_ref())?;
                         }
                     }
                     if let Some(remaining) = remaining_fuel {
@@ -754,6 +815,9 @@ fn run_inner(
                         )?);
                     }
                     write_json(&mut input, &reply)?;
+                    if let (Some(live), Some(kind)) = (&options.live, terminal_reply) {
+                        live.terminal_reply_written(kind);
+                    }
                     {
                         let mut state = progress.lock().expect("progress mutex");
                         if !persistent || state.initialized {
@@ -804,7 +868,12 @@ fn run_inner(
     let status = loop {
         let state = child.lock().expect("worker mutex").try_wait();
         match state {
-            Ok(Some(s)) => break Ok(s),
+            Ok(Some(s)) => {
+                if let Some(live) = &options.live {
+                    live.worker_reaped();
+                }
+                break Ok(s);
+            }
             Ok(None) => thread::sleep(Duration::from_millis(2)),
             Err(e) => break Err(e),
         }
@@ -818,7 +887,11 @@ fn run_inner(
     if timed_out.load(Ordering::SeqCst) {
         bail!("TIMEOUT: worker exceeded {}ms", options.timeout_ms);
     }
-    if cancelled.load(Ordering::SeqCst) {
+    // A fast exit can finish before the watcher's next cancellation poll.
+    // Keep the parent's explicit cancel authoritative when delivering the result.
+    if cancelled.load(Ordering::SeqCst)
+        || options.live.as_ref().is_some_and(|live| live.cancel.load(Ordering::SeqCst))
+    {
         bail!("APP_CANCELLED");
     }
     result.with_context(|| {
@@ -882,6 +955,73 @@ impl Outcome {
             self.gpu_stats = Some(session.stats()?);
         }
         Ok(())
+    }
+}
+
+// Keep the existing service admission delay separate from worker close delivery.
+fn wait_service_budget(delay: Duration, live: Option<&ViewBridge>) -> Result<()> {
+    let until = Instant::now()
+        .checked_add(delay)
+        .context("SERVICE_BUDGET_OVERFLOW")?;
+    while Instant::now() < until {
+        // Normal Close still needs this SDK reply before the worker can handle it.
+        // The desktop grace deadline and explicit cancellation set the cancel flag.
+        if live.is_some_and(|v| v.cancel.load(Ordering::SeqCst)) {
+            bail!("APP_CANCELLED");
+        }
+        thread::sleep(
+            until
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod service_delay_tests {
+    use super::*;
+
+    #[test]
+    fn normal_close_preserves_service_delay_and_the_next_close_event() {
+        let (bridge, _sender) = ViewBridge::new();
+        let mut budget = crate::execution_budget::ServiceBudget::new();
+        // Exhaust the unchanged 1s service burst; 1ms excess costs 2ms of delay.
+        let delay = budget.charge(Duration::from_millis(1001), Duration::ZERO);
+        assert_eq!(delay, Duration::from_millis(2));
+        bridge.request_close();
+        let started = Instant::now();
+        wait_service_budget(delay, Some(&bridge))
+            .expect("normal Close must let the SDK reply finish during its grace period");
+        assert!(started.elapsed() >= delay, "Close must not waive service admission");
+        assert!(!bridge.cancel.load(Ordering::SeqCst));
+
+        let mut clock = crate::frame_clock_service::FrameClockService::persistent(Instant::now());
+        let mut scripted = VecDeque::new();
+        let mut counts = [0; 9];
+        let event = clock.wait(
+            crate::frame_clock::WaitRequest { frame: false, nonblocking: false, deadline: None },
+            Some(&bridge), &mut scripted, &mut counts,
+        ).unwrap().expect("the worker can receive Close after its SDK reply");
+        assert_eq!(event.kind, crate::frame_clock::EventKind::Close);
+        assert_eq!(clock.stats.closes, 1);
+    }
+
+    #[test]
+    fn explicit_cancel_interrupts_service_delay() {
+        let (bridge, _sender) = ViewBridge::new();
+        bridge.cancel.store(true, Ordering::SeqCst);
+        let error = wait_service_budget(Duration::from_millis(2), Some(&bridge)).unwrap_err();
+        assert_eq!(error.to_string(), "APP_CANCELLED");
+    }
+
+    #[test]
+    fn close_does_not_hide_a_later_explicit_cancel() {
+        let (bridge, _sender) = ViewBridge::new();
+        bridge.request_close();
+        bridge.cancel.store(true, Ordering::SeqCst);
+        let error = wait_service_budget(Duration::from_millis(2), Some(&bridge)).unwrap_err();
+        assert_eq!(error.to_string(), "APP_CANCELLED");
     }
 }
 
@@ -1023,9 +1163,237 @@ fn cleanup_kernel(group:&mut Option<crate::linux_isolation::WorkerIsolation>,chi
 #[cfg(all(test, feature = "desktop"))]
 mod app_data_host_tests {
     use super::*;
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // AppDataRoot requires a private directory, independent of the test runner's umask.
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        directory
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the typed Kotlin probe and an explicit test worker binary"]
+    fn default_private_data_survives_worker_kill_and_fresh_parent() {
+        use std::os::unix::process::ExitStatusExt;
+        let manifest = PathBuf::from(std::env::var_os("MING_TEST_PRIVATE_MANIFEST").expect("manifest required"));
+        let package = crate::package::load_package(&manifest).unwrap();
+        let mut sibling = crate::package::load_package(&manifest).unwrap();
+        sibling.manifest.id = "dev.example.sibling".into();
+        if let Some(root) = std::env::var_os("MING_TEST_PRIVATE_CRASH_ROOT") {
+            let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(crate::app_data::AppDataRoot::open(root).unwrap()).unwrap());
+            assert_eq!(authority.default_private_session_for_package(&package).unwrap().read_file("note.txt").unwrap(), b"alpha");
+            assert_eq!(authority.default_private_session_for_package(&sibling).unwrap().read_file("note.txt").unwrap(), b"sibling");
+            return;
+        }
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let temp = private_tempdir();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(crate::app_data::AppDataRoot::open(temp.path()).unwrap()).unwrap());
+        let session = authority.default_private_session_for_package(&package).unwrap();
+        let sibling_session = authority.default_private_session_for_package(&sibling).unwrap();
+        assert!(sibling_session.write_file("note.txt", b"sibling").unwrap().directory_synced);
+        let rpc = crate::private_file_rpc::PrivateFileRpc::new(session.clone());
+        let worker = std::env::var_os("MING_TEST_PRIVATE_WORKER").expect("worker required");
+        let mut child = ChildGuard(Command::new(worker).arg("__worker").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap());
+        let mut input = child.0.stdin.take().unwrap();
+        let mut output = BufReader::new(child.0.stdout.take().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let message = read_json::<serde_json::Value>(&mut output, 100_000);
+            let _ = tx.send(message);
+        });
+        write_json(&mut input, &serde_json::json!({"wasm":STANDARD.encode(&package.bytes),"fuel":100000000,"memoryBytes":67108864,"sdkVersion":6})).unwrap();
+        let message = rx.recv_timeout(Duration::from_secs(20)).unwrap().unwrap().unwrap();
+        assert_eq!(message["method"], "private_file_call");
+        let reply = rpc.dispatch(message["id"].as_u64().unwrap(), message["payload"].as_str().unwrap());
+        assert_eq!(reply.value, 5);
+        assert_eq!(reply.payload.as_deref(), Some("1"));
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        reader.join().unwrap();
+        drop(input);
+        rpc.close();
+        drop(rpc);
+        drop(session);
+        drop(sibling_session);
+        drop(authority);
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "supervisor::app_data_host_tests::default_private_data_survives_worker_kill_and_fresh_parent", "--ignored"])
+            .env("MING_TEST_PRIVATE_CRASH_ROOT", temp.path())
+            .status().unwrap();
+        assert!(status.success(), "fresh parent failed: {status}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_private_sessions_are_isolated_and_survive_reopen() {
+        let temp = private_tempdir();
+        let root = crate::app_data::AppDataRoot::open(temp.path()).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(root.clone()).unwrap());
+        let make_package = |id: &str| crate::package::Package {
+            manifest: serde_json::from_value(serde_json::json!({"schemaVersion":1,"id":id,"version":"1.0.0","sdkVersion":6,"entry":"main.wasm"})).unwrap(),
+            bytes: b"\0asm\x01\0\0\0".to_vec(),
+        };
+        let a = make_package("dev.example.alpha");
+        let b = make_package("dev.example.beta");
+        let first = authority.default_private_session_for_package(&a).unwrap();
+        let other = authority.default_private_session_for_package(&b).unwrap();
+        first.write_file("note", b"alpha").unwrap();
+        assert_eq!(other.read_file("note"), Err(crate::app_data::AppDataError::NotFound));
+        other.write_file("note", b"beta").unwrap();
+        authority.revoke(&a.manifest.id).unwrap();
+        assert_eq!(first.read_file("note").unwrap(), b"alpha");
+        first.close();
+        assert_eq!(first.read_file("note"), Err(crate::app_data::AppDataError::Denied));
+        drop(first);
+        drop(other);
+        drop(authority);
+        let reopened = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(root).unwrap());
+        assert_eq!(reopened.default_private_session_for_package(&a).unwrap().read_file("note").unwrap(), b"alpha");
+        assert_eq!(reopened.default_private_session_for_package(&b).unwrap().read_file("note").unwrap(), b"beta");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_file_dispatch_uses_bound_session_and_closes_on_revoke() {
+        let temp = private_tempdir();
+        let root = crate::app_data::AppDataRoot::open(temp.path()).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::new(root));
+        let app = "dev.example.alpha";
+        authority.authorize(app).unwrap();
+        let package = crate::package::Package {
+            manifest: serde_json::from_str(r#"{"schemaVersion":1,"id":"dev.example.alpha","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap(),
+            bytes: b"\0asm\x01\0\0\0".to_vec(),
+        };
+        let service = AppDataService::default().with_private_files_for_package(authority.file_session(app).unwrap(), package);
+        let payload = r#"{"op":"list","path":"","offset":0,"limit":1}"#;
+        assert_eq!(AppDataService::default().dispatch_private_files(6, 1, &[], Some(payload)).value, -1);
+        assert_eq!(service.dispatch_private_files(5, 1, &[], Some(payload)).value, -1);
+        assert_eq!(service.dispatch_private_files(6, 1, &[1], Some(payload)).value, -2);
+        assert_eq!(service.dispatch_private_files(6, 1, &[], None).value, -2);
+        assert_eq!(service.dispatch_private_files(6, 1, &[], Some(payload)).value, 0);
+        service.revoke();
+        assert_eq!(service.dispatch_private_files(6, 2, &[], Some(payload)).value, -1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_file_launch_rejects_replaced_module_with_same_package_id() {
+        let temp = private_tempdir();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        let module = temp.path().join("main.wasm");
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.alpha","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        std::fs::write(&module, wat::parse_str("(module)").unwrap()).unwrap();
+        let approved = crate::package::load_package(&manifest).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::new(crate::app_data::AppDataRoot::open(&data).unwrap()));
+        authority.authorize("dev.example.alpha").unwrap();
+        let legacy_service = AppDataService::default().with_private_files_for_package(
+            authority.file_session("dev.example.alpha").unwrap(), crate::package::load_package(&manifest).unwrap());
+        let pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let error = run_desktop(Options::new(manifest.clone()), pid.clone(), false,
+            DesktopLaunchContext { isolation: None, app_data: legacy_service }).unwrap_err();
+        assert!(format!("{error:#}").contains("PRIVATE_FILES_PACKAGE_NOT_AUTHORIZED"), "{error:#}");
+        assert_eq!(pid.load(Ordering::SeqCst), 0);
+        authority.revoke("dev.example.alpha").unwrap();
+        authority.authorize_package(&approved).unwrap();
+        let session = authority.file_session_for_package(&approved).unwrap();
+        let service = AppDataService::default().with_private_files_for_package(
+            session, approved);
+        std::fs::write(&module, wat::parse_str("(module (func))").unwrap()).unwrap();
+        let error = run_desktop(Options::new(manifest.clone()), pid.clone(), false,
+            DesktopLaunchContext { isolation: None, app_data: service }).unwrap_err();
+        assert!(format!("{error:#}").contains("PRIVATE_FILES_PACKAGE_CHANGED"), "{error:#}");
+        assert_eq!(pid.load(Ordering::SeqCst), 0);
+
+        std::fs::write(&module, wat::parse_str("(module)").unwrap()).unwrap();
+        let approved = crate::package::load_package(&manifest).unwrap();
+        let session = authority.file_session_for_package(&approved).unwrap();
+        let monitor = session.clone();
+        let service = AppDataService::default().with_private_files_for_package(session, approved);
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.alpha","version":"1.0.1","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        let error = run_desktop(Options::new(manifest), pid.clone(), false,
+            DesktopLaunchContext { isolation: None, app_data: service }).unwrap_err();
+        assert!(format!("{error:#}").contains("PRIVATE_FILES_PACKAGE_CHANGED"), "{error:#}");
+        assert_eq!(pid.load(Ordering::SeqCst), 0);
+        assert_eq!(monitor.read_file("x"), Err(crate::app_data::AppDataError::Denied));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the authorized Kotlin probe and an explicit test worker binary"]
+    fn private_file_supervisor_runs_authorized_kotlin_and_rejects_mismatched_identity() {
+        let manifest = std::path::PathBuf::from(std::env::var_os("MING_TEST_PRIVATE_MANIFEST").expect("manifest required"));
+        let temp = private_tempdir();
+        let root = crate::app_data::AppDataRoot::open(temp.path()).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::new(root));
+        let id = crate::package::load_package(&manifest).unwrap().manifest.id;
+        let other = "dev.example.other";
+        let consent = crate::storage_consent::StorageConsent::new(authority.clone());
+        let pending = match consent.request(crate::package::load_package(&manifest).unwrap()).unwrap() {
+            crate::storage_consent::ConsentRequest::Prompt(pending) => pending,
+            _ => panic!("new package must request consent"),
+        };
+        let granted = pending.allow().unwrap();
+        authority.authorize(other).unwrap();
+
+        let mut options = Options::new(manifest.clone());
+        options.timeout_ms = 20_000;
+        let wrong_session = authority.file_session(other).unwrap();
+        let wrong_service = AppDataService::default().with_private_files_for_package(wrong_session, crate::package::load_package(&manifest).unwrap());
+        let error = run_desktop(options, Arc::new(std::sync::atomic::AtomicU32::new(0)), false,
+            DesktopLaunchContext { isolation: None, app_data: wrong_service }).unwrap_err();
+        assert!(format!("{error:#}").contains("PRIVATE_FILES_IDENTITY_MISMATCH"), "{error:#}");
+
+        let mut options = Options::new(manifest.clone());
+        options.timeout_ms = 20_000;
+        let session = granted.session;
+        let monitor = session.clone();
+        let service = AppDataService::default().with_private_files_for_package(session, granted.package);
+        let outcome = run_desktop(options, Arc::new(std::sync::atomic::AtomicU32::new(0)), false,
+            DesktopLaunchContext { isolation: None, app_data: service }).unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.events.iter().any(|event| event.code == 7102 && event.value == 1));
+        assert_eq!(authority.read_file(&id, "note.txt").unwrap(), b"alpha");
+        assert_eq!(monitor.read_file("note.txt"), Err(crate::app_data::AppDataError::Denied));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the large Kotlin probe and an explicit test worker binary"]
+    fn private_file_supervisor_runs_large_kotlin_upload() {
+        let manifest = std::path::PathBuf::from(std::env::var_os("MING_TEST_PRIVATE_LARGE_MANIFEST").expect("manifest required"));
+        let temp = private_tempdir();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::new(
+            crate::app_data::AppDataRoot::open(temp.path()).unwrap()));
+        let id = crate::package::load_package(&manifest).unwrap().manifest.id;
+        authority.authorize_package(&crate::package::load_package(&manifest).unwrap()).unwrap();
+        let session = authority.file_session_for_package(&crate::package::load_package(&manifest).unwrap()).unwrap();
+        let monitor = session.clone();
+        let service = AppDataService::default().with_private_files_for_package(session, crate::package::load_package(&manifest).unwrap());
+        let mut options = Options::new(manifest);
+        options.timeout_ms = 30_000;
+        options.fuel = 100_000_000;
+        let outcome = run_desktop(options, Arc::new(std::sync::atomic::AtomicU32::new(0)), false,
+            DesktopLaunchContext { isolation: None, app_data: service }).unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.events.iter().any(|event| event.code == 7103 && event.value == 1));
+        assert_eq!(authority.read_file(&id, "large.txt").unwrap(), b"abc".repeat(43688));
+        assert_eq!(monitor.read_file("large.txt"), Err(crate::app_data::AppDataError::Denied));
+    }
+
     #[test]
     fn malformed_parent_bulk_never_writes_and_data_replies_never_grant_fuel() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let root = crate::app_data::AppDataRoot::open(temp.path()).unwrap();
         let grant = root.grant("trusted", &[1]).unwrap();
         let service = AppDataService::new(Some(grant.clone()));
@@ -1041,7 +1409,7 @@ mod app_data_host_tests {
     }
     #[test]
     fn committed_unsynced_receipt_survives_revoke_and_is_not_rollback_error() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_tempdir();
         let grant = crate::app_data::AppDataRoot::open(temp.path()).unwrap().grant("trusted", &[1]).unwrap();
         let service = AppDataService::new(Some(grant.clone())); let monitor = service.clone();
         grant.fail_next_directory_sync();

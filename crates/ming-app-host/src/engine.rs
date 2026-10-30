@@ -4,11 +4,17 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use std::io::{self, BufReader};
+use std::{
+    collections::BTreeMap,
+    io::{self, BufReader},
+    time::Instant,
+};
 use wasmtime::{
     Caller, Config, Engine, ExternType, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
     Trap, ValType,
 };
+
+const FILE_LENGTH_CACHE_LIMIT: usize = 64;
 
 struct Rpc {
     input: BufReader<io::Stdin>,
@@ -16,9 +22,22 @@ struct Rpc {
     sequence: u64,
     fuel: crate::execution_budget::WorkerFuel,
     remaining: Option<u64>,
+    request_budget: Option<crate::execution_budget::RequestBudget>,
+    logical_requests: u64,
+    started: Instant,
+    file_lengths: BTreeMap<i32, i32>,
 }
 impl Rpc {
     fn exchange(&mut self, method: &str, args: &[i32], payload: Option<String>) -> Result<Reply> {
+        self.accept_request()?;
+        self.exchange_accepted(method, args, payload)
+    }
+    fn exchange_accepted(
+        &mut self,
+        method: &str,
+        args: &[i32],
+        payload: Option<String>,
+    ) -> Result<Reply> {
         self.sequence = self.sequence.checked_add(1).context("PROTOCOL_SEQUENCE")?;
         let remaining_fuel = self.remaining.take();
         write_json(
@@ -40,12 +59,57 @@ impl Rpc {
         }
         Ok(reply)
     }
+    fn accept_request(&mut self) -> Result<()> {
+        self.logical_requests = self
+            .logical_requests
+            .checked_add(1)
+            .context("PROTOCOL_SEQUENCE")?;
+        if let Some(budget) = &mut self.request_budget {
+            budget
+                .accept(self.started.elapsed())
+                .map_err(|error| anyhow::anyhow!("{error}: requests={}", self.logical_requests))?;
+        }
+        Ok(())
+    }
     fn call(&mut self, method: &str, args: &[i32]) -> Result<i32> {
         let reply = self.exchange(method, args, None)?;
         if reply.payload.is_some() {
             bail!("PROTOCOL_UNEXPECTED_PAYLOAD");
         }
         Ok(reply.value)
+    }
+    fn file_open(&mut self, id: i32) -> Result<i32> {
+        let handle = self.call("file_open", &[id])?;
+        if handle >= 0 {
+            self.file_lengths.remove(&handle);
+        }
+        Ok(handle)
+    }
+    fn file_length(&mut self, handle: i32) -> Result<i32> {
+        self.accept_request()?;
+        if self.request_budget.is_some() {
+            if let Some(value) = self.file_lengths.get(&handle) {
+                return Ok(*value);
+            }
+        }
+        let reply = self.exchange_accepted("file_length", &[handle], None)?;
+        if reply.payload.is_some() {
+            bail!("PROTOCOL_UNEXPECTED_PAYLOAD");
+        }
+        if self.request_budget.is_some() {
+            if self.file_lengths.len() == FILE_LENGTH_CACHE_LIMIT
+                && !self.file_lengths.contains_key(&handle)
+            {
+                self.file_lengths.clear();
+            }
+            self.file_lengths.insert(handle, reply.value);
+        }
+        Ok(reply.value)
+    }
+    fn file_close(&mut self, handle: i32) -> Result<i32> {
+        let value = self.call("file_close", &[handle])?;
+        self.file_lengths.remove(&handle);
+        Ok(value)
     }
 }
 
@@ -79,6 +143,10 @@ pub fn validate_imports(module: &Module, sdk_version: u32) -> Result<()> {
             ("ming_data_v1", "read") if sdk_version >= 6 => 4,
             ("ming_data_v1", "write") if sdk_version >= 6 => 3,
             ("ming_data_v1", "size" | "delete") if sdk_version >= 6 => 1,
+            ("ming_private_files_v1", "call") if cfg!(target_os = "linux") && sdk_version >= 6 => 4,
+            ("ming_private_files_v2", "call") if cfg!(target_os = "linux") && sdk_version >= 6 => 4,
+            ("ming_public_files_v1", "call") if cfg!(target_os = "linux") && sdk_version >= 6 => 4,
+            ("ming_public_files_v2", "call") if cfg!(target_os = "linux") && sdk_version >= 6 => 4,
             _ => bail!("IMPORT_DENIED: {}.{}", import.module(), import.name()),
         };
         let ExternType::Func(ty) = import.ty() else {
@@ -149,9 +217,14 @@ pub fn worker() -> Result<()> {
     if !matches!(init.sdk_version, 1..=6)
         || init.fuel == 0
         || !(65536..=268_435_456).contains(&init.memory_bytes)
+        || init
+            .max_requests
+            .is_some_and(|limit| !(1..=1_000_000).contains(&limit))
+        || (init.max_requests.is_some() && init.fuel_capacity.is_none())
     {
         bail!("INVALID_LIMIT");
     }
+    let started = Instant::now();
     // Trusted policy is applied before any guest bytes are decoded or JIT'd.
     let isolation_report = if let Some(policy) = &init.isolation {
         let policy = policy.to_native().context("PROTOCOL_ISOLATION_POLICY")?;
@@ -203,6 +276,12 @@ pub fn worker() -> Result<()> {
                 fuel: crate::execution_budget::WorkerFuel::new(init.fuel, init.fuel_capacity)
                     .map_err(anyhow::Error::msg)?,
                 remaining: None,
+                request_budget: init
+                    .max_requests
+                    .map(crate::execution_budget::RequestBudget::new),
+                logical_requests: 0,
+                started,
+                file_lengths: BTreeMap::new(),
             },
             limits,
         },
@@ -217,7 +296,7 @@ pub fn worker() -> Result<()> {
             caller
                 .data_mut()
                 .rpc
-                .call("file_open", &[id])
+                .file_open(id)
                 .map_err(wasmtime::Error::from_anyhow)
         },
     )?;
@@ -228,7 +307,7 @@ pub fn worker() -> Result<()> {
             caller
                 .data_mut()
                 .rpc
-                .call("file_length", &[h])
+                .file_length(h)
                 .map_err(wasmtime::Error::from_anyhow)
         },
     )?;
@@ -239,7 +318,7 @@ pub fn worker() -> Result<()> {
             caller
                 .data_mut()
                 .rpc
-                .call("file_close", &[h])
+                .file_close(h)
                 .map_err(wasmtime::Error::from_anyhow)
         },
     )?;
@@ -280,6 +359,10 @@ pub fn worker() -> Result<()> {
     if init.sdk_version >= 6 {
         register_text_input(&mut linker)?;
         register_app_data(&mut linker)?;
+        #[cfg(target_os = "linux")]
+        register_private_files(&mut linker)?;
+        #[cfg(target_os = "linux")]
+        register_public_files(&mut linker)?;
     }
     let instance = linker
         .instantiate(&mut store, &module)
@@ -798,5 +881,82 @@ fn register_app_data(linker: &mut Linker<State>) -> Result<()> {
             Ok(value)
         })?;
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn register_private_files(linker: &mut Linker<State>) -> Result<()> {
+    const MAX_REQUEST: i32 = 90_000;
+    const REPLY_CAPACITY: i32 = 90_000;
+    linker.func_wrap("ming_private_files_v1", "call", |mut caller: Caller<'_, State>, input: i32, length: i32, output: i32, capacity: i32| -> wasmtime::Result<i32> {
+        if !(1..=MAX_REQUEST).contains(&length) || capacity < REPLY_CAPACITY { return Ok(-2); }
+        let Some((input_memory, input_start)) = guest_range(&mut caller, input, length) else { return Ok(-2); };
+        let Some((output_memory, output_start)) = guest_range(&mut caller, output, REPLY_CAPACITY) else { return Ok(-2); };
+        let bytes = input_memory.data(&caller)[input_start..input_start + length as usize].to_vec();
+        let Ok(request) = String::from_utf8(bytes) else { return Ok(-2); };
+        // The request is nested inside the worker message JSON, so account for escaping.
+        if serde_json::to_vec(&request).map_or(true, |encoded| encoded.len() > 99_000) { return Ok(-2); }
+        let reply = caller.data_mut().rpc.exchange("private_file_call", &[], Some(request)).map_err(wasmtime::Error::from_anyhow)?;
+        if reply.value < 0 {
+            if reply.value < -4 || reply.payload.is_some() { return Err(wasmtime::Error::msg("PROTOCOL_PRIVATE_FILE")); }
+            return Ok(reply.value);
+        }
+        if reply.value > 65_536 { return Err(wasmtime::Error::msg("PROTOCOL_PRIVATE_FILE")); }
+        let encoded = serde_json::to_vec(&reply).map_err(|error| wasmtime::Error::msg(error.to_string()))?;
+        if encoded.len() > REPLY_CAPACITY as usize { return Err(wasmtime::Error::msg("PROTOCOL_PRIVATE_FILE")); }
+        output_memory.write(&mut caller, output_start, &encoded)?;
+        Ok(encoded.len() as i32)
+    })?;
+    linker.func_wrap("ming_private_files_v2", "call", |mut caller: Caller<'_, State>, input: i32, length: i32, output: i32, capacity: i32| -> wasmtime::Result<i32> {
+        use crate::private_file_wire::{MAX_INPUT, MAX_OUTPUT, WireRequest};
+        if length < 1 || length as usize > MAX_INPUT || capacity < MAX_OUTPUT as i32 { return Ok(-2); }
+        let Some((input_memory, input_start)) = guest_range(&mut caller, input, length) else { return Ok(-2); };
+        let Some((output_memory, output_start)) = guest_range(&mut caller, output, MAX_OUTPUT as i32) else { return Ok(-2); };
+        let bytes = input_memory.data(&caller)[input_start..input_start + length as usize].to_vec();
+        let request = match WireRequest::parse(&bytes) { Ok(request) => request, Err(error) => return Ok(error.code()) };
+        if serde_json::to_vec(request.json()).map_or(true, |encoded| encoded.len() > 99_000) { return Ok(-2); }
+        let reply = caller.data_mut().rpc.exchange("private_file_call", &[], Some(request.json().to_owned())).map_err(wasmtime::Error::from_anyhow)?;
+        let reply = match request.convert_reply(&reply) { Ok(reply) => reply, Err(error) => return Ok(error.code()) };
+        output_memory.write(&mut caller, output_start, &reply.data)?;
+        Ok(reply.value)
+    })?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn register_public_files(linker: &mut Linker<State>) -> Result<()> {
+    const MAX_REQUEST: i32 = 90_000;
+    const REPLY_CAPACITY: i32 = 90_000;
+    linker.func_wrap("ming_public_files_v1", "call", |mut caller: Caller<'_, State>, input: i32, length: i32, output: i32, capacity: i32| -> wasmtime::Result<i32> {
+        if !(1..=MAX_REQUEST).contains(&length) || capacity < REPLY_CAPACITY { return Ok(-2); }
+        let Some((input_memory, input_start)) = guest_range(&mut caller, input, length) else { return Ok(-2); };
+        let Some((output_memory, output_start)) = guest_range(&mut caller, output, REPLY_CAPACITY) else { return Ok(-2); };
+        let bytes = input_memory.data(&caller)[input_start..input_start + length as usize].to_vec();
+        let Ok(request) = String::from_utf8(bytes) else { return Ok(-2); };
+        if serde_json::to_vec(&request).map_or(true, |encoded| encoded.len() > 99_000) { return Ok(-2); }
+        let reply = caller.data_mut().rpc.exchange("public_file_call", &[], Some(request)).map_err(wasmtime::Error::from_anyhow)?;
+        if reply.value < 0 {
+            if reply.value < -4 || reply.payload.is_some() { return Err(wasmtime::Error::msg("PROTOCOL_PUBLIC_FILE")); }
+            return Ok(reply.value);
+        }
+        if reply.value > 65_536 { return Err(wasmtime::Error::msg("PROTOCOL_PUBLIC_FILE")); }
+        let encoded = serde_json::to_vec(&reply).map_err(|error| wasmtime::Error::msg(error.to_string()))?;
+        if encoded.len() > REPLY_CAPACITY as usize { return Err(wasmtime::Error::msg("PROTOCOL_PUBLIC_FILE")); }
+        output_memory.write(&mut caller, output_start, &encoded)?;
+        Ok(encoded.len() as i32)
+    })?;
+    linker.func_wrap("ming_public_files_v2", "call", |mut caller: Caller<'_, State>, input: i32, length: i32, output: i32, capacity: i32| -> wasmtime::Result<i32> {
+        use crate::private_file_wire::{MAX_INPUT, MAX_OUTPUT, WireRequest};
+        if length < 1 || length as usize > MAX_INPUT || capacity < MAX_OUTPUT as i32 { return Ok(-2); }
+        let Some((input_memory, input_start)) = guest_range(&mut caller, input, length) else { return Ok(-2); };
+        let Some((output_memory, output_start)) = guest_range(&mut caller, output, MAX_OUTPUT as i32) else { return Ok(-2); };
+        let bytes = input_memory.data(&caller)[input_start..input_start + length as usize].to_vec();
+        let request = match WireRequest::parse(&bytes) { Ok(request) => request, Err(error) => return Ok(error.code()) };
+        if serde_json::to_vec(request.json()).map_or(true, |encoded| encoded.len() > 99_000) { return Ok(-2); }
+        let reply = caller.data_mut().rpc.exchange("public_file_call", &[], Some(request.json().to_owned())).map_err(wasmtime::Error::from_anyhow)?;
+        let reply = match request.convert_reply(&reply) { Ok(reply) => reply, Err(error) => return Ok(error.code()) };
+        output_memory.write(&mut caller, output_start, &reply.data)?;
+        Ok(reply.value)
+    })?;
     Ok(())
 }

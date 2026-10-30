@@ -10,15 +10,36 @@ import subprocess
 import sys
 from pathlib import Path
 from bootlib import checked_path, checked_session, sha256, validate_kernel_config
-from payload_profiles import verify_data_text
+from infra import validate_fault_injection
+from isolation_profiles import verify_review_and_files
+from payload_profiles import verify_data_text, verify_data_text_private_probe, verify_data_text_public_probe, verify_public_probe
 from wayland_receipt import POINTER_SYNC_POLICY
 
 MODULES = ("virtio_pci", "virtio_gpu", "virtio_input", "virtio_console", "virtio_rng", "evdev", "virtio_blk", "ext4")
 
+
+def fault_config_from_review(review):
+    fault_config = review.get("faultInjection")
+    if fault_config is None:
+        return None
+    return validate_fault_injection(fault_config)
+
+
+def install_fault_injection(root, scripts, fault_config):
+    if fault_config is None:
+        return None
+    fault_config = validate_fault_injection(fault_config)
+    target = Path(root) / "etc/mingos"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "fault-injection.json").write_text(json.dumps(fault_config, sort_keys=True, separators=(",", ":")))
+    shutil.copyfile(Path(scripts) / "fault_injector.py", target / "fault_injector.py")
+    return fault_config
+
+
 def verify_payload(payload, review):
     checked_session(review, payload)
     profile = review.get("profile", "desktop")
-    if profile not in ("desktop", "data-text"):
+    if profile not in ("desktop", "data-text", "data-text-private-probe", "data-text-public-probe", "public-probe"):
         raise ValueError("unknown reviewed payload profile")
     if any(item.is_symlink() for item in payload.rglob("*")):
         raise ValueError("frozen payload must contain no symlinks")
@@ -29,6 +50,12 @@ def verify_payload(payload, review):
     catalog = json.loads((payload / "catalog.json").read_text())
     if profile == "data-text":
         return verify_data_text(payload, review, catalog)
+    if profile == "data-text-private-probe":
+        return verify_data_text_private_probe(payload, review, catalog)
+    if profile == "data-text-public-probe":
+        return verify_data_text_public_probe(payload, review, catalog)
+    if profile == "public-probe":
+        return verify_public_probe(payload, review, catalog)
     apps = catalog["apps"]
     if len(apps) != 2 or set(catalog["autostart"]) != {app["id"] for app in apps}:
         raise ValueError("reviewed catalog must autostart both real Kotlin apps")
@@ -121,13 +148,17 @@ def main():
     parser.add_argument("--review", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--isolation-probes", type=Path)
+    parser.add_argument("--isolation-profile", choices=("legacy-v1", "source-v2"), default="legacy-v1")
     parser.add_argument("--input-diagnostics", action="store_true")
     parser.add_argument("--wayland-client-diagnostics", action="store_true")
     parser.add_argument("--pointer-handshake-diagnostics", action="store_true")
     args = parser.parse_args()
+    if args.isolation_profile != "legacy-v1" and not args.isolation_probes:
+        raise ValueError("non-legacy isolation profile requires --isolation-probes")
     review = json.loads(args.review.read_text())
+    fault_config = fault_config_from_review(review)
     catalog = verify_payload(args.payload, review)  # before any large filesystem write
-    if args.input_diagnostics and (review.get("profile") != "data-text" or not args.isolation_probes):
+    if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-private-probe", "data-text-public-probe", "public-probe") or not args.isolation_probes):
         raise ValueError("input diagnostics requires reviewed data-text with strict probes")
     if args.wayland_client_diagnostics and not args.input_diagnostics:
         raise ValueError("Wayland client logging requires diagnostic-only input bundle")
@@ -142,15 +173,9 @@ def main():
             "observerMaxSeconds":900, "exclusiveGrab":False, "readyCaptureSeconds":None}
         if review.get("instrumentation") != expected_instrumentation:
             raise ValueError("reviewed instrumentation does not match actual bounded guest configuration")
-    probe_hashes = None
+    probe_contract = None
     if args.isolation_probes:
-        probe_hashes = {"mingos-isolation-probe": "d213382d37e1496c5d5eb8ba31081d712395eb7b4e7ae19c7a4d7fd8aa028ccd",
-                        "vm-prepare.sh": "511336a8661fc3eb991e6c8b168c5615c7420f22baf3134eba72f3a111e15ac4"}
-        if review.get("strictProbeSha256") != probe_hashes:
-            raise ValueError("explicit reviewed frozen strict-probe hashes required")
-        for name, digest in probe_hashes.items():
-            source = args.isolation_probes / name
-            if source.is_symlink() or sha256(source) != digest: raise ValueError("frozen probe changed: " + name)
+        probe_contract = verify_review_and_files(args.isolation_profile, review, args.isolation_probes)
     args.output.mkdir(parents=True, exist_ok=False)
     root = args.output / "rootfs"
     root.mkdir()
@@ -181,9 +206,16 @@ def main():
     (root / "etc/hostname").write_text("mingos-dev\n")
     shutil.copytree(args.payload, root / "opt/mingos", dirs_exist_ok=True)
     (root / "opt/mingos/ming-app-host").chmod(0o755)
-    for name in ("init", "guest.py", "guest_platform.py", "infra.py", "bounded_log.py", "wayland_receipt.py", "weston.ini"):
+    for name in ("init", "guest.py", "guest_platform.py", "infra.py", "bounded_log.py", "wayland_receipt.py", "worker_resources.py", "weston.ini"):
         target = root / ("init" if name == "init" else "etc/mingos/" + name)
         shutil.copyfile(scripts / name, target)
+    if review.get("profile") in ("data-text-public-probe", "public-probe"):
+        (root / "etc/mingos/public-storage-seed.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "profile": "data-text-public-probe",
+            "packageIds": ["dev.ming.public-kernel-probe"],
+        }, sort_keys=True, separators=(",", ":")))
+    install_fault_injection(root, scripts, fault_config)
     if args.input_diagnostics:
         shutil.copyfile(scripts / "evdev_observer.py", root / "etc/mingos/evdev_observer.py")
         env = {"WAYLAND_DEBUG": "client"} if args.wayland_client_diagnostics else {}
@@ -199,7 +231,11 @@ def main():
             target = root / destination; target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(args.isolation_probes / source_name, target); target.chmod(0o755)
         system.copy_dependencies(args.isolation_probes / "mingos-isolation-probe")
-        (root / "etc/mingos/probe.json").write_text(json.dumps({"schemaVersion": 1, "sha256": probe_hashes}))
+        (root / "etc/mingos/probe.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "profile": probe_contract["name"],
+            "sha256": probe_contract["artifactSha256"],
+        }, sort_keys=True))
     (root / "init").chmod(0o755)
     (root / "etc/mingos/session.json").write_bytes(args.review.read_bytes())
     locks = Path("/opt/mingos-boot/locks")
@@ -228,11 +264,11 @@ def main():
             thread.join()
             if proc.wait() != 0:
                 raise RuntimeError("cpio archive creation failed")
-    manifest = {"schemaVersion": 1, "infraApiVersion": 1, "inputDiagnostics": args.input_diagnostics, "diagnosticOnly": args.input_diagnostics and not qualification, "instrumentedQualification": qualification, "diagnosticProfile": ("input-pointer-ready-v1" if args.pointer_handshake_diagnostics else ("input-wayland-client-v1" if args.wayland_client_diagnostics else "input-transport-v1")) if args.input_diagnostics else None, "payloadProfile": review.get("profile", "desktop"), "strictProbeSha256": probe_hashes, "autostart": catalog["autostart"], "bootAttempted": False, "kernelRelease": release,
+    manifest = {"schemaVersion": 1, "infraApiVersion": 1, "inputDiagnostics": args.input_diagnostics, "diagnosticOnly": args.input_diagnostics and not qualification, "instrumentedQualification": qualification, "diagnosticProfile": ("input-pointer-ready-v1" if args.pointer_handshake_diagnostics else ("input-wayland-client-v1" if args.wayland_client_diagnostics else "input-transport-v1")) if args.input_diagnostics else None, "payloadProfile": review.get("profile", "desktop"), "isolationProfile": probe_contract["name"] if probe_contract else None, "strictProbeSha256": probe_contract["artifactSha256"] if probe_contract else None, "faultInjection": fault_config, "autostart": catalog["autostart"], "bootAttempted": False, "kernelRelease": release,
                 "reviewSha256": sha256(args.review), "sessionReview": review,
                 "sha256": {name: sha256(args.output / name) for name in ("vmlinuz", "initramfs.cpio.gz")},
                 "payloadSha256": {str(p.relative_to(args.payload)): sha256(p) for p in args.payload.rglob("*") if p.is_file()},
-                "scriptSha256": {name: sha256(scripts / name) for name in ("bundle.py", "payload_profiles.py", "evdev_observer.py", "bounded_log.py", "wayland_receipt.py", "bootlib.py", "guest.py", "guest_platform.py", "infra.py", "init", "weston.ini")}}
+                "scriptSha256": {name: sha256(scripts / name) for name in (("bundle.py", "isolation_profiles.py", "payload_profiles.py", "evdev_observer.py", "bounded_log.py", "wayland_receipt.py", "worker_resources.py", "bootlib.py", "guest.py", "guest_platform.py", "infra.py", "init", "weston.ini") + (("fault_injector.py",) if fault_config else ()))}}
     (args.output / "bundle.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest, indent=2))
 

@@ -1,11 +1,22 @@
 #!/usr/bin/python3
 """Guest-only passive virtual evdev observer; no exclusive grabs or host inputs."""
-import argparse,json,os,re,select,stat,struct,time
+import argparse,json,os,re,select,stat,struct,time,uuid
 from pathlib import Path
 EVENT=struct.Struct('<qqHHi')
 def decode(block):
     if len(block)%EVENT.size:raise ValueError('partial evdev event')
     return [dict(zip(('seconds','microseconds','type','code','value'),EVENT.unpack_from(block,n))) for n in range(0,len(block),EVENT.size)]
+def task_owned_cmdline(cmdline):
+    params={}
+    for token in cmdline.split():
+        if '=' in token:
+            key,value=token.split('=',1);params[key]=value
+    if params.get('rdinit')!='/init':return False
+    identifier=params.get('mingos.data_uuid');serial=params.get('mingos.data_serial')
+    if not identifier or not serial:return False
+    try: normalized=str(uuid.UUID(identifier))
+    except ValueError:return False
+    return serial=='MINGDATA'+normalized.replace('-','')[:12]
 def capture(descriptors, write, deadline):
     count=0
     while time.monotonic()<deadline and count<4096:
@@ -23,7 +34,7 @@ def main():
     args=parser.parse_args()
     if not 1<=args.duration_seconds<=900:raise ValueError('duration bound')
     cmdline=Path('/proc/cmdline').read_text()
-    if os.geteuid()!=0 or 'rdinit=/init' not in cmdline or 'mingos.data_uuid=1bb342cc-5448-4ae6-8bd6-108a15b2cafc' not in cmdline:
+    if os.geteuid()!=0 or not task_owned_cmdline(cmdline):
         raise RuntimeError('requires task-owned guest kernel and data disk identity')
     if Path('/proc/sys/kernel/random/boot_id').read_text().strip()!=args.boot_id:raise RuntimeError('current boot mismatch')
     output=Path('/run/evidence/evdev-input.log')

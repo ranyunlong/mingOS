@@ -67,7 +67,15 @@ fn render(session: &mut Session, shell: &mut DesktopShell) -> Result<RenderedFra
             },
         })
         .collect();
-    shell.draw(&root, &windows, &apps)
+    #[cfg(target_os = "linux")]
+    {
+        let prompt = session.storage_prompt().cloned();
+        let frame = shell.draw_with_storage_prompt(&root, &windows, &apps, prompt.as_ref())?;
+        if prompt.is_some() { session.storage_prompt_composed(frame.sequence); }
+        Ok(frame)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { shell.draw(&root, &windows, &apps) }
 }
 fn shell_stats(shell: &DesktopShell) -> Result<Option<crate::graphics::GpuStats>> {
     #[cfg(feature = "gpu")]
@@ -146,6 +154,10 @@ struct NativeDesktop {
     error: Option<anyhow::Error>,
     mouse: Option<(i32, i32)>,
     left: bool,
+    #[cfg(target_os = "linux")]
+    storage_press: Option<bool>,
+    #[cfg(target_os = "linux")]
+    storage_dock_press: Option<(u16, u64)>,
     drag: Option<Drag>,
     active: bool,
     input: crate::desktop_input::NativeInput,
@@ -165,6 +177,10 @@ impl NativeDesktop {
             error: None,
             mouse: None,
             left: false,
+            #[cfg(target_os = "linux")]
+            storage_press: None,
+            #[cfg(target_os = "linux")]
+            storage_dock_press: None,
             drag: None,
             active: true,
             input: crate::desktop_input::NativeInput::default(),
@@ -313,6 +329,12 @@ impl NativeDesktop {
             return Ok(());
         };
         let session = self.session.as_mut().context("DESKTOP_SESSION")?;
+        #[cfg(target_os = "linux")]
+        if session.storage_prompt().is_some() {
+            self.storage_press = session.storage_prompt_hit(x, y);
+            self.drag = None;
+            return Ok(());
+        }
         if !session.pointer_sink_ready() {
             return Ok(());
         }
@@ -380,11 +402,36 @@ impl NativeDesktop {
         }
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    fn storage_dock_release(&mut self) -> Result<bool> {
+        let Some((id, presented)) = self.storage_dock_press.take() else { return Ok(false); };
+        let session = self.session.as_mut().context("DESKTOP_SESSION")?;
+        if session.pointer_sink_ready() && session.frames_presented == presented && session.storage_prompt().is_none()
+            && let Some((x, y)) = self.mouse
+            && let Some(index) = session.catalog.apps.iter().position(|app| app.id == id)
+            && crate::graphics::desktop_shell::dock_storage_cell(session.options.width, session.options.height, index, session.catalog.apps.len()).contains(x, y) {
+            session.begin_storage_management(id)?;
+        }
+        Ok(true)
+    }
+    #[cfg(target_os = "linux")]
+    fn storage_release(&mut self) -> Result<bool> {
+        if !self.session.as_ref().is_some_and(|session| session.storage_prompt().is_some()) { return Ok(false); }
+        let pressed = self.storage_press.take();
+        let session = self.session.as_mut().context("DESKTOP_SESSION")?;
+        if let (Some(pressed), Some((x, y))) = (pressed, self.mouse)
+            && session.storage_prompt_hit(x, y) == Some(pressed) {
+            session.respond_storage_prompt(pressed)?;
+        }
+        Ok(true)
+    }
     fn motion(&mut self) -> Result<()> {
         let Some((x, y)) = self.mouse else {
             return Ok(());
         };
         let session = self.session.as_mut().context("DESKTOP_SESSION")?;
+        #[cfg(target_os = "linux")]
+        if session.storage_prompt().is_some() || self.storage_dock_press.is_some() { return Ok(()); }
         if let Some(drag) = self.drag
             && self.left
         {
@@ -502,6 +549,8 @@ impl ApplicationHandler for NativeDesktop {
                         self.input.lost_focus();
                         self.left = false;
                         self.drag = None;
+                        #[cfg(target_os = "linux")]
+                        { self.storage_press = None; self.storage_dock_press = None; }
                         self.session
                             .as_mut()
                             .context("DESKTOP_SESSION")?
@@ -527,6 +576,10 @@ impl ApplicationHandler for NativeDesktop {
                         self.down()?;
                     } else {
                         self.drag = None;
+                        #[cfg(target_os = "linux")]
+                        if self.storage_dock_release()? { return Ok(()); }
+                        #[cfg(target_os = "linux")]
+                        if self.storage_release()? { return Ok(()); }
                         if let Some((x, y)) = self.mouse {
                             self.session
                                 .as_mut()
@@ -546,6 +599,8 @@ impl ApplicationHandler for NativeDesktop {
                     }
                 }
                 WindowEvent::MouseWheel { delta, .. } if self.active => {
+                    #[cfg(target_os = "linux")]
+                    if self.session.as_ref().is_some_and(|session| session.storage_prompt().is_some()) { return Ok(()); }
                     if let Some((x, y)) = self.mouse {
                         let raw = match delta {
                             MouseScrollDelta::LineDelta(_, y) => f64::from(y) * 100.0,
@@ -562,10 +617,14 @@ impl ApplicationHandler for NativeDesktop {
                 }
                 WindowEvent::ModifiersChanged(modifiers) => self.input.modifiers(modifiers.state()),
                 WindowEvent::Ime(event) if self.active => {
+                    #[cfg(target_os = "linux")]
+                    if self.session.as_ref().is_some_and(|session| session.storage_prompt().is_some()) { return Ok(()); }
                     let session = self.session.as_mut().context("DESKTOP_SESSION")?;
                     self.input.ime(event, session);
                 }
                 WindowEvent::KeyboardInput { event, .. } if self.active => {
+                    #[cfg(target_os = "linux")]
+                    if self.session.as_ref().is_some_and(|session| session.storage_prompt().is_some()) { return Ok(()); }
                     let session = self.session.as_mut().context("DESKTOP_SESSION")?;
                     if self.input.shutdown_shortcut(&event) {
                         session.perform(&DesktopAction::Shutdown)?;
@@ -709,6 +768,256 @@ fn window_error(error: softbuffer::SoftBufferError) -> anyhow::Error {
 #[cfg(test)]
 mod input_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dock_no_longer_opens_private_storage_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        let root = crate::app_data::AppDataRoot::open(temp.path()).unwrap();
+        let authority = crate::app_data::PackageStorageAuthority::open_persistent(root).unwrap();
+        authority.authorize_package(&crate::package::load_package(&manifest).unwrap()).unwrap();
+        drop(authority);
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), temp.path().as_os_str().to_owned()]).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Example".into(), package_fingerprint: crate::package::load_package(&manifest).unwrap().storage_fingerprint(), manifest_path: manifest, package_id: "dev.example.app".into() }], autostart: vec![] };
+        let mut app = NativeDesktop::new(options, catalog);
+        let (options, catalog) = app.pending.take().unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        session.start().unwrap();
+        let mut shell = DesktopShell::cpu();
+        let frame = render(&mut session, &mut shell).unwrap();
+        session.accepted(frame.sequence, false).unwrap();
+        app.session = Some(session);
+        let control = crate::graphics::desktop_shell::dock_storage_cell(1280, 800, 0, 1);
+        app.mouse = Some((control.x + 1, control.y + 1));
+        app.down().unwrap();
+        assert!(!app.storage_dock_release().unwrap());
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+    }
+    #[cfg(target_os = "linux")]
+    fn storage_test_app(manifest: std::path::PathBuf, root: &std::path::Path) -> NativeDesktop {
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), root.as_os_str().to_owned()]).unwrap();
+        let package_id = crate::package::load_package(&manifest).unwrap().manifest.id;
+        let package_fingerprint = crate::package::load_package(&manifest).unwrap().storage_fingerprint();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Example".into(), manifest_path: manifest, package_id, package_fingerprint }], autostart: vec![1] };
+        let mut app = NativeDesktop::new(options, catalog);
+        let (options, catalog) = app.pending.take().unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        session.start().unwrap();
+        app.session = Some(session);
+        app
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn declared_private_storage_does_not_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        let app = storage_test_app(manifest, &root);
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the public typed Kotlin probe"]
+    fn public_storage_approval_launches_real_kotlin_worker_with_shared_capability() {
+        use std::os::unix::fs::PermissionsExt;
+        let wasm = std::path::PathBuf::from(std::env::var_os("MING_PUBLIC_TYPED_WASM").expect("probe required"));
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::copy(wasm, temp.path().join("main.wasm")).unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.public","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","publicStorage":true}"#).unwrap();
+        let mut app = storage_test_app(manifest.clone(), &data);
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_some());
+
+        let mut shell = DesktopShell::cpu();
+        let frame = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+        app.session.as_mut().unwrap().accepted(frame.sequence, false).unwrap();
+        let geometry = crate::graphics::desktop_shell::storage_prompt_geometry(1280, 800, false).unwrap();
+        let allow = geometry.allow.unwrap();
+        app.mouse = Some((allow.x + 1, allow.y + 1));
+        app.down().unwrap();
+        app.storage_release().unwrap();
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let session = app.session.as_mut().unwrap();
+            session.tick().unwrap();
+            match session.app_status(1) {
+                "closed" => break,
+                "failed" => {
+                    let error = session
+                        .outcome("test", "offscreen", None, None)
+                        .ok()
+                        .and_then(|outcome| outcome.instances.into_iter().next()?.error);
+                    panic!("worker failed: {error:?}");
+                }
+                _ if Instant::now() >= deadline => panic!("worker timed out"),
+                _ => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let outcome = app.session.as_mut().unwrap().outcome("test", "offscreen", None, None).unwrap();
+        assert!(outcome.instances[0].events.as_ref().unwrap().iter().any(|event| event.code == 7201 && event.value == 1));
+        drop(app.session.take());
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(crate::app_data::AppDataRoot::open(data).unwrap()).unwrap());
+        assert_eq!(authority.public_session("dev.example.public").unwrap().read_file("shared-note.txt").unwrap(), b"shared");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the public denied Kotlin probe"]
+    fn public_storage_denial_launches_real_kotlin_worker_without_shared_capability() {
+        use std::os::unix::fs::PermissionsExt;
+        let wasm = std::path::PathBuf::from(std::env::var_os("MING_PUBLIC_DENIED_WASM").expect("probe required"));
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::copy(wasm, temp.path().join("main.wasm")).unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.public","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","publicStorage":true}"#).unwrap();
+        let mut app = storage_test_app(manifest, &data);
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_some());
+
+        let mut shell = DesktopShell::cpu();
+        let frame = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+        app.session.as_mut().unwrap().accepted(frame.sequence, false).unwrap();
+        let geometry = crate::graphics::desktop_shell::storage_prompt_geometry(1280, 800, false).unwrap();
+        app.mouse = Some((geometry.deny.x + 1, geometry.deny.y + 1));
+        app.down().unwrap();
+        app.storage_release().unwrap();
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let session = app.session.as_mut().unwrap();
+            session.tick().unwrap();
+            match session.app_status(1) {
+                "closed" => break,
+                "failed" => {
+                    let error = session
+                        .outcome("test", "offscreen", None, None)
+                        .ok()
+                        .and_then(|outcome| outcome.instances.into_iter().next()?.error);
+                    panic!("worker failed: {error:?}");
+                }
+                _ if Instant::now() >= deadline => panic!("worker timed out"),
+                _ => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let outcome = app.session.as_mut().unwrap().outcome("test", "offscreen", None, None).unwrap();
+        assert!(outcome.instances[0].events.as_ref().unwrap().iter().any(|event| event.code == 7203 && event.value == 1));
+        drop(app.session.take());
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(crate::app_data::AppDataRoot::open(data).unwrap()).unwrap());
+        assert!(matches!(authority.public_session("dev.example.public"), Err(crate::app_data::AppDataError::Denied)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the typed Kotlin probe and an explicit test worker binary"]
+    fn private_storage_is_automatically_available_without_manifest_declaration() {
+        use std::os::unix::fs::PermissionsExt;
+        let wasm = std::path::PathBuf::from(std::env::var_os("MING_TEST_PRIVATE_TYPED_WASM").expect("probe required"));
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        std::fs::copy(wasm, temp.path().join("main.wasm")).unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let mut app = storage_test_app(manifest, &data);
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let session = app.session.as_mut().unwrap();
+            session.tick().unwrap();
+            match session.app_status(1) {
+                "closed" => break,
+                "failed" => panic!("worker failed"),
+                _ if Instant::now() >= deadline => panic!("worker timed out"),
+                _ => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let outcome = app.session.as_mut().unwrap().outcome("test", "offscreen", None, None).unwrap();
+        assert!(outcome.instances.iter().any(|record|
+            record.events.as_ref().is_some_and(|events| events.iter().any(|event| event.code == 7102 && event.value == 1))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the typed Kotlin probe and an explicit test worker binary"]
+    fn declared_private_storage_launches_real_kotlin_worker_without_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+        let manifest = std::path::PathBuf::from(std::env::var_os("MING_TEST_PRIVATE_MANIFEST").expect("manifest required"));
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut app = storage_test_app(manifest.clone(), temp.path());
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let session = app.session.as_mut().unwrap();
+            session.tick().unwrap();
+            match session.app_status(1) {
+                "closed" => break,
+                "failed" => panic!("worker failed"),
+                _ if Instant::now() >= deadline => panic!("worker timed out"),
+                _ => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        drop(app.session.take());
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(crate::app_data::AppDataRoot::open(temp.path()).unwrap()).unwrap());
+        let package = crate::package::load_package(&manifest).unwrap();
+        assert_eq!(authority.default_private_session_for_package(&package).unwrap().read_file("note.txt").unwrap(), b"alpha");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the typed Kotlin probe and an explicit test worker binary"]
+    fn offscreen_declared_storage_is_available_without_approval() {
+        use std::os::unix::fs::PermissionsExt;
+        let wasm = std::path::PathBuf::from(std::env::var_os("MING_TEST_PRIVATE_TYPED_WASM").expect("probe required"));
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        std::fs::copy(wasm, temp.path().join("main.wasm")).unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--backend".into(), "offscreen".into(), "--data-root".into(), data.as_os_str().to_owned()]).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Example".into(), package_fingerprint: crate::package::load_package(&manifest).unwrap().storage_fingerprint(), manifest_path: manifest.clone(), package_id: "dev.example.app".into() }], autostart: vec![1] };
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        session.start().unwrap();
+        assert!(session.storage_prompt().is_none());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            session.tick().unwrap();
+            match session.app_status(1) {
+                "closed" => break,
+                "failed" => panic!("worker failed"),
+                _ if Instant::now() >= deadline => panic!("worker timed out"),
+                _ => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let outcome = session.outcome("test", "offscreen", None, None).unwrap();
+        assert!(outcome.instances[0].events.as_ref().unwrap().iter().any(|event| event.code == 7102 && event.value == 1));
+        drop(session);
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(crate::app_data::AppDataRoot::open(data).unwrap()).unwrap());
+        let package = crate::package::load_package(&manifest).unwrap();
+        assert_eq!(authority.default_private_session_for_package(&package).unwrap().read_file("note.txt").unwrap(), b"alpha");
+    }
     fn app() -> NativeDesktop {
         let options = DesktopOptions::parse(
             [
@@ -729,6 +1038,9 @@ mod input_tests {
                 id: 1,
                 title: "One".into(),
                 manifest_path: "unused".into(),
+                package_id: "dev.example.one".into(),
+                #[cfg(target_os = "linux")]
+                package_fingerprint: [0; 32],
             }],
             autostart: vec![],
         };
