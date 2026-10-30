@@ -35,6 +35,11 @@ pub struct StorageManagement {
     app_id: String,
     snapshot: AuthorizationSnapshot,
 }
+pub struct PublicStorageManagement {
+    authority: Arc<PackageStorageAuthority>,
+    app_id: String,
+    snapshot: AuthorizationSnapshot,
+}
 
 impl StorageConsent {
     pub fn new(authority: Arc<PackageStorageAuthority>) -> Self { Self { authority } }
@@ -61,6 +66,13 @@ impl StorageConsent {
 }
 impl PublicStorageConsent {
     pub fn new(authority: Arc<PackageStorageAuthority>) -> Self { Self { authority } }
+    /// Returns a trusted snapshot for viewing or revoking the current public authorization.
+    #[cfg(target_os = "linux")]
+    pub fn management(&self, app_id: &str) -> Result<Option<PublicStorageManagement>, AppDataError> {
+        Ok(self.authority.public_authorization_snapshot(app_id)?.map(|snapshot| PublicStorageManagement {
+            authority: self.authority.clone(), app_id: app_id.to_owned(), snapshot,
+        }))
+    }
     /// The app ID must come from the trusted installed catalog, not from a guest request.
     #[cfg(target_os = "linux")]
     pub fn request(&self, app_id: &str) -> Result<PublicConsentRequest, AppDataError> {
@@ -115,6 +127,20 @@ impl StorageManagement {
     /// previous disk record intact. Check both receipt fields before reporting durability.
     pub fn revoke(&self) -> Result<AuthorizationReceipt, AppDataError> {
         self.authority.revoke_snapshot(&self.app_id, &self.snapshot)
+    }
+}
+impl PublicStorageManagement {
+    pub fn app_id(&self) -> &str { &self.app_id }
+    pub fn revocation_pending(&self) -> bool { self.snapshot.revocation_pending() }
+    pub fn fingerprint(&self) -> Option<String> {
+        self.snapshot.fingerprint.map(|fingerprint| {
+            let mut text = String::with_capacity(64);
+            for byte in fingerprint { write!(&mut text, "{byte:02x}").expect("string write"); }
+            text
+        })
+    }
+    pub fn revoke(&self) -> Result<AuthorizationReceipt, AppDataError> {
+        self.authority.revoke_public_snapshot(&self.app_id, &self.snapshot)
     }
 }
 impl PendingConsent {

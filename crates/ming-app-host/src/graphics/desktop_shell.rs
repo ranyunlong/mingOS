@@ -47,6 +47,12 @@ impl StoragePrompt {
         }
         Ok(Self { id: id.into(), version: String::new(), fingerprint: fingerprint.unwrap_or("LEGACY").into(), replacement: false, mode: if retry { 3 } else { 2 } })
     }
+    pub fn public_management(id: &str, fingerprint: Option<&str>, retry: bool) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) || fingerprint.is_some_and(|value| value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+            bail!("DESKTOP_STORAGE_PROMPT_INVALID");
+        }
+        Ok(Self { id: id.into(), version: String::new(), fingerprint: fingerprint.unwrap_or("LEGACY").into(), replacement: false, mode: if retry { 9 } else { 8 } })
+    }
     pub fn status(id: Option<&str>, available: bool) -> Result<Self> {
         if id.is_some_and(|value| !crate::app_data::valid_package_id(value)) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
         Ok(Self { id: id.unwrap_or("").into(), version: String::new(), fingerprint: String::new(), replacement: true, mode: if available { 4 } else { 5 } })
@@ -62,13 +68,22 @@ impl StoragePrompt {
     pub(super) fn buttons(&self) -> (&'static [u8], Option<&'static [u8]>) {
         match self.mode {
             1 | 4 | 5 => (b"CLOSE", None),
-            2 => (b"CANCEL", Some(b"REVOKE")),
-            3 | 7 => (b"CANCEL", Some(b"RETRY")),
+            2 | 8 => (b"CANCEL", Some(b"REVOKE")),
+            3 | 7 | 9 => (b"CANCEL", Some(b"RETRY")),
             _ => (b"DENY", Some(b"ALLOW")),
         }
     }
+    pub(crate) fn has_allow(&self) -> bool { self.buttons().1.is_some() }
     pub(crate) fn lines(&self, width: i32) -> Vec<Vec<u8>> {
         let capacity = ((width - 24) / 6) as usize;
+        if self.mode == 8 || self.mode == 9 {
+            let mut lines = vec![b"PUBLIC STORAGE ACCESS".to_vec()];
+            lines.extend(format!("APP ID: {}", self.id).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.extend(format!("SHA256: {}", self.fingerprint).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.push(b"SHARED DATA WILL BE KEPT".to_vec());
+            if self.mode == 9 { lines.push(b"REVOCATION NOT SAVED".to_vec()); }
+            return lines;
+        }
         if self.mode == 6 || self.mode == 7 {
             return vec![
                 b"PUBLIC STORAGE ACCESS".to_vec(),
@@ -229,7 +244,7 @@ impl DesktopShell {
             .map(|a| ascii_title(&a.title, LABEL_CHARS))
             .collect();
         let mut pixels = Vec::with_capacity(source.len());
-        let overlay = prompt.map(|prompt| (storage_prompt_geometry(root.width as i32, root.height as i32, prompt.replacement).expect("validated viewport"), prompt.lines((root.width as i32 - 16).min(600)), prompt.buttons()));
+        let overlay = prompt.map(|prompt| (storage_prompt_geometry(root.width as i32, root.height as i32, !prompt.has_allow()).expect("validated viewport"), prompt.lines((root.width as i32 - 16).min(600)), prompt.buttons()));
         // Independent scalar oracle: choose an outer first; never paint a
         // lower title through the selected window's preserved root content.
         for y in 0..root.height as i32 {
@@ -430,6 +445,19 @@ mod storage_prompt_tests {
         assert!(lines.iter().any(|line| line == b"DATA WILL BE KEPT"));
         assert_eq!(prompt.buttons(), (b"CANCEL".as_slice(), Some(b"REVOKE".as_slice())));
         let retry = StoragePrompt::management(&id, None, true).unwrap();
+        assert!(retry.lines(304).iter().any(|line| line == b"REVOCATION NOT SAVED"));
+        assert_eq!(retry.buttons(), (b"CANCEL".as_slice(), Some(b"RETRY".as_slice())));
+    }
+
+    #[test]
+    fn public_management_prompt_has_revoke_and_retry_states() {
+        let id = "dev.example.public";
+        let fingerprint = "f".repeat(64);
+        let prompt = StoragePrompt::public_management(id, Some(&fingerprint), false).unwrap();
+        assert!(prompt.lines(304).iter().any(|line| line == b"PUBLIC STORAGE ACCESS"));
+        assert!(prompt.lines(304).iter().any(|line| line == b"SHARED DATA WILL BE KEPT"));
+        assert_eq!(prompt.buttons(), (b"CANCEL".as_slice(), Some(b"REVOKE".as_slice())));
+        let retry = StoragePrompt::public_management(id, None, true).unwrap();
         assert!(retry.lines(304).iter().any(|line| line == b"REVOCATION NOT SAVED"));
         assert_eq!(retry.buttons(), (b"CANCEL".as_slice(), Some(b"RETRY".as_slice())));
     }

@@ -1,5 +1,5 @@
 #![cfg(target_os = "linux")]
-use ming_app_host::{app_data::{AppDataError, AppDataRoot, PackageStorageAuthority}, package::load_package, storage_consent::{ConsentRequest, StorageConsent}};
+use ming_app_host::{app_data::{AppDataError, AppDataRoot, PackageStorageAuthority}, package::load_package, storage_consent::{ConsentRequest, PublicStorageConsent, StorageConsent}};
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
 
 #[test]
@@ -136,4 +136,26 @@ fn management_exposes_legacy_records_and_rejects_invalid_ids() {
     assert_eq!(management.fingerprint(), None);
     management.revoke().unwrap();
     assert!(consent.management("dev.example.legacy").unwrap().is_none());
+}
+
+#[test]
+fn public_management_revokes_only_the_current_public_authorization() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let authority = Arc::new(PackageStorageAuthority::open_persistent(AppDataRoot::open(temp.path()).unwrap()).unwrap());
+    let consent = PublicStorageConsent::new(authority.clone());
+    authority.authorize_public("dev.example.app").unwrap();
+    let session = authority.public_session("dev.example.app").unwrap();
+    session.write_file("shared", b"keep").unwrap();
+
+    let stale = consent.management("dev.example.app").unwrap().unwrap();
+    assert_eq!(stale.app_id(), "dev.example.app");
+    assert_eq!(stale.fingerprint(), None);
+    let current = consent.management("dev.example.app").unwrap().unwrap();
+    current.revoke().unwrap();
+    assert_eq!(session.read_file("shared"), Err(AppDataError::Denied));
+
+    authority.authorize_public("dev.example.app").unwrap();
+    assert!(stale.revoke().is_err());
+    assert!(consent.management("dev.example.app").unwrap().is_some());
 }

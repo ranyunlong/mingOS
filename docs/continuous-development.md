@@ -132,6 +132,8 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 
 2026-10-30 安装服务接入数据策略：`PackageInstallRegistry::uninstall_with_data_policy` 接入默认保留和显式清除两条父侧路径。清除失败时保持已卸载、数据保留，可在关闭运行代并撤销旧式 grant 后重试；重复调用不会重新激活登记。`package_install` 全量回归 `8/8` 通过；桌面卸载 UI、系统确认交互、多用户安装身份和跨平台实现仍待完成，`finalSystemAccepted=false`。
 
+2026-10-30 公共目录授权管理：新增公共授权代快照和按代撤销，桌面 `S` 管理入口优先显示公共授权并支持持久化失败重试；撤销只使旧公共 session 失效，不删除共享文件，重新授权后数据仍可读。公共授权管理 `5/5`、桌面 Shell `16/16`、`ming-app-host --all-targets -j1` 库 `226/226` 通过；设计见 [公共目录授权管理](superpowers/specs/2026-10-30-public-storage-management.md)，`finalSystemAccepted=false`。
+
 ## 验证原则
 
 - 软件编译、软件渲染、GPU计算、GPU Surface、Wayland客户端、桌面合成器和系统启动分别记录。

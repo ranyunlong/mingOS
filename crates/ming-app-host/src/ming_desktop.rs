@@ -121,6 +121,7 @@ struct PendingDesktopStorage {
 #[cfg(target_os = "linux")]
 enum DesktopStorageDecision {
     Management(crate::storage_consent::StorageManagement),
+    PublicManagement(crate::storage_consent::PublicStorageManagement),
     Public(crate::storage_consent::PendingPublicConsent),
     Information,
 }
@@ -419,8 +420,7 @@ impl Session {
     pub(crate) fn storage_prompt_hit(&self, x: i32, y: i32) -> Option<bool> {
         let pending = self.pending_storage.as_ref()?;
         if !pending.presented || !self.sink_ready { return None; }
-        let replacement = matches!(&pending.pending, DesktopStorageDecision::Information);
-        let geometry = crate::graphics::desktop_shell::storage_prompt_geometry(self.options.width, self.options.height, replacement)?;
+        let geometry = crate::graphics::desktop_shell::storage_prompt_geometry(self.options.width, self.options.height, !pending.prompt.has_allow())?;
         if geometry.deny.contains(x, y) { Some(false) }
         else if geometry.allow.is_some_and(|r| r.contains(x, y)) { Some(true) }
         else { None }
@@ -443,6 +443,25 @@ impl Session {
                             self.log(app, 0, 0, "storage_revoke_not_saved", format!("{result:?}"));
                             let prompt = crate::graphics::desktop_shell::StoragePrompt::management(management.app_id(), management.fingerprint().as_deref(), true)?;
                             self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Management(management), prompt, composed: None, presented: false });
+                            self.changed();
+                            return Ok(());
+                        }
+                    }
+                }
+                self.changed();
+                self.launch_pending_autostart()?;
+                return Ok(());
+            }
+            DesktopStorageDecision::PublicManagement(management) => {
+                if allow {
+                    match management.revoke() {
+                        Ok(receipt) if receipt.persisted && receipt.directory_synced => {
+                            self.log(app, 0, 0, "public_storage_revoked", String::new());
+                        }
+                        result => {
+                            self.log(app, 0, 0, "public_storage_revoke_not_saved", format!("{result:?}"));
+                            let prompt = crate::graphics::desktop_shell::StoragePrompt::public_management(management.app_id(), management.fingerprint().as_deref(), true)?;
+                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::PublicManagement(management), prompt, composed: None, presented: false });
                             self.changed();
                             return Ok(());
                         }
@@ -498,6 +517,11 @@ impl Session {
         }
         let (pending, prompt) = match (package, self.storage_authority.as_ref()) {
             (Some(package), Some(authority)) => {
+                let public = crate::storage_consent::PublicStorageConsent::new(authority.clone());
+                if let Some(management) = public.management(&package.manifest.id)? {
+                    let prompt = crate::graphics::desktop_shell::StoragePrompt::public_management(management.app_id(), management.fingerprint().as_deref(), management.revocation_pending())?;
+                    (DesktopStorageDecision::PublicManagement(management), prompt)
+                } else {
                 let consent = crate::storage_consent::StorageConsent::new(authority.clone());
                 match consent.management(&package.manifest.id) {
                     Ok(Some(management)) => {
@@ -506,6 +530,7 @@ impl Session {
                     }
                     Ok(None) => (DesktopStorageDecision::Information, crate::graphics::desktop_shell::StoragePrompt::status(Some(&package.manifest.id), true)?),
                     Err(_) => (DesktopStorageDecision::Information, crate::graphics::desktop_shell::StoragePrompt::status(Some(&package.manifest.id), false)?),
+                }
                 }
             }
             (package, _) => (DesktopStorageDecision::Information, crate::graphics::desktop_shell::StoragePrompt::status(package.as_ref().map(|p| p.manifest.id.as_str()), false)?),
@@ -1717,6 +1742,45 @@ mod input_backpressure_tests {
         authority.authorize_package(&package).unwrap();
         assert_eq!(authority.file_session_for_package(&package).unwrap().read_file("note").unwrap(), b"kept");
         assert!(session.instances.is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_storage_management_revokes_access_and_keeps_shared_data() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.public","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","publicStorage":true}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let root = crate::app_data::AppDataRoot::open(&data).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(root).unwrap());
+        authority.authorize_public(&package.manifest.id).unwrap();
+        let public = authority.public_session(&package.manifest.id).unwrap();
+        public.write_file("shared", b"keep").unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Public".into(), package_fingerprint: package.storage_fingerprint(), manifest_path: manifest, package_id: package.manifest.id.clone() }], autostart: vec![] };
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.storage_authority = Some(authority.clone());
+        session.begin_storage_management(1).unwrap();
+        assert!(session.storage_prompt().unwrap().lines(600).iter().any(|line| line == b"PUBLIC STORAGE ACCESS"));
+        assert!(session.respond_storage_prompt(true).is_err());
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        authority.fail_next_public_policy_commit();
+        session.respond_storage_prompt(true).unwrap();
+        assert!(session.storage_prompt().unwrap().lines(600).iter().any(|line| line == b"REVOCATION NOT SAVED"));
+        assert_eq!(public.read_file("shared"), Err(crate::app_data::AppDataError::Denied));
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.respond_storage_prompt(true).unwrap();
+        assert!(session.storage_prompt().is_none());
+        authority.authorize_public(&package.manifest.id).unwrap();
+        assert_eq!(authority.public_session(&package.manifest.id).unwrap().read_file("shared").unwrap(), b"keep");
     }
     #[cfg(target_os = "linux")]
     #[test]

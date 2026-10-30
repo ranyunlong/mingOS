@@ -768,6 +768,26 @@ impl PackageStorageAuthority {
     pub fn revoke_public(&self, package_id: &str) -> Result<AuthorizationReceipt> {
         if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
         let mut authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        self.revoke_public_locked(package_id, &mut authorized)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn public_authorization_snapshot(&self, package_id: &str) -> Result<Option<AuthorizationSnapshot>> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        Ok(authorized.get(package_id).map(|entry| AuthorizationSnapshot {
+            fingerprint: entry.fingerprint, generation: entry.generation.clone(),
+        }))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn revoke_public_snapshot(&self, package_id: &str, snapshot: &AuthorizationSnapshot) -> Result<AuthorizationReceipt> {
+        let mut authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if !authorized.get(package_id).is_some_and(|entry| Arc::ptr_eq(&entry.generation, &snapshot.generation)) {
+            return Err(AppDataError::Denied);
+        }
+        self.revoke_public_locked(package_id, &mut authorized)
+    }
+    #[cfg(target_os = "linux")]
+    fn revoke_public_locked(&self, package_id: &str, authorized: &mut BTreeMap<String, PackageAuthorization>) -> Result<AuthorizationReceipt> {
         if let Some(entry) = authorized.get_mut(package_id) {
             entry.generation.store(false, Ordering::Release);
             for session in entry.sessions.drain(..).filter_map(|session| session.upgrade()) {
@@ -809,6 +829,10 @@ impl PackageStorageAuthority {
     pub fn fail_next_policy_commit(&self) { self.policy.as_ref().unwrap().store.fail_next_commit(); }
     #[cfg(test)]
     pub fn fail_next_policy_directory_sync(&self) { self.policy.as_ref().unwrap().store.fail_next_directory_sync(); }
+    #[cfg(test)]
+    pub fn fail_next_public_policy_commit(&self) { self.public_policy.as_ref().unwrap().store.fail_next_commit(); }
+    #[cfg(test)]
+    pub fn fail_next_public_policy_directory_sync(&self) { self.public_policy.as_ref().unwrap().store.fail_next_directory_sync(); }
 }
 impl Drop for PackageStorageAuthority {
     fn drop(&mut self) {
