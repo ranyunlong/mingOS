@@ -28,6 +28,7 @@ pub struct PendingConsent {
 pub struct PendingPublicConsent {
     authority: Arc<PackageStorageAuthority>,
     app_id: String,
+    fingerprint: Option<[u8; 32]>,
 }
 pub struct StorageManagement {
     authority: Arc<PackageStorageAuthority>,
@@ -66,16 +67,36 @@ impl PublicStorageConsent {
         if !crate::app_data::valid_package_id(app_id) { return Err(AppDataError::InvalidArgument); }
         match self.authority.public_session(app_id) {
             Ok(session) => Ok(PublicConsentRequest::Allowed(GrantedPublicStorage { app_id: app_id.to_owned(), session, receipt: None })),
-            Err(AppDataError::Denied) => Ok(PublicConsentRequest::Prompt(PendingPublicConsent { authority: self.authority.clone(), app_id: app_id.to_owned() })),
+            Err(AppDataError::Denied) => Ok(PublicConsentRequest::Prompt(PendingPublicConsent { authority: self.authority.clone(), app_id: app_id.to_owned(), fingerprint: None })),
             Err(error) => Err(error),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn request_package(&self, package: &Package) -> Result<PublicConsentRequest, AppDataError> {
+        if !package.manifest.public_storage || package.manifest.sdk_version < 6 { return Err(AppDataError::Denied); }
+        match self.authority.public_binding_status(&package.manifest.id, package.storage_fingerprint())? {
+            PackageBinding::Matched => {
+                let session = self.authority.public_session_for_package(package)?;
+                Ok(PublicConsentRequest::Allowed(GrantedPublicStorage { app_id: package.manifest.id.clone(), session, receipt: None }))
+            }
+            PackageBinding::Missing | PackageBinding::Conflict => Ok(PublicConsentRequest::Prompt(PendingPublicConsent {
+                authority: self.authority.clone(), app_id: package.manifest.id.clone(), fingerprint: Some(package.storage_fingerprint()),
+            })),
         }
     }
 }
 impl PendingPublicConsent {
     pub fn app_id(&self) -> &str { &self.app_id }
     pub fn allow(self) -> Result<GrantedPublicStorage, AppDataError> {
-        let receipt = self.authority.authorize_public(&self.app_id)?;
-        let session = self.authority.public_session(&self.app_id)?;
+        let (receipt, session) = if let Some(fingerprint) = self.fingerprint {
+            let receipt = self.authority.authorize_public_bound(&self.app_id, fingerprint)?;
+            let session = self.authority.public_session_bound(&self.app_id, fingerprint)?;
+            (receipt, session)
+        } else {
+            let receipt = self.authority.authorize_public(&self.app_id)?;
+            let session = self.authority.public_session(&self.app_id)?;
+            (receipt, session)
+        };
         Ok(GrantedPublicStorage { app_id: self.app_id, session, receipt: Some(receipt) })
     }
     pub fn deny(self) {}

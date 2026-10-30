@@ -327,7 +327,7 @@ fn run_inner(
         bail!("PRIVATE_FILES_PACKAGE_NOT_AUTHORIZED");
     }
     #[cfg(target_os = "linux")]
-    if app_data.public_files.as_ref().is_some_and(|files| !files.belongs_to(&package.manifest.id)) {
+    if app_data.public_files.as_ref().is_some_and(|files| !files.belongs_to_package(&package)) {
         bail!("PUBLIC_FILES_IDENTITY_MISMATCH");
     }
     #[cfg(target_os = "linux")]

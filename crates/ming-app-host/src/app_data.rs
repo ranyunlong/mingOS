@@ -208,6 +208,7 @@ pub(crate) enum PackageBinding { Missing, Matched, Conflict }
 const POLICY_HEADER: &str = "ming-private-storage-policy-v1\n";
 const POLICY_HEADER_V2: &str = "ming-private-storage-policy-v2\n";
 const PUBLIC_POLICY_HEADER: &str = "ming-public-storage-policy-v1\n";
+const PUBLIC_POLICY_HEADER_V2: &str = "ming-public-storage-policy-v2\n";
 impl PackageStorageAuthority {
     pub fn new(root: AppDataRoot) -> Self {
         Self { root, authorized: Mutex::new(BTreeMap::new()), #[cfg(target_os = "linux")] private: Mutex::new(BTreeMap::new()), public_authorized: Mutex::new(BTreeMap::new()), policy: None, public_policy: None, #[cfg(target_os = "linux")] _private_only_lock: None }
@@ -268,12 +269,26 @@ impl PackageStorageAuthority {
         let mut public_authorized = BTreeMap::new();
         if !public_bytes.is_empty() {
             let text = std::str::from_utf8(&public_bytes).map_err(|_| AppDataError::Io)?;
-            let lines = text.strip_prefix(PUBLIC_POLICY_HEADER).ok_or(AppDataError::Io)?;
+            let (lines, v2) = if let Some(lines) = text.strip_prefix(PUBLIC_POLICY_HEADER_V2) {
+                (lines, true)
+            } else { (text.strip_prefix(PUBLIC_POLICY_HEADER).ok_or(AppDataError::Io)?, false) };
             if !lines.is_empty() && !lines.ends_with('\n') { return Err(AppDataError::Io); }
             let mut previous: Option<&str> = None;
-            for id in lines.lines() {
+            for line in lines.lines() {
+                let (id, fingerprint) = if v2 {
+                    let (id, value) = line.split_once('\t').ok_or(AppDataError::Io)?;
+                    let fingerprint = if value == "-" { None } else {
+                        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err(AppDataError::Io); }
+                        let mut result = [0u8; 32];
+                        for (index, item) in result.iter_mut().enumerate() {
+                            *item = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| AppDataError::Io)?;
+                        }
+                        Some(result)
+                    };
+                    (id, fingerprint)
+                } else { (line, None) };
                 if !valid_package_id(id) || previous.is_some_and(|value| value >= id) { return Err(AppDataError::Io); }
-                public_authorized.insert(id.to_owned(), PackageAuthorization::default());
+                public_authorized.insert(id.to_owned(), PackageAuthorization { fingerprint, ..Default::default() });
                 previous = Some(id);
             }
         } else if public_store.size(1).is_ok() {
@@ -307,10 +322,18 @@ impl PackageStorageAuthority {
         let Some(policy) = &self.public_policy else {
             return Ok(AuthorizationReceipt { persisted: false, directory_synced: false });
         };
-        let mut text = String::from(PUBLIC_POLICY_HEADER);
+        let v2 = authorized.values().any(|entry| entry.generation.load(Ordering::Acquire) && entry.fingerprint.is_some());
+        let mut text = String::from(if v2 { PUBLIC_POLICY_HEADER_V2 } else { PUBLIC_POLICY_HEADER });
         for (id, entry) in authorized {
             if !entry.generation.load(Ordering::Acquire) { continue; }
             text.push_str(id);
+            if v2 {
+                use std::fmt::Write as _;
+                text.push('\t');
+                if let Some(fingerprint) = entry.fingerprint {
+                    for byte in fingerprint { write!(&mut text, "{byte:02x}").map_err(|_| AppDataError::Io)?; }
+                } else { text.push('-'); }
+            }
             text.push('\n');
             if text.len() > MAX_SLOT_BYTES { return Err(AppDataError::Io); }
         }
@@ -346,6 +369,39 @@ impl PackageStorageAuthority {
             Err(error) => { if inserted { authorized.remove(package_id); } Err(error) }
         }
     }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn authorize_public_bound(&self, package_id: &str, fingerprint: [u8; 32]) -> Result<AuthorizationReceipt> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if let Some(entry) = authorized.get(package_id) {
+            if entry.generation.load(Ordering::Acquire) && entry.fingerprint == Some(fingerprint) {
+                return self.persist_public(&authorized);
+            }
+        }
+        if let Some(entry) = authorized.get_mut(package_id) {
+            entry.generation.store(false, Ordering::Release);
+            for session in entry.sessions.drain(..).filter_map(|session| session.upgrade()) {
+                *session.lock().unwrap_or_else(|poison| poison.into_inner()) = false;
+            }
+        }
+        authorized.insert(package_id.to_owned(), PackageAuthorization { fingerprint: Some(fingerprint), ..Default::default() });
+        match self.persist_public(&authorized) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => { authorized.remove(package_id); Err(error) }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn public_binding_status(&self, package_id: &str, fingerprint: [u8; 32]) -> Result<PackageBinding> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        Ok(match authorized.get(package_id) {
+            None => PackageBinding::Missing,
+            Some(entry) if entry.generation.load(Ordering::Acquire) && entry.fingerprint == Some(fingerprint) => PackageBinding::Matched,
+            Some(_) => PackageBinding::Conflict,
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn supports_public_persistence(&self) -> bool { self.public_policy.is_some() }
     #[cfg(target_os = "linux")]
     pub(crate) fn authorize_bound(&self, package_id: &str, fingerprint: [u8; 32]) -> Result<AuthorizationReceipt> {
         if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
@@ -415,7 +471,19 @@ impl PackageStorageAuthority {
         if entry.sessions.len() >= 64 { return Err(AppDataError::Io); }
         let active = Arc::new(Mutex::new(true));
         entry.sessions.push(Arc::downgrade(&active));
-        Ok(PublicFileSession { authority: self.clone(), package_id: package_id.to_owned(), generation: entry.generation.clone(), active })
+        Ok(PublicFileSession { authority: self.clone(), package_id: package_id.to_owned(), generation: entry.generation.clone(), fingerprint: None, active })
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn public_session_bound(self: &Arc<Self>, package_id: &str, fingerprint: [u8; 32]) -> Result<PublicFileSession> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let mut authorized = self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        let entry = authorized.get_mut(package_id).ok_or(AppDataError::Denied)?;
+        if !entry.generation.load(Ordering::Acquire) || entry.fingerprint != Some(fingerprint) { return Err(AppDataError::Denied); }
+        entry.sessions.retain(|session| session.strong_count() != 0);
+        if entry.sessions.len() >= 64 { return Err(AppDataError::Io); }
+        let active = Arc::new(Mutex::new(true));
+        entry.sessions.push(Arc::downgrade(&active));
+        Ok(PublicFileSession { authority: self.clone(), package_id: package_id.to_owned(), generation: entry.generation.clone(), fingerprint: Some(fingerprint), active })
     }
     #[cfg(target_os = "linux")]
     fn file_session_checked(self: &Arc<Self>, package_id: &str, fingerprint: Option<[u8; 32]>) -> Result<PrivateFileSession> {
@@ -807,11 +875,13 @@ pub struct PublicFileSession {
     authority: Arc<PackageStorageAuthority>,
     package_id: String,
     generation: Arc<AtomicBool>,
+    fingerprint: Option<[u8; 32]>,
     active: Arc<Mutex<bool>>,
 }
 #[cfg(target_os = "linux")]
 impl PublicFileSession {
     pub(crate) fn belongs_to(&self, package_id: &str) -> bool { self.package_id == package_id }
+    pub(crate) fn matches_fingerprint(&self, fingerprint: [u8; 32]) -> bool { self.fingerprint == Some(fingerprint) }
     pub(crate) fn check(&self) -> Result<()> {
         self.run(|a, id, g| a.with_public_files(id, Some(g), |_| Ok(())))
     }

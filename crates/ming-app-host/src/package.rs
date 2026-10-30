@@ -106,10 +106,25 @@ impl crate::app_data::PackageStorageAuthority {
         if !package.manifest.private_storage || package.manifest.sdk_version < 6 { return Err(crate::app_data::AppDataError::Denied); }
         self.file_session_bound(&package.manifest.id, package.storage_fingerprint())
     }
+    pub fn authorize_public_package(&self, package: &Package) -> Result<crate::app_data::AuthorizationReceipt, crate::app_data::AppDataError> {
+        if !package.manifest.public_storage || package.manifest.sdk_version < 6 { return Err(crate::app_data::AppDataError::Denied); }
+        self.authorize_public_bound(&package.manifest.id, package.storage_fingerprint())
+    }
+    pub fn public_session_for_package(self: &std::sync::Arc<Self>, package: &Package) -> Result<crate::app_data::PublicFileSession, crate::app_data::AppDataError> {
+        if !package.manifest.public_storage || package.manifest.sdk_version < 6 { return Err(crate::app_data::AppDataError::Denied); }
+        self.public_session_bound(&package.manifest.id, package.storage_fingerprint())
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl crate::app_data::PrivateFileSession {
+    pub(crate) fn belongs_to_package(&self, package: &Package) -> bool {
+        self.belongs_to(&package.manifest.id) && self.matches_fingerprint(package.storage_fingerprint())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl crate::app_data::PublicFileSession {
     pub(crate) fn belongs_to_package(&self, package: &Package) -> bool {
         self.belongs_to(&package.manifest.id) && self.matches_fingerprint(package.storage_fingerprint())
     }

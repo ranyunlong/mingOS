@@ -66,7 +66,7 @@ impl PrivateFileRpc {
     pub(crate) fn belongs_to_package(&self, package: &crate::package::Package) -> bool {
         match &self.capability {
             FileCapability::Private(session) => session.belongs_to_package(package),
-            FileCapability::Public(session) => session.belongs_to(&package.manifest.id),
+            FileCapability::Public(session) => session.belongs_to_package(package),
         }
     }
 
@@ -165,6 +165,6 @@ impl PrivateFileRpc {
 impl PublicFileRpc {
     pub fn new(session: PublicFileSession) -> Self { Self { inner: PrivateFileRpc::new_public(session) } }
     pub fn close(&self) { self.inner.close(); }
-    pub(crate) fn belongs_to(&self, package_id: &str) -> bool { self.inner.belongs_to(package_id) }
+    pub(crate) fn belongs_to_package(&self, package: &crate::package::Package) -> bool { self.inner.belongs_to_package(package) }
     pub fn dispatch(&self, id: u64, payload: &str) -> Reply { self.inner.dispatch(id, payload) }
 }

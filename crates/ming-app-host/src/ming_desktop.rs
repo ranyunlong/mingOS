@@ -468,7 +468,7 @@ impl Session {
                             let package = crate::package::load_package(&entry.manifest_path).context("DESKTOP_PUBLIC_STORAGE_PACKAGE")?;
                             let authority = self.storage_authority.as_ref().context("DESKTOP_STORAGE_AUTHORITY")?.clone();
                             let consent = crate::storage_consent::PublicStorageConsent::new(authority);
-                            let pending = match consent.request(&package.manifest.id)? {
+                            let pending = match consent.request_package(&package)? {
                                 crate::storage_consent::PublicConsentRequest::Prompt(pending) => pending,
                                 crate::storage_consent::PublicConsentRequest::Allowed(_) => bail!("DESKTOP_PUBLIC_STORAGE_NOT_DURABLE"),
                             };
@@ -584,14 +584,21 @@ impl Session {
             if package.manifest.id != entry.package_id { bail!("DESKTOP_PACKAGE_ID_CHANGED"); }
             if package.storage_fingerprint() != entry.package_fingerprint { bail!("DESKTOP_PACKAGE_CHANGED"); }
             if package.manifest.sdk_version >= 6 {
-                if self.storage_authority.is_none() {
-                    self.storage_authority = Some(Arc::new(crate::app_data::PackageStorageAuthority::open_persistent(root).context("DESKTOP_STORAGE_AUTHORITY")?));
+                if self.storage_authority.as_ref().is_none_or(|authority| {
+                    package.manifest.public_storage && !authority.supports_public_persistence()
+                }) {
+                    let authority = if package.manifest.public_storage {
+                        crate::app_data::PackageStorageAuthority::open_persistent(root).context("DESKTOP_STORAGE_AUTHORITY")?
+                    } else {
+                        crate::app_data::PackageStorageAuthority::new(root)
+                    };
+                    self.storage_authority = Some(Arc::new(authority));
                 }
                 let session = self.storage_authority.as_ref().expect("initialized").default_private_session_for_package(&package).context("DESKTOP_PRIVATE_STORAGE")?;
                 let public = if package.manifest.public_storage && !self.public_denied.remove(&app) {
                     let authority = self.storage_authority.as_ref().expect("initialized").clone();
                     let consent = crate::storage_consent::PublicStorageConsent::new(authority);
-                    match consent.request(&package.manifest.id)? {
+                    match consent.request_package(&package)? {
                         crate::storage_consent::PublicConsentRequest::Allowed(granted) => Some((granted.app_id, granted.session)),
                         crate::storage_consent::PublicConsentRequest::Prompt(pending) if !self.options.offscreen => {
                             let prompt = crate::graphics::desktop_shell::StoragePrompt::public_request(&package.manifest.id)?;
