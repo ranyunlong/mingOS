@@ -3,6 +3,8 @@ use crate::{
     graphics::RendererKind,
     package::{load_package, read_bounded},
 };
+#[cfg(target_os = "linux")]
+use crate::package_install::PackageInstallRegistry;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -58,6 +60,22 @@ pub fn load_catalog(path: &Path) -> Result<Catalog> {
     load_catalog_with_data(path).map(|(catalog, _)| catalog)
 }
 pub(crate) fn load_catalog_with_data(path: &Path) -> Result<(Catalog, BTreeMap<u16, TrustedAppData>)> {
+    #[cfg(target_os = "linux")]
+    { return load_catalog_with_data_impl(path, None); }
+    #[cfg(not(target_os = "linux"))]
+    { load_catalog_with_data_impl(path) }
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn load_catalog_with_install_registry(
+    path: &Path,
+    registry: &PackageInstallRegistry,
+) -> Result<(Catalog, BTreeMap<u16, TrustedAppData>)> {
+    load_catalog_with_data_impl(path, Some(registry))
+}
+fn load_catalog_with_data_impl(
+    path: &Path,
+    #[cfg(target_os = "linux")] registry: Option<&PackageInstallRegistry>,
+) -> Result<(Catalog, BTreeMap<u16, TrustedAppData>)> {
     let disk: DiskCatalog = serde_json::from_slice(&read_bounded(path, 16384, "DESKTOP_CATALOG")?)
         .context("DESKTOP_CATALOG_INVALID")?;
     if !matches!(disk.schema_version, 1 | 2)
@@ -107,6 +125,10 @@ pub(crate) fn load_catalog_with_data(path: &Path) -> Result<(Catalog, BTreeMap<u
             parent.join(app.manifest)
         };
         let package = load_package(&manifest).context("DESKTOP_CATALOG_PACKAGE")?;
+        #[cfg(target_os = "linux")]
+        if let Some(registry) = registry {
+            registry.verify_package(&package).context("DESKTOP_INSTALL_REGISTRY")?;
+        }
         if !package_ids.insert(package.manifest.id.clone()) { bail!("DESKTOP_PACKAGE_ID_SHARED"); }
         if package.manifest.sdk_version < 2 {
             bail!("DESKTOP_GRAPHICAL_PACKAGE_REQUIRED");
@@ -242,6 +264,9 @@ pub enum IsolationMode { Off, Strict }
 #[derive(Debug)]
 pub struct DesktopOptions {
     pub(crate) app_data: DesktopDataConfig,
+    pub install_root: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    pub(crate) install_registry: Option<PackageInstallRegistry>,
     pub catalog_path: PathBuf,
     pub renderer: RendererKind,
     pub offscreen: bool,
@@ -262,6 +287,9 @@ impl DesktopOptions {
             .into();
         let mut result = Self {
             app_data: DesktopDataConfig::default(),
+            install_root: None,
+            #[cfg(target_os = "linux")]
+            install_registry: None,
             catalog_path,
             renderer: RendererKind::Gpu,
             offscreen: false,
@@ -284,6 +312,9 @@ impl DesktopOptions {
             match flag {
                 "--data-root" => {
                     result.app_data.root = Some(crate::app_data::AppDataRoot::open(Path::new(&value)).context("DESKTOP_DATA_ROOT")?);
+                }
+                "--install-root" => {
+                    result.install_root = Some(PathBuf::from(value));
                 }
                 "--renderer" => {
                     result.renderer = match text {
@@ -397,7 +428,7 @@ impl DesktopOptions {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::fmt::Write as _;
+    use std::{fmt::Write as _, os::unix::fs::PermissionsExt};
 
     fn hex(value: [u8; 32]) -> String {
         let mut text = String::with_capacity(64);
@@ -441,5 +472,28 @@ mod tests {
         .unwrap();
         let error = load_catalog(&catalog).unwrap_err();
         assert!(format!("{error:#}").contains("DESKTOP_INSTALL_IDENTITY_MISMATCH"));
+    }
+
+    #[test]
+    fn configured_install_registry_rejects_unregistered_and_removed_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(dir.path().join("app")).unwrap();
+        std::fs::write(dir.path().join("app/main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        let manifest = dir.path().join("app/app.json");
+        std::fs::write(
+            &manifest,
+            r#"{"schemaVersion":1,"id":"dev.example.installed","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#,
+        )
+        .unwrap();
+        let catalog = dir.path().join("catalog.json");
+        std::fs::write(&catalog, r#"{"schemaVersion":1,"apps":[{"id":1,"title":"Installed","manifest":"app/app.json"}],"autostart":[]}"#).unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(dir.path()).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        assert!(format!("{:#}", load_catalog_with_install_registry(&catalog, &registry).unwrap_err()).contains("INSTALL_NOT_REGISTERED"));
+        registry.install_package(&package).unwrap();
+        assert!(load_catalog_with_install_registry(&catalog, &registry).is_ok());
+        registry.uninstall(&package.manifest.id).unwrap();
+        assert!(format!("{:#}", load_catalog_with_install_registry(&catalog, &registry).unwrap_err()).contains("INSTALL_PACKAGE_REMOVED"));
     }
 }

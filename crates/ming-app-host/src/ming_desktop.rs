@@ -1473,6 +1473,21 @@ fn model_error(e: crate::desktop_model::ModelError) -> anyhow::Error {
 
 pub fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<DesktopOutcome> {
     let mut options = DesktopOptions::parse(arguments)?;
+    #[cfg(target_os = "linux")]
+    if let Some(root) = options.install_root.as_ref() {
+        options.install_registry = Some(crate::package_install::PackageInstallRegistry::open(root)?);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if options.install_root.is_some() {
+        bail!("DESKTOP_INSTALL_REGISTRY_UNSUPPORTED");
+    }
+    #[cfg(target_os = "linux")]
+    let (catalog, data_bindings) = if let Some(registry) = options.install_registry.as_ref() {
+        crate::desktop_catalog::load_catalog_with_install_registry(&options.catalog_path, registry)?
+    } else {
+        load_catalog_with_data(&options.catalog_path)?
+    };
+    #[cfg(not(target_os = "linux"))]
     let (catalog, data_bindings) = load_catalog_with_data(&options.catalog_path)?;
     options.app_data.grants = data_bindings;
     if options.offscreen {

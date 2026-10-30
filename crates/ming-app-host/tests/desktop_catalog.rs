@@ -22,6 +22,13 @@ fn desktop_flags_are_bounded_and_duplicate_unknown_arguments_rejected() {
     .unwrap();
     assert_eq!((o.width, o.height, o.duration_ms), (800, 600, 1000));
     assert!(o.offscreen);
+    let install_root = tempfile::tempdir().unwrap();
+    let configured = DesktopOptions::parse(args(&[
+        "catalog.json",
+        "--install-root",
+        install_root.path().to_str().unwrap(),
+    ])).unwrap();
+    assert_eq!(configured.install_root.as_deref(), Some(install_root.path()));
     for bad in [
         args(&[]),
         args(&["x", "--renderer", "typo"]),

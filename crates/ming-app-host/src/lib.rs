@@ -4,6 +4,8 @@ pub mod private_file_rpc;
 #[cfg(target_os = "linux")]
 pub mod private_file_wire;
 #[cfg(target_os = "linux")]
+pub mod package_install;
+#[cfg(target_os = "linux")]
 pub mod storage_consent;
 pub mod linux_isolation;
 #[cfg(feature="desktop")]
