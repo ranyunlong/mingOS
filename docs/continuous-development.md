@@ -130,6 +130,8 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 
 2026-10-30 卸载数据策略基础：默认卸载继续只撤销安装登记并保留应用私有数据；新增父侧 `purge_private_data` 作为独立、显式的破坏性清除入口。清除要求所有私有运行代已关闭，使用 Linux pinned descriptor、`O_NOFOLLOW` 和递归 no-follow 删除，只删除目标应用私有目录，不删除兄弟应用或公共共享目录。固定 Rust 1.99.1 禁网环境下 `app_data` 全量 `49/49` 通过，包含活跃运行代拒绝清除、清除后私有数据不可恢复以及公共文件保持可读。设计见 [安装生命周期与应用数据策略](superpowers/specs/2026-10-30-install-lifecycle-data-policy.md)；真实卸载 UI、安装服务事务、多用户身份和跨平台实现仍待完成，`finalSystemAccepted=false`。
 
+2026-10-30 安装服务接入数据策略：`PackageInstallRegistry::uninstall_with_data_policy` 接入默认保留和显式清除两条父侧路径。清除失败时保持已卸载、数据保留，可在关闭运行代并撤销旧式 grant 后重试；重复调用不会重新激活登记。`package_install` 全量回归 `8/8` 通过；桌面卸载 UI、系统确认交互、多用户安装身份和跨平台实现仍待完成，`finalSystemAccepted=false`。
+
 ## 验证原则
 
 - 软件编译、软件渲染、GPU计算、GPU Surface、Wayland客户端、桌面合成器和系统启动分别记录。

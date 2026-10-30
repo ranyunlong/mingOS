@@ -452,7 +452,7 @@ impl PackageStorageAuthority {
     pub fn purge_private_data(&self, package_id: &str) -> Result<bool> {
         if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
         let authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
-        if self.policy.is_some() && authorized.contains_key(package_id) { return Err(AppDataError::Denied); }
+        if authorized.contains_key(package_id) { return Err(AppDataError::Denied); }
         let mut private = self.private.lock().map_err(|_| AppDataError::Denied)?;
         if let Some(entry) = private.get_mut(package_id) {
             entry.sessions.retain(|session| session.strong_count() != 0);

@@ -4,7 +4,7 @@
 //! binds a package ID to exact loaded package bytes and version; `open_verified()` additionally
 //! requires a trusted publisher signature.
 
-use crate::{app_data::valid_package_id, package::{Package, load_package}};
+use crate::{app_data::{PackageStorageAuthority, valid_package_id}, package::{Package, load_package}};
 use crate::publisher::PublisherTrustStore;
 use anyhow::{Context, Result, bail};
 use std::{
@@ -30,6 +30,18 @@ pub enum InstallState {
     Unchanged,
     Updated,
     Reinstalled,
+}
+
+#[derive(Clone, Copy)]
+pub enum UninstallDataPolicy<'a> {
+    PreservePrivateData,
+    PurgePrivateData(&'a PackageStorageAuthority),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UninstallOutcome {
+    pub registry_changed: bool,
+    pub private_data_purged: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +206,19 @@ impl PackageInstallRegistry {
             return Err(error);
         }
         Ok(true)
+    }
+
+    /// Marks the package removed and optionally performs the separate destructive data purge.
+    /// A purge failure leaves the package removed and its private data available for retry.
+    pub fn uninstall_with_data_policy(&self, package_id: &str, policy: UninstallDataPolicy<'_>) -> Result<UninstallOutcome> {
+        let registry_changed = self.uninstall(package_id)?;
+        let private_data_purged = match policy {
+            UninstallDataPolicy::PreservePrivateData => false,
+            UninstallDataPolicy::PurgePrivateData(authority) => authority
+                .purge_private_data(package_id)
+                .map_err(|error| anyhow::anyhow!("INSTALL_PRIVATE_DATA_PURGE: {error}"))?,
+        };
+        Ok(UninstallOutcome { registry_changed, private_data_purged })
     }
 
     pub fn verify_package(&self, package: &Package) -> Result<()> {

@@ -2,7 +2,12 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signer, SigningKey};
-use ming_app_host::{package::{Manifest, Package, load_package}, package_install::{InstallState, PackageInstallRegistry}, publisher::PublisherTrustStore};
+use ming_app_host::{
+    app_data::{AppDataRoot, PackageStorageAuthority},
+    package::{Manifest, Package, load_package},
+    package_install::{InstallState, PackageInstallRegistry, UninstallDataPolicy},
+    publisher::PublisherTrustStore,
+};
 use std::{fs, os::unix::fs::PermissionsExt};
 
 fn package(version: &str, bytes: &[u8]) -> Package {
@@ -114,6 +119,70 @@ fn install_from_manifest_stores_versioned_content_and_keeps_old_update_content()
     registry.uninstall("dev.example.installed").unwrap();
     assert!(registry.active_manifest_path("dev.example.installed").is_err());
     assert!(first.exists() && second.exists());
+}
+
+#[test]
+fn uninstall_preserves_private_data_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let install_root = temp.path().join("install");
+    let data_root = temp.path().join("data");
+    fs::create_dir(&install_root).unwrap();
+    fs::create_dir(&data_root).unwrap();
+    fs::set_permissions(&install_root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&data_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let registry = PackageInstallRegistry::open(&install_root).unwrap();
+    let installed = package("1.0.0", b"\0asm\x01\0\0\0");
+    registry.install_package(&installed).unwrap();
+    let authority = std::sync::Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&data_root).unwrap()));
+    authority.authorize(&installed.manifest.id).unwrap();
+    let session = authority.file_session(&installed.manifest.id).unwrap();
+    session.write_file("note", b"keep").unwrap();
+    drop(session);
+
+    let outcome = registry
+        .uninstall_with_data_policy(&installed.manifest.id, UninstallDataPolicy::PreservePrivateData)
+        .unwrap();
+    assert!(outcome.registry_changed);
+    assert!(!outcome.private_data_purged);
+    authority.revoke(&installed.manifest.id).unwrap();
+    authority.authorize(&installed.manifest.id).unwrap();
+    assert_eq!(authority.file_session(&installed.manifest.id).unwrap().read_file("note").unwrap(), b"keep");
+}
+
+#[test]
+fn explicit_private_data_purge_is_retryable_after_uninstall_and_closed_session() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let install_root = temp.path().join("install");
+    let data_root = temp.path().join("data");
+    fs::create_dir(&install_root).unwrap();
+    fs::create_dir(&data_root).unwrap();
+    fs::set_permissions(&install_root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&data_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let registry = PackageInstallRegistry::open(&install_root).unwrap();
+    let installed = package("1.0.0", b"\0asm\x01\0\0\0");
+    registry.install_package(&installed).unwrap();
+    let authority = std::sync::Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&data_root).unwrap()));
+    authority.authorize(&installed.manifest.id).unwrap();
+    let session = authority.file_session(&installed.manifest.id).unwrap();
+    session.write_file("note", b"delete").unwrap();
+
+    let failed = registry.uninstall_with_data_policy(
+        &installed.manifest.id,
+        UninstallDataPolicy::PurgePrivateData(&authority),
+    );
+    assert!(failed.is_err());
+    assert!(registry.verify_package(&installed).is_err());
+    drop(session);
+    authority.revoke(&installed.manifest.id).unwrap();
+    let outcome = registry
+        .uninstall_with_data_policy(&installed.manifest.id, UninstallDataPolicy::PurgePrivateData(&authority))
+        .unwrap();
+    assert!(!outcome.registry_changed);
+    assert!(outcome.private_data_purged);
+    authority.authorize(&installed.manifest.id).unwrap();
+    assert_eq!(authority.file_session(&installed.manifest.id).unwrap().read_file("note"), Err(ming_app_host::app_data::AppDataError::NotFound));
 }
 
 #[test]
