@@ -4,7 +4,7 @@
 //! exact loaded package bytes and version, but it is not a publisher signature or a replacement
 //! for a future signed distribution format.
 
-use crate::{app_data::valid_package_id, package::Package};
+use crate::{app_data::valid_package_id, package::{Package, load_package}};
 use anyhow::{Context, Result, bail};
 use std::{
     collections::BTreeMap,
@@ -13,10 +13,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{Mutex, atomic::{AtomicU64, Ordering}},
 };
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 const HEADER: &str = "ming-installed-packages-v1\n";
 const RECORD_NAME: &str = "installed-packages-v1";
 const LOCK_NAME: &str = ".ming-installed-packages.lock";
+const CONTENT_DIR_NAME: &str = "packages";
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -98,25 +101,7 @@ impl PackageInstallRegistry {
         };
         let mut records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
         let previous = records.clone();
-        let state = match records.get(id) {
-            None => InstallState::Installed,
-            Some(existing) if existing.state == RecordState::Active
-                && existing.version == candidate.version
-                && existing.fingerprint == candidate.fingerprint => InstallState::Unchanged,
-            Some(existing) if existing.state == RecordState::Active
-                && !version_is_newer(&candidate.version, &existing.version) => {
-                bail!("INSTALL_VERSION_NOT_NEWER");
-            }
-            Some(existing) if existing.state == RecordState::Removed
-                && existing.version == candidate.version
-                && existing.fingerprint == candidate.fingerprint => InstallState::Reinstalled,
-            Some(existing) if existing.state == RecordState::Removed
-                && !version_is_newer(&candidate.version, &existing.version) => {
-                bail!("INSTALL_VERSION_NOT_NEWER");
-            }
-            Some(existing) if existing.state == RecordState::Removed => InstallState::Reinstalled,
-            Some(_) => InstallState::Updated,
-        };
+        let state = next_state(records.get(id), &candidate)?;
         if state != InstallState::Unchanged {
             records.insert(id.clone(), candidate);
             if let Err(error) = self.persist_locked(&records) {
@@ -125,6 +110,57 @@ impl PackageInstallRegistry {
             }
         }
         Ok(state)
+    }
+
+    /// Loads a package through the trusted parent, stores its content under an immutable
+    /// versioned directory, and then publishes the matching active record atomically.
+    pub fn install_from_manifest(&self, manifest_path: &Path) -> Result<InstallState> {
+        let package = load_package(manifest_path).context("INSTALL_PACKAGE_LOAD")?;
+        validate_package_record(&package.manifest.id, &package.manifest.version)?;
+        let candidate = Record {
+            version: package.manifest.version.clone(),
+            fingerprint: package.storage_fingerprint(),
+            state: RecordState::Active,
+        };
+        let mut records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let previous = records.clone();
+        let state = next_state(records.get(&package.manifest.id), &candidate)?;
+        let content_path = self.content_path(&package.manifest.id, &candidate);
+        let content_was_created = if let Ok(metadata) = fs::symlink_metadata(&content_path) {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("INSTALL_CONTENT_DIRECTORY");
+            }
+            self.verify_stored_package(&content_path, &package)?;
+            false
+        } else {
+            self.stage_package(&content_path, &package)?;
+            true
+        };
+        if state != InstallState::Unchanged {
+            records.insert(package.manifest.id.clone(), candidate);
+            if let Err(error) = self.persist_locked(&records) {
+                *records = previous;
+                if content_was_created { let _ = fs::remove_dir_all(&content_path); }
+                return Err(error);
+            }
+        }
+        Ok(state)
+    }
+
+    pub fn active_manifest_path(&self, package_id: &str) -> Result<PathBuf> {
+        if !valid_package_id(package_id) { bail!("INSTALL_PACKAGE_ID"); }
+        let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let record = records.get(package_id).context("INSTALL_NOT_FOUND")?;
+        if record.state != RecordState::Active { bail!("INSTALL_PACKAGE_REMOVED"); }
+        let path = self.content_path(package_id, record).join("app.json");
+        let package = load_package(&path).context("INSTALL_CONTENT_MISSING")?;
+        if package.manifest.id != package_id
+            || package.manifest.version != record.version
+            || package.storage_fingerprint() != record.fingerprint
+        {
+            bail!("INSTALL_CONTENT_MISMATCH");
+        }
+        Ok(path)
     }
 
     pub fn uninstall(&self, package_id: &str) -> Result<bool> {
@@ -193,6 +229,47 @@ impl PackageInstallRegistry {
         }
         result
     }
+
+    fn content_path(&self, package_id: &str, record: &Record) -> PathBuf {
+        self.root
+            .join(CONTENT_DIR_NAME)
+            .join(hex_bytes(package_id.as_bytes()))
+            .join(format!("{}-{}", record.version, hex(&record.fingerprint)))
+    }
+
+    fn stage_package(&self, destination: &Path, package: &Package) -> Result<()> {
+        let package_root = self.root.join(CONTENT_DIR_NAME);
+        ensure_private_directory(&package_root)?;
+        let id_root = package_root.join(hex_bytes(package.manifest.id.as_bytes()));
+        ensure_private_directory(&id_root)?;
+        if destination.exists() { bail!("INSTALL_CONTENT_RACE"); }
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = id_root.join(format!(".tmp-{}-{sequence}", std::process::id()));
+        ensure_private_directory(&temporary)?;
+        let result = (|| -> Result<()> {
+            let manifest = serde_json::to_vec(&package.manifest).context("INSTALL_MANIFEST_SERIALIZE")?;
+            write_private_file(&temporary.join("app.json"), &manifest)?;
+            write_private_file(&temporary.join(&package.manifest.entry), &package.bytes)?;
+            File::open(&temporary).context("INSTALL_CONTENT_OPEN")?.sync_all().context("INSTALL_CONTENT_SYNC")?;
+            fs::rename(&temporary, destination).context("INSTALL_CONTENT_RENAME")?;
+            File::open(&id_root).context("INSTALL_CONTENT_PARENT_OPEN")?.sync_all().context("INSTALL_CONTENT_PARENT_SYNC")?;
+            File::open(&package_root).context("INSTALL_CONTENT_ROOT_OPEN")?.sync_all().context("INSTALL_CONTENT_ROOT_SYNC")?;
+            Ok(())
+        })();
+        if result.is_err() { let _ = fs::remove_dir_all(&temporary); }
+        result
+    }
+
+    fn verify_stored_package(&self, path: &Path, expected: &Package) -> Result<()> {
+        let stored = load_package(&path.join("app.json")).context("INSTALL_CONTENT_LOAD")?;
+        if stored.manifest.id != expected.manifest.id
+            || stored.manifest.version != expected.manifest.version
+            || stored.storage_fingerprint() != expected.storage_fingerprint()
+        {
+            bail!("INSTALL_CONTENT_MISMATCH");
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PackageInstallRegistry {
@@ -248,6 +325,23 @@ fn load_records(path: PathBuf) -> Result<BTreeMap<String, Record>> {
     Ok(records)
 }
 
+fn next_state(existing: Option<&Record>, candidate: &Record) -> Result<InstallState> {
+    match existing {
+        None => Ok(InstallState::Installed),
+        Some(existing) if existing.state == RecordState::Active
+            && existing.version == candidate.version
+            && existing.fingerprint == candidate.fingerprint => Ok(InstallState::Unchanged),
+        Some(existing) if existing.state == RecordState::Removed
+            && existing.version == candidate.version
+            && existing.fingerprint == candidate.fingerprint => Ok(InstallState::Reinstalled),
+        Some(existing) if !version_is_newer(&candidate.version, &existing.version) => {
+            bail!("INSTALL_VERSION_NOT_NEWER");
+        }
+        Some(existing) if existing.state == RecordState::Removed => Ok(InstallState::Reinstalled),
+        Some(_) => Ok(InstallState::Updated),
+    }
+}
+
 fn validate_package_record(id: &str, version: &str) -> Result<()> {
     if !valid_package_id(id) { bail!("INSTALL_PACKAGE_ID"); }
     if !valid_version(version) { bail!("INSTALL_PACKAGE_VERSION"); }
@@ -290,6 +384,40 @@ fn hex(bytes: &[u8; 32]) -> String {
     let mut value = String::with_capacity(64);
     for byte in bytes { value.push_str(&format!("{byte:02x}")); }
     value
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes { value.push_str(&format!("{byte:02x}")); }
+    value
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("INSTALL_CONTENT_DIRECTORY");
+        }
+        verify_private_owner(&metadata, "INSTALL_CONTENT_PERMISSIONS")?;
+        return Ok(());
+    }
+    fs::create_dir(path).context("INSTALL_CONTENT_MKDIR")?;
+    #[cfg(unix)]
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).context("INSTALL_CONTENT_CHMOD")?;
+    let metadata = fs::symlink_metadata(path).context("INSTALL_CONTENT_METADATA")?;
+    verify_private_owner(&metadata, "INSTALL_CONTENT_PERMISSIONS")
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).context("INSTALL_CONTENT_FILE")?;
+    file.write_all(bytes).context("INSTALL_CONTENT_WRITE")?;
+    file.sync_all().context("INSTALL_CONTENT_FILE_SYNC")
 }
 
 #[cfg(target_os = "linux")]

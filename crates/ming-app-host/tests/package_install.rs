@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use ming_app_host::{package::{Manifest, Package}, package_install::{InstallState, PackageInstallRegistry}};
+use ming_app_host::{package::{Manifest, Package, load_package}, package_install::{InstallState, PackageInstallRegistry}};
 use std::{fs, os::unix::fs::PermissionsExt};
 
 fn package(version: &str, bytes: &[u8]) -> Package {
@@ -71,4 +71,35 @@ fn registry_lock_is_exclusive_and_uninstall_does_not_delete_sibling_data() {
     assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
     drop(registry);
     assert!(PackageInstallRegistry::open(temp.path()).is_ok());
+}
+
+#[test]
+fn install_from_manifest_stores_versioned_content_and_keeps_old_update_content() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    let manifest = source.join("app.json");
+    fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.installed","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+    let registry_root = temp.path().join("registry");
+    fs::create_dir(&registry_root).unwrap();
+    fs::set_permissions(&registry_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let registry = PackageInstallRegistry::open(&registry_root).unwrap();
+
+    assert_eq!(registry.install_from_manifest(&manifest).unwrap(), InstallState::Installed);
+    let first = registry.active_manifest_path("dev.example.installed").unwrap();
+    assert_eq!(load_package(&first).unwrap().manifest.version, "1.0.0");
+
+    fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0\x00").unwrap();
+    fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.installed","version":"1.1.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+    assert_eq!(registry.install_from_manifest(&manifest).unwrap(), InstallState::Updated);
+    let second = registry.active_manifest_path("dev.example.installed").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(load_package(&first).unwrap().manifest.version, "1.0.0");
+    assert_eq!(load_package(&second).unwrap().manifest.version, "1.1.0");
+
+    registry.uninstall("dev.example.installed").unwrap();
+    assert!(registry.active_manifest_path("dev.example.installed").is_err());
+    assert!(first.exists() && second.exists());
 }

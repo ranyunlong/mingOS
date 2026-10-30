@@ -38,7 +38,10 @@ struct DiskCatalog {
 struct DiskEntry {
     id: u16,
     title: String,
-    manifest: PathBuf,
+    #[serde(default)]
+    manifest: Option<PathBuf>,
+    #[serde(default)]
+    package_id: Option<String>,
     #[serde(default)] identity: Option<DiskIdentity>,
     #[serde(default)] data_key: Option<String>,
     #[serde(default)] slots: Option<Vec<u8>>,
@@ -78,7 +81,7 @@ fn load_catalog_with_data_impl(
 ) -> Result<(Catalog, BTreeMap<u16, TrustedAppData>)> {
     let disk: DiskCatalog = serde_json::from_slice(&read_bounded(path, 16384, "DESKTOP_CATALOG")?)
         .context("DESKTOP_CATALOG_INVALID")?;
-    if !matches!(disk.schema_version, 1 | 2)
+    if !matches!(disk.schema_version, 1 | 2 | 3)
         || disk.apps.is_empty()
         || disk.apps.len() > 4
         || disk.autostart.len() > 4
@@ -119,10 +122,27 @@ fn load_catalog_with_data_impl(
     let mut bindings = BTreeMap::new();
     let mut package_ids = BTreeSet::new();
     for app in disk.apps {
-        let manifest = if app.manifest.is_absolute() {
-            app.manifest
-        } else {
-            parent.join(app.manifest)
+        let manifest = match disk.schema_version {
+            1 | 2 => {
+                if app.package_id.is_some() { bail!("DESKTOP_CATALOG_ENTRY"); }
+                let manifest = app.manifest.context("DESKTOP_CATALOG_MANIFEST")?;
+                if manifest.is_absolute() { manifest } else { parent.join(manifest) }
+            }
+            3 => {
+                if app.manifest.is_some() || app.identity.is_some() { bail!("DESKTOP_CATALOG_ENTRY"); }
+                let package_id = app.package_id.as_deref().context("DESKTOP_INSTALL_PACKAGE_ID")?;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = package_id;
+                    bail!("DESKTOP_INSTALL_IDENTITY_UNSUPPORTED");
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let registry = registry.context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?;
+                    registry.active_manifest_path(package_id).context("DESKTOP_INSTALL_PACKAGE")?
+                }
+            }
+            _ => unreachable!(),
         };
         let package = load_package(&manifest).context("DESKTOP_CATALOG_PACKAGE")?;
         #[cfg(target_os = "linux")]
@@ -495,5 +515,26 @@ mod tests {
         assert!(load_catalog_with_install_registry(&catalog, &registry).is_ok());
         registry.uninstall(&package.manifest.id).unwrap();
         assert!(format!("{:#}", load_catalog_with_install_registry(&catalog, &registry).unwrap_err()).contains("INSTALL_PACKAGE_REMOVED"));
+    }
+
+    #[test]
+    fn catalog_v3_resolves_only_from_the_installed_package_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        let manifest = source.join("app.json");
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.installed","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let registry_root = dir.path().join("registry");
+        std::fs::create_dir(&registry_root).unwrap();
+        std::fs::set_permissions(&registry_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&registry_root).unwrap();
+        registry.install_from_manifest(&manifest).unwrap();
+        let catalog = dir.path().join("catalog.json");
+        std::fs::write(&catalog, r#"{"schemaVersion":3,"apps":[{"id":1,"title":"Installed","packageId":"dev.example.installed"}],"autostart":[]}"#).unwrap();
+        let loaded = load_catalog_with_install_registry(&catalog, &registry).unwrap();
+        assert!(loaded.0.apps[0].manifest_path.starts_with(&registry_root));
+        assert!(loaded.0.apps[0].manifest_path != manifest);
     }
 }

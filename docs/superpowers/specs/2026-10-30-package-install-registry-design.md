@@ -27,6 +27,8 @@ packageId<TAB>active|removed<TAB>version<TAB>lowercase-sha256
 
 桌面开发入口增加 `--install-root <absolute-directory>`。配置该选项时，catalog 仍负责开发期的窗口和包路径配置，但每个包还必须出现在登记账本中并精确匹配。未配置时保留 schema v1/v2 开发兼容行为，不能将其称为生产安装信任。
 
+登记根同时保存父侧加载后的包内容，目录按 `packageId/版本-指纹` 分代，不覆盖历史版本。`install_from_manifest` 先完整加载并校验源包，再把规范化 manifest 和 Wasm 写入新的私有目录，完成同步后发布登记记录。catalog schema v3 只接受 `packageId`，从活动登记解析内容路径，不再直接信任任意 catalog manifest 路径；v1/v2 仍是开发兼容格式。
+
 ## 非目标
 
-本阶段不实现发布者签名、密钥轮换、远程仓库、安装包复制、用户确认 UI、多用户身份、更新迁移脚本或卸载数据清理策略。上述能力必须在真实安装服务和系统信任根阶段单独设计与验收。
+本阶段不实现发布者签名、密钥轮换、远程仓库、用户确认 UI、多用户身份、更新迁移脚本或卸载数据清理策略。上述能力必须在真实安装服务和系统信任根阶段单独设计与验收。

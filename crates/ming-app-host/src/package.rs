@@ -52,7 +52,7 @@ pub fn read_bounded(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: u32,
