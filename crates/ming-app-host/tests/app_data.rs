@@ -128,6 +128,32 @@ fn private_file_sessions_bind_identity_and_old_sessions_stay_revoked() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn explicit_private_data_purge_requires_closed_sessions_and_preserves_public_files() {
+    use std::sync::Arc;
+    let f = Fixture::new();
+    let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&f.0).unwrap()));
+    let app = "dev.example.alpha";
+    let sibling = "dev.example.beta";
+    let session = authority.default_private_session(app, [1; 32]).unwrap();
+    session.write_file("note", b"private").unwrap();
+    let sibling_session = authority.default_private_session(sibling, [2; 32]).unwrap();
+    sibling_session.write_file("note", b"sibling").unwrap();
+    authority.authorize_public(app).unwrap();
+    let public = authority.public_session(app).unwrap();
+    public.write_file("shared", b"public").unwrap();
+
+    assert_eq!(authority.purge_private_data(app), Err(AppDataError::Denied));
+    drop(session);
+    assert!(authority.purge_private_data(app).unwrap());
+
+    let reopened = authority.default_private_session(app, [3; 32]).unwrap();
+    assert_eq!(reopened.read_file("note"), Err(AppDataError::NotFound));
+    assert_eq!(sibling_session.read_file("note").unwrap(), b"sibling");
+    assert_eq!(public.read_file("shared").unwrap(), b"public");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn private_file_sessions_are_bounded_and_dropped_sessions_are_reclaimed() {
     use std::sync::Arc;
     let f = Fixture::new();

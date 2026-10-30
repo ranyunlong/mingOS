@@ -446,6 +446,26 @@ impl PackageStorageAuthority {
         entry.sessions.push(Arc::downgrade(&active));
         Ok(PrivateFileSession { authority: self.clone(), package_id: package_id.to_owned(), generation: entry.generation.clone(), fingerprint: Some(fingerprint), active })
     }
+    /// Permanently removes one application's private directory after all private sessions close.
+    /// Shared public files and their authorization are intentionally unaffected.
+    #[cfg(target_os = "linux")]
+    pub fn purge_private_data(&self, package_id: &str) -> Result<bool> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if self.policy.is_some() && authorized.contains_key(package_id) { return Err(AppDataError::Denied); }
+        let mut private = self.private.lock().map_err(|_| AppDataError::Denied)?;
+        if let Some(entry) = private.get_mut(package_id) {
+            entry.sessions.retain(|session| session.strong_count() != 0);
+            if entry.sessions.iter().any(|session| session.strong_count() != 0) {
+                return Err(AppDataError::Denied);
+            }
+        }
+        let removed = self.root.root.remove_tree(&package_directory_name(package_id))?;
+        if let Some(entry) = private.remove(package_id) {
+            entry.generation.store(false, Ordering::Release);
+        }
+        Ok(removed)
+    }
     /// Creates a parent-owned capability for the shared public directory.
     #[cfg(target_os = "linux")]
     pub fn public_session(self: &Arc<Self>, package_id: &str) -> Result<PublicFileSession> {
@@ -1300,6 +1320,21 @@ mod platform {
             private_directory(&dir)?;
             Ok(Self(dir))
         }
+        pub fn remove_tree(&self, name: &str) -> Result<bool> {
+            private_directory(&self.0)?;
+            let directory = match open_at(&self.0, name, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+                Ok(file) => Directory(file),
+                Err(AppDataError::NotFound) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            directory.remove_contents()?;
+            let name = CString::new(name).map_err(|_| AppDataError::InvalidArgument)?;
+            if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(io_error(std::io::Error::last_os_error()));
+            }
+            self.0.sync_all().map_err(io_error)?;
+            Ok(true)
+        }
     }
     impl Directory {
         pub fn child(&self, name: &str, create: bool) -> Result<Self> {
@@ -1365,6 +1400,49 @@ mod platform {
             } else {
                 Err(io_error(std::io::Error::last_os_error()))
             }
+        }
+        fn remove_contents(&self) -> Result<()> {
+            private_directory(&self.0)?;
+            let file = open_at(&self.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let raw = file.into_raw_fd();
+            let stream = unsafe { libc::fdopendir(raw) };
+            if stream.is_null() {
+                unsafe { libc::close(raw); }
+                return Err(AppDataError::Io);
+            }
+            let result = (|| {
+                let mut count = 0;
+                loop {
+                    unsafe { *libc::__errno_location() = 0; }
+                    let entry = unsafe { libc::readdir(stream) };
+                    if entry.is_null() {
+                        if unsafe { *libc::__errno_location() } != 0 { return Err(AppDataError::Io); }
+                        break;
+                    }
+                    let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_str().map_err(|_| AppDataError::Io)?;
+                    if name == "." || name == ".." { continue; }
+                    count += 1;
+                    if count > MAX_PRIVATE_ENTRIES { return Err(AppDataError::Io); }
+                    let child = open_at(&self.0, name, libc::O_RDONLY, 0)?;
+                    let metadata = child.metadata().map_err(io_error)?;
+                    let name_c = CString::new(name).map_err(|_| AppDataError::InvalidArgument)?;
+                    if metadata.is_dir() {
+                        private_directory(&child)?;
+                        Directory(child).remove_contents()?;
+                        if unsafe { libc::unlinkat(self.0.as_raw_fd(), name_c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                            return Err(io_error(std::io::Error::last_os_error()));
+                        }
+                    } else {
+                        file_stamp_with_limit(metadata, MAX_PRIVATE_FILE_BYTES)?;
+                        if unsafe { libc::unlinkat(self.0.as_raw_fd(), name_c.as_ptr(), 0) } != 0 {
+                            return Err(io_error(std::io::Error::last_os_error()));
+                        }
+                    }
+                }
+                self.0.sync_all().map_err(io_error)
+            })();
+            unsafe { libc::closedir(stream); }
+            result
         }
         pub fn rename_no_replace(&self, from: &str, destination: &Directory, to: &str) -> Result<()> {
             private_directory(&self.0)?;

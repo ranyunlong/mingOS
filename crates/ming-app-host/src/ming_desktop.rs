@@ -1770,7 +1770,11 @@ mod input_backpressure_tests {
         std::fs::create_dir(&data).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
         let manifest = temp.path().join("manifest.json");
-        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(
+            temp.path().join("main.wasm"),
+            wat::parse_str("(module (func (export \"_start\") (loop br 0)))").unwrap(),
+        )
+        .unwrap();
         std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.public","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","publicStorage":true}"#).unwrap();
         let package = crate::package::load_package(&manifest).unwrap();
         let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Public".into(), package_fingerprint: package.storage_fingerprint(), manifest_path: manifest, package_id: package.manifest.id.clone() }], autostart: vec![1] };

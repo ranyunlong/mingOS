@@ -128,6 +128,8 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 
 2026-10-30 发布者签名强制接入：父侧新增 Ed25519 publisher trust root，支持 active/revoked key、轮换、原子 keyring 写入和固定 canonical signature envelope。`PackageInstallRegistry::open()` 保留开发兼容的无签名模式；`open_verified()` 在安装、活动 manifest 解析和包校验时强制验证发布者签名。Linux 桌面配置 `--install-root` 现在使用 verified registry，缺少 `trusted-publishers-v1` 时在启动前 fail-closed。固定 Rust 1.99.1 镜像、禁网、只读源码下，publisher `4/4`、package_install `6/6`、桌面回归 `1/1` 通过；`ming-app-host --all-targets -j1` 通过，库 `224 passed, 8 ignored`，其余集成目标均通过。固定镜像未安装 `rustfmt`，因此 `cargo fmt --check` 未执行成功；`git diff --check` 通过。当前签名覆盖仍是本地父侧信任根，不是证书链、远程密钥发布、多用户安装身份或完整安装 UI；更新迁移、卸载数据策略、多用户隔离和真实安装交互仍待完成，`finalSystemAccepted=false`。
 
+2026-10-30 卸载数据策略基础：默认卸载继续只撤销安装登记并保留应用私有数据；新增父侧 `purge_private_data` 作为独立、显式的破坏性清除入口。清除要求所有私有运行代已关闭，使用 Linux pinned descriptor、`O_NOFOLLOW` 和递归 no-follow 删除，只删除目标应用私有目录，不删除兄弟应用或公共共享目录。固定 Rust 1.99.1 禁网环境下 `app_data` 全量 `49/49` 通过，包含活跃运行代拒绝清除、清除后私有数据不可恢复以及公共文件保持可读。设计见 [安装生命周期与应用数据策略](superpowers/specs/2026-10-30-install-lifecycle-data-policy.md)；真实卸载 UI、安装服务事务、多用户身份和跨平台实现仍待完成，`finalSystemAccepted=false`。
+
 ## 验证原则
 
 - 软件编译、软件渲染、GPU计算、GPU Surface、Wayland客户端、桌面合成器和系统启动分别记录。
