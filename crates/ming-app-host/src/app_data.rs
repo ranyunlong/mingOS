@@ -209,6 +209,47 @@ const POLICY_HEADER: &str = "ming-private-storage-policy-v1\n";
 const POLICY_HEADER_V2: &str = "ming-private-storage-policy-v2\n";
 const PUBLIC_POLICY_HEADER: &str = "ming-public-storage-policy-v1\n";
 const PUBLIC_POLICY_HEADER_V2: &str = "ming-public-storage-policy-v2\n";
+#[cfg(target_os = "linux")]
+fn load_persistent_policy(
+    store: &AppDataGrant,
+    legacy_header: &str,
+    bound_header: &str,
+) -> Result<BTreeMap<String, PackageAuthorization>> {
+    let bytes = match store.read(1, 0, MAX_SLOT_BYTES as i32) {
+        Ok(bytes) => bytes,
+        Err(AppDataError::NotFound) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    if bytes.is_empty() {
+        if store.size(1).is_ok() { return Err(AppDataError::Io); }
+        return Ok(BTreeMap::new());
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| AppDataError::Io)?;
+    let (lines, v2) = if let Some(lines) = text.strip_prefix(bound_header) {
+        (lines, true)
+    } else { (text.strip_prefix(legacy_header).ok_or(AppDataError::Io)?, false) };
+    if !lines.is_empty() && !lines.ends_with('\n') { return Err(AppDataError::Io); }
+    let mut authorized = BTreeMap::new();
+    let mut previous: Option<&str> = None;
+    for line in lines.lines() {
+        let (id, fingerprint) = if v2 {
+            let (id, value) = line.split_once('\t').ok_or(AppDataError::Io)?;
+            let fingerprint = if value == "-" { None } else {
+                if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err(AppDataError::Io); }
+                let mut result = [0u8; 32];
+                for (index, item) in result.iter_mut().enumerate() {
+                    *item = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| AppDataError::Io)?;
+                }
+                Some(result)
+            };
+            (id, fingerprint)
+        } else { (line, None) };
+        if !valid_package_id(id) || previous.is_some_and(|value| value >= id) { return Err(AppDataError::Io); }
+        authorized.insert(id.to_owned(), PackageAuthorization { fingerprint, ..Default::default() });
+        previous = Some(id);
+    }
+    Ok(authorized)
+}
 impl PackageStorageAuthority {
     pub fn new(root: AppDataRoot) -> Self {
         Self { root, authorized: Mutex::new(BTreeMap::new()), #[cfg(target_os = "linux")] private: Mutex::new(BTreeMap::new()), public_authorized: Mutex::new(BTreeMap::new()), policy: None, public_policy: None, #[cfg(target_os = "linux")] _private_only_lock: None }
@@ -217,7 +258,18 @@ impl PackageStorageAuthority {
     pub(crate) fn open_default_private(root: AppDataRoot) -> Result<Self> {
         let store = root.grant_directory("system-private-storage-policy-v1", 1)?;
         let lock = store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.lock_policy()?;
-        Ok(Self { root, authorized: Mutex::new(BTreeMap::new()), private: Mutex::new(BTreeMap::new()), public_authorized: Mutex::new(BTreeMap::new()), policy: None, public_policy: None, _private_only_lock: Some(PersistentPolicy { store, _lock: lock }) })
+        let public_store = root.grant_directory("system-public-storage-policy-v1", 1)?;
+        let public_lock = public_store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.lock_policy()?;
+        let public_authorized = load_persistent_policy(&public_store, PUBLIC_POLICY_HEADER, PUBLIC_POLICY_HEADER_V2)?;
+        Ok(Self {
+            root,
+            authorized: Mutex::new(BTreeMap::new()),
+            private: Mutex::new(BTreeMap::new()),
+            public_authorized: Mutex::new(public_authorized),
+            policy: None,
+            public_policy: Some(PersistentPolicy { store: public_store, _lock: public_lock }),
+            _private_only_lock: Some(PersistentPolicy { store, _lock: lock }),
+        })
     }
     /// The caller must ensure that only this trusted coordinator issues package grants.
     #[cfg(target_os = "linux")]
@@ -226,74 +278,8 @@ impl PackageStorageAuthority {
         let lock = store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.lock_policy()?;
         let public_store = root.grant_directory("system-public-storage-policy-v1", 1)?;
         let public_lock = public_store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.lock_policy()?;
-        let bytes = match store.read(1, 0, MAX_SLOT_BYTES as i32) {
-            Ok(bytes) => bytes,
-            Err(AppDataError::NotFound) => Vec::new(),
-            Err(error) => return Err(error),
-        };
-        let mut authorized = BTreeMap::new();
-        if !bytes.is_empty() {
-            let text = std::str::from_utf8(&bytes).map_err(|_| AppDataError::Io)?;
-            let (lines, v2) = if let Some(lines) = text.strip_prefix(POLICY_HEADER_V2) {
-                (lines, true)
-            } else { (text.strip_prefix(POLICY_HEADER).ok_or(AppDataError::Io)?, false) };
-            if !lines.is_empty() && !lines.ends_with('\n') { return Err(AppDataError::Io); }
-            let mut previous: Option<&str> = None;
-            for line in lines.lines() {
-                let (id, fingerprint) = if v2 {
-                    let (id, value) = line.split_once('\t').ok_or(AppDataError::Io)?;
-                    let fingerprint = if value == "-" { None } else {
-                        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err(AppDataError::Io); }
-                        let mut result = [0u8; 32];
-                        for (index, item) in result.iter_mut().enumerate() {
-                            *item = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| AppDataError::Io)?;
-                        }
-                        Some(result)
-                    };
-                    (id, fingerprint)
-                } else { (line, None) };
-                if !valid_package_id(id) || previous.is_some_and(|value| value >= id) {
-                    return Err(AppDataError::Io);
-                }
-                authorized.insert(id.to_owned(), PackageAuthorization { fingerprint, ..Default::default() });
-                previous = Some(id);
-            }
-        } else if store.size(1).is_ok() {
-            return Err(AppDataError::Io);
-        }
-        let public_bytes = match public_store.read(1, 0, MAX_SLOT_BYTES as i32) {
-            Ok(bytes) => bytes,
-            Err(AppDataError::NotFound) => Vec::new(),
-            Err(error) => return Err(error),
-        };
-        let mut public_authorized = BTreeMap::new();
-        if !public_bytes.is_empty() {
-            let text = std::str::from_utf8(&public_bytes).map_err(|_| AppDataError::Io)?;
-            let (lines, v2) = if let Some(lines) = text.strip_prefix(PUBLIC_POLICY_HEADER_V2) {
-                (lines, true)
-            } else { (text.strip_prefix(PUBLIC_POLICY_HEADER).ok_or(AppDataError::Io)?, false) };
-            if !lines.is_empty() && !lines.ends_with('\n') { return Err(AppDataError::Io); }
-            let mut previous: Option<&str> = None;
-            for line in lines.lines() {
-                let (id, fingerprint) = if v2 {
-                    let (id, value) = line.split_once('\t').ok_or(AppDataError::Io)?;
-                    let fingerprint = if value == "-" { None } else {
-                        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err(AppDataError::Io); }
-                        let mut result = [0u8; 32];
-                        for (index, item) in result.iter_mut().enumerate() {
-                            *item = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| AppDataError::Io)?;
-                        }
-                        Some(result)
-                    };
-                    (id, fingerprint)
-                } else { (line, None) };
-                if !valid_package_id(id) || previous.is_some_and(|value| value >= id) { return Err(AppDataError::Io); }
-                public_authorized.insert(id.to_owned(), PackageAuthorization { fingerprint, ..Default::default() });
-                previous = Some(id);
-            }
-        } else if public_store.size(1).is_ok() {
-            return Err(AppDataError::Io);
-        }
+        let authorized = load_persistent_policy(&store, POLICY_HEADER, POLICY_HEADER_V2)?;
+        let public_authorized = load_persistent_policy(&public_store, PUBLIC_POLICY_HEADER, PUBLIC_POLICY_HEADER_V2)?;
         Ok(Self { root, authorized: Mutex::new(authorized), private: Mutex::new(BTreeMap::new()), public_authorized: Mutex::new(public_authorized), policy: Some(PersistentPolicy { store, _lock: lock }), public_policy: Some(PersistentPolicy { store: public_store, _lock: public_lock }), _private_only_lock: None })
     }
     fn persist(&self, authorized: &BTreeMap<String, PackageAuthorization>) -> Result<AuthorizationReceipt> {

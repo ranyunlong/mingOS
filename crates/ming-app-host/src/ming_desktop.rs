@@ -590,7 +590,7 @@ impl Session {
                     let authority = if package.manifest.public_storage {
                         crate::app_data::PackageStorageAuthority::open_persistent(root).context("DESKTOP_STORAGE_AUTHORITY")?
                     } else {
-                        crate::app_data::PackageStorageAuthority::new(root)
+                        crate::app_data::PackageStorageAuthority::open_default_private(root).context("DESKTOP_STORAGE_AUTHORITY")?
                     };
                     self.storage_authority = Some(Arc::new(authority));
                 }
@@ -1499,6 +1499,45 @@ mod input_backpressure_tests {
         assert!(crate::app_data::PackageStorageAuthority::open_default_private(root.clone()).is_err());
         drop(legacy);
         assert!(crate::app_data::PackageStorageAuthority::open_default_private(root).is_ok());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_default_private_session_requires_exclusive_root_authority() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(
+            temp.path().join("app.json"),
+            r#"{"schemaVersion":1,"id":"dev.example.app","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#,
+        )
+        .unwrap();
+        let catalog_path = temp.path().join("catalog.json");
+        std::fs::write(
+            &catalog_path,
+            r#"{"schemaVersion":1,"apps":[{"id":1,"title":"Example","manifest":"app.json"}],"autostart":[1]}"#,
+        )
+        .unwrap();
+        let catalog = crate::desktop_catalog::load_catalog(&catalog_path).unwrap();
+        let held = crate::app_data::PackageStorageAuthority::open_default_private(
+            crate::app_data::AppDataRoot::open(&data).unwrap(),
+        )
+        .unwrap();
+        let options = DesktopOptions::parse([
+            catalog_path.into_os_string(),
+            "--renderer".into(),
+            "cpu".into(),
+            "--data-root".into(),
+            data.into_os_string(),
+        ])
+        .unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        let error = session.start().unwrap_err();
+        assert!(format!("{error:#}").contains("DESKTOP_STORAGE_AUTHORITY"), "{error:#}");
+        assert!(session.instances.is_empty());
+        drop(held);
     }
     #[cfg(target_os = "linux")]
     #[test]

@@ -118,6 +118,8 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 
 2026-10-30 公共目录 kernel 诊断：修正 bounded public probe 的严格 session 参数，使 guest 挂载新数据盘并使用 `/data/mingos`；移除无故障注入 bundle 对 `fault_injector` 的无条件导入；以当前 Host、source-v2 strict probe 和全新 UID65534 数据盘完成两轮 fresh QEMU。两轮均在桌面启动前记录 `public-storage-preauthorized`，真实 Kotlin 公共 probe 完成写入、读取、目录创建/列举、重命名、删除和目录删除，事件 `7201=1`，并完成 strict cgroup/resource 清理、marker `1 -> 2`、数据同步卸载和 kernel PowerDown。独立审计 21/21 通过，证据见 `artifacts/boot-delivery-20261027/system-image-public-kernel-v2/`；这只覆盖 guest 预授权公共目录路径，不等同于真实物理用户授权、可信安装身份、多用户或整体系统验收，`finalSystemAccepted=false`。
 
+2026-10-30 数据根单一 authority：桌面 SDK6 默认私有目录现在通过 `open_default_private` 持有数据根排他锁，同时恢复公共授权策略；同一数据根的第二个桌面/持久 authority 在 worker 启动前拒绝，私有默认访问仍不读取旧私有授权记录。`ming-app-host` lib 220/220、公共存储 4/4 通过；该阶段只解决同一数据根的可信父侧串行化，不等同可信安装身份、多用户隔离、真实物理输入/GPU 或最终 kernel 系统验收。
+
 ## 验证原则
 
 - 软件编译、软件渲染、GPU计算、GPU Surface、Wayland客户端、桌面合成器和系统启动分别记录。
