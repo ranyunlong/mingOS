@@ -126,6 +126,8 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 
 随后登记根增加按版本和指纹保存的父侧包内容。`install_from_manifest` 完整加载源包后原子写入私有内容目录；catalog schema v3 只按 `packageId` 从活动登记解析包，更新保留旧内容，卸载不删除历史内容。库 `223/223`、安装登记集成 `4/4`、catalog 集成 `4/4` 通过。发布者签名、多用户、更新迁移和真实安装 UI 仍未完成。
 
+2026-10-30 发布者签名强制接入：父侧新增 Ed25519 publisher trust root，支持 active/revoked key、轮换、原子 keyring 写入和固定 canonical signature envelope。`PackageInstallRegistry::open()` 保留开发兼容的无签名模式；`open_verified()` 在安装、活动 manifest 解析和包校验时强制验证发布者签名。Linux 桌面配置 `--install-root` 现在使用 verified registry，缺少 `trusted-publishers-v1` 时在启动前 fail-closed。固定 Rust 1.99.1 镜像、禁网、只读源码下，publisher `4/4`、package_install `6/6`、桌面回归 `1/1` 通过；`ming-app-host --all-targets -j1` 通过，库 `224 passed, 8 ignored`，其余集成目标均通过。固定镜像未安装 `rustfmt`，因此 `cargo fmt --check` 未执行成功；`git diff --check` 通过。当前签名覆盖仍是本地父侧信任根，不是证书链、远程密钥发布、多用户安装身份或完整安装 UI；更新迁移、卸载数据策略、多用户隔离和真实安装交互仍待完成，`finalSystemAccepted=false`。
+
 ## 验证原则
 
 - 软件编译、软件渲染、GPU计算、GPU Surface、Wayland客户端、桌面合成器和系统启动分别记录。

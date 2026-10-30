@@ -1475,7 +1475,7 @@ pub fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<De
     let mut options = DesktopOptions::parse(arguments)?;
     #[cfg(target_os = "linux")]
     if let Some(root) = options.install_root.as_ref() {
-        options.install_registry = Some(crate::package_install::PackageInstallRegistry::open(root)?);
+        options.install_registry = Some(crate::package_install::PackageInstallRegistry::open_verified(root)?);
     }
     #[cfg(not(target_os = "linux"))]
     if options.install_root.is_some() {
@@ -1500,6 +1500,34 @@ pub fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<De
 #[cfg(test)]
 mod input_backpressure_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_root_requires_the_publisher_trust_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let catalog = temp.path().join("catalog.json");
+        std::fs::write(
+            &catalog,
+            r#"{"schemaVersion":3,"apps":[{"id":1,"title":"Signed","packageId":"dev.example.signed"}],"autostart":[]}"#,
+        )
+        .unwrap();
+        let error = match run([
+            catalog.into_os_string(),
+            "--install-root".into(),
+            temp.path().as_os_str().to_owned(),
+            "--renderer".into(),
+            "cpu".into(),
+            "--backend".into(),
+            "offscreen".into(),
+        ])
+        {
+            Ok(_) => panic!("install root without publisher keyring must fail"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("PUBLISHER_KEYRING_FILE"), "{error:#}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn default_and_legacy_storage_authorities_share_the_root_lock() {
