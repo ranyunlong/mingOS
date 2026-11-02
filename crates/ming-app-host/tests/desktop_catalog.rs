@@ -61,6 +61,8 @@ fn trusted_install_source_is_absolute_and_singleton() {
         "--install-source",
         source.to_str().unwrap(),
     ])).is_err());
+    let overlong = format!("/{}", "a".repeat(4096));
+    assert!(DesktopOptions::parse(args(&["catalog.json", "--install-source", &overlong])).is_err());
 }
 
 #[test]

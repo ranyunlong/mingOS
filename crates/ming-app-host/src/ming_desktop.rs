@@ -2069,6 +2069,21 @@ mod input_backpressure_tests {
     use super::*;
     #[cfg(target_os = "linux")]
     #[test]
+    fn native_install_requires_a_trusted_source_option() {
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into()]).unwrap();
+        let mut session = Session::new(
+            options,
+            Catalog { apps: Vec::new(), autostart: Vec::new() },
+            #[cfg(feature = "gpu")]
+            None,
+        )
+        .unwrap();
+        let error = session.begin_install_from_dock().unwrap_err();
+        assert!(format!("{error:#}").contains("DESKTOP_INSTALL_SOURCE_REQUIRED"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn install_root_requires_the_publisher_trust_root() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
