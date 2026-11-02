@@ -1,6 +1,9 @@
 //! Also runnable as a tiny standalone Cargo test, with no engine dependency.
 #[path = "../src/app_data.rs"]
 mod app_data;
+#[cfg(target_os = "linux")]
+#[path = "../src/package.rs"]
+mod package;
 use app_data::*;
 use std::{
     fs,
@@ -8,6 +11,16 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn migration_backup_names_accept_generated_names_and_reject_path_escape() {
+    assert!(valid_migration_backup_name(".ming-update-backup-123-0"));
+    for name in ["", ".ming-update-backup-", "../.ming-update-backup-1", ".ming-update-backup-a/b",
+        ".ming-update-backup-..", ".ming-update-backup-a\\b"] {
+        assert!(!valid_migration_backup_name(name), "{name}");
+    }
+    assert!(!valid_migration_backup_name(&format!(".ming-update-backup-{}", "a".repeat(128))));
+}
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {

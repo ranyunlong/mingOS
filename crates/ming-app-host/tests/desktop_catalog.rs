@@ -1,5 +1,5 @@
 #![cfg(feature = "desktop")]
-use ming_app_host::desktop_catalog::{DesktopOptions, load_catalog};
+use ming_app_host::desktop_catalog::{DesktopAction, DesktopOptions, load_catalog};
 use std::{ffi::OsString, fs};
 fn args(v: &[&str]) -> Vec<OsString> {
     v.iter().map(OsString::from).collect()
@@ -41,6 +41,50 @@ fn desktop_flags_are_bounded_and_duplicate_unknown_arguments_rejected() {
     ] {
         assert!(DesktopOptions::parse(bad).is_err());
     }
+}
+
+#[test]
+fn trusted_install_source_is_absolute_and_singleton() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("app.json");
+    let options = DesktopOptions::parse(args(&[
+        "catalog.json",
+        "--install-source",
+        source.to_str().unwrap(),
+    ])).unwrap();
+    assert_eq!(options.install_source.as_deref(), Some(source.as_path()));
+    assert!(DesktopOptions::parse(args(&["catalog.json", "--install-source", "relative/app.json"])).is_err());
+    assert!(DesktopOptions::parse(args(&[
+        "catalog.json",
+        "--install-source",
+        source.to_str().unwrap(),
+        "--install-source",
+        source.to_str().unwrap(),
+    ])).is_err());
+}
+
+#[test]
+fn reviewed_event_script_extracts_timed_actions_from_wrapped_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("events.json");
+    fs::write(&events, r#"{
+        "schemaVersion": 1,
+        "requireApps": [1],
+        "steps": [
+            {"name":"install","afterMs":1000,"action":{"op":"install","source":"/tmp/app.json"},"events":[],"expect":{}},
+            {"name":"wait","events":[],"expect":{}}
+        ]
+    }"#).unwrap();
+    let options = DesktopOptions::parse(vec![
+        OsString::from("catalog.json"),
+        OsString::from("--duration-ms"),
+        OsString::from("0"),
+        OsString::from("--events"),
+        events.into_os_string(),
+    ]).unwrap();
+    assert_eq!(options.actions.len(), 1);
+    assert_eq!(options.actions[0].after_ms, 1000);
+    assert!(matches!(options.actions[0].action, DesktopAction::Install { .. }));
 }
 #[test]
 fn malformed_catalogs_fail_before_any_application_launch() {

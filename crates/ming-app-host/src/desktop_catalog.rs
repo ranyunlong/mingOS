@@ -10,8 +10,17 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
+    fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+#[cfg(target_os = "linux")]
+static CATALOG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug)]
 pub struct CatalogEntry {
     pub id: u16,
@@ -58,6 +67,102 @@ pub(crate) struct TrustedAppData { pub data_key: String, pub slots: Vec<u8> }
 pub(crate) struct DesktopDataConfig {
     pub root: Option<crate::app_data::AppDataRoot>,
     pub grants: BTreeMap<u16, TrustedAppData>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedCatalog {
+    schema_version: u32,
+    apps: Vec<PersistedCatalogEntry>,
+    autostart: Vec<u16>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedCatalogEntry {
+    id: u16,
+    title: String,
+    package_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slots: Option<Vec<u8>>,
+}
+
+/// Atomically persists the trusted schema-3 catalog after an installation.
+/// The registry remains the package identity authority; this file only records
+/// which installed package IDs the desktop should expose and their UI IDs.
+#[cfg(target_os = "linux")]
+pub(crate) fn persist_installed_catalog(
+    path: &Path,
+    catalog: &Catalog,
+    grants: &BTreeMap<u16, TrustedAppData>,
+) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("DESKTOP_CATALOG_PATH_ABSOLUTE");
+    }
+    if catalog.apps.is_empty() || catalog.apps.len() > 4 || catalog.autostart.len() > 4 {
+        bail!("DESKTOP_CATALOG_LIMIT");
+    }
+    let mut ids = BTreeSet::new();
+    let mut packages = BTreeSet::new();
+    let mut apps = Vec::with_capacity(catalog.apps.len());
+    for app in &catalog.apps {
+        if app.id == 0 || !ids.insert(app.id) || !packages.insert(app.package_id.clone())
+            || app.title.is_empty() || app.title.len() > 20
+            || !app.title.bytes().all(|c| c.is_ascii_graphic() || c == b' ')
+        {
+            bail!("DESKTOP_CATALOG_ENTRY");
+        }
+        let grant = grants.get(&app.id);
+        if grant.is_some_and(|grant| crate::app_data::validate_grant(&grant.data_key, &grant.slots).is_err()) {
+            bail!("DESKTOP_DATA_GRANT");
+        }
+        apps.push(PersistedCatalogEntry {
+            id: app.id,
+            title: app.title.clone(),
+            package_id: app.package_id.clone(),
+            data_key: grant.map(|grant| grant.data_key.clone()),
+            slots: grant.map(|grant| grant.slots.clone()),
+        });
+    }
+    if catalog.autostart.iter().any(|id| !ids.contains(id)) {
+        bail!("DESKTOP_CATALOG_AUTOSTART");
+    }
+    let mut bytes = serde_json::to_vec(&PersistedCatalog { schema_version: 3, apps, autostart: catalog.autostart.clone() })
+        .context("DESKTOP_CATALOG_SERIALIZE")?;
+    if bytes.len() > 16 * 1024 { bail!("DESKTOP_CATALOG_TOO_LARGE"); }
+    bytes.push(b'\n');
+    let parent = path.parent().context("DESKTOP_CATALOG_PARENT")?;
+    let parent_metadata = fs::symlink_metadata(parent).context("DESKTOP_CATALOG_PARENT")?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        bail!("DESKTOP_CATALOG_PARENT");
+    }
+    let target_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() { bail!("DESKTOP_CATALOG_FILE"); }
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("DESKTOP_CATALOG_FILE"),
+    };
+    let sequence = CATALOG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".ming-catalog.tmp-{}-{sequence}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    options.mode(target_metadata.as_ref().map_or(0o600, |metadata| metadata.permissions().mode() & 0o777));
+    let result = (|| -> Result<()> {
+        let mut file = options.open(&temporary).context("DESKTOP_CATALOG_TEMP")?;
+        file.write_all(&bytes).context("DESKTOP_CATALOG_WRITE")?;
+        file.sync_all().context("DESKTOP_CATALOG_SYNC")?;
+        fs::rename(&temporary, path).context("DESKTOP_CATALOG_RENAME")?;
+        File::open(parent).context("DESKTOP_CATALOG_PARENT_OPEN")?.sync_all().context("DESKTOP_CATALOG_PARENT_SYNC")?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result
 }
 pub fn load_catalog(path: &Path) -> Result<Catalog> {
     load_catalog_with_data(path).map(|(catalog, _)| catalog)
@@ -202,6 +307,9 @@ fn decode_fingerprint(value: &str) -> Result<[u8; 32]> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
 pub enum DesktopAction {
+    /// A trusted parent-side request. Guest applications cannot emit desktop
+    /// actions, and the source is reloaded and signature-checked before use.
+    Install { source: PathBuf },
     Launch {
         app: u16,
     },
@@ -258,6 +366,7 @@ impl DesktopAction {
     pub fn app(&self) -> u16 {
         match *self {
             Self::Shutdown => 0,
+            Self::Install { .. } => 0,
             Self::Launch { app }
             | Self::Close { app }
             | Self::Minimize { app }
@@ -279,12 +388,64 @@ pub struct TimedAction {
     pub after_ms: u64,
     pub action: DesktopAction,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReviewedDesktopEventScript {
+    schema_version: u32,
+    require_apps: Vec<u16>,
+    steps: Vec<ReviewedDesktopEventStep>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReviewedDesktopEventStep {
+    name: String,
+    #[serde(default)]
+    after_ms: Option<u64>,
+    #[serde(default)]
+    action: Option<DesktopAction>,
+    #[serde(default)]
+    events: Option<serde_json::Value>,
+    #[serde(default)]
+    expect: Option<serde_json::Value>,
+}
+
+fn parse_desktop_event_script(bytes: &[u8]) -> Result<Vec<TimedAction>> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).context("DESKTOP_EVENTS_INVALID")?;
+    if value.is_array() {
+        return serde_json::from_value(value).context("DESKTOP_EVENTS_INVALID");
+    }
+    let script: ReviewedDesktopEventScript =
+        serde_json::from_value(value).context("DESKTOP_EVENTS_INVALID")?;
+    if script.schema_version != 1
+        || script.require_apps.is_empty()
+        || script.require_apps.iter().any(|app| *app == 0)
+        || script.steps.is_empty()
+        || script.steps.len() > 128
+    {
+        bail!("DESKTOP_EVENTS_INVALID");
+    }
+    let mut actions = Vec::new();
+    for step in script.steps {
+        if step.name.is_empty() || step.name.len() > 64 {
+            bail!("DESKTOP_EVENTS_INVALID");
+        }
+        let _ = (&step.events, &step.expect);
+        if let Some(action) = step.action {
+            let after_ms = step.after_ms.context("DESKTOP_EVENTS_INVALID")?;
+            actions.push(TimedAction { after_ms, action });
+        }
+    }
+    Ok(actions)
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IsolationMode { Off, Strict }
 #[derive(Debug)]
 pub struct DesktopOptions {
     pub(crate) app_data: DesktopDataConfig,
     pub install_root: Option<PathBuf>,
+    /// A trusted parent-selected package source for the native install Dock
+    /// action. Guest applications cannot modify this value.
+    pub install_source: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     pub(crate) install_registry: Option<PackageInstallRegistry>,
     pub catalog_path: PathBuf,
@@ -308,6 +469,7 @@ impl DesktopOptions {
         let mut result = Self {
             app_data: DesktopDataConfig::default(),
             install_root: None,
+            install_source: None,
             #[cfg(target_os = "linux")]
             install_registry: None,
             catalog_path,
@@ -336,6 +498,13 @@ impl DesktopOptions {
                 "--install-root" => {
                     result.install_root = Some(PathBuf::from(value));
                 }
+                "--install-source" => {
+                    let source = PathBuf::from(value);
+                    if !source.is_absolute() || source.as_os_str().len() > 4096 {
+                        bail!("DESKTOP_INSTALL_SOURCE");
+                    }
+                    result.install_source = Some(source);
+                }
                 "--renderer" => {
                     result.renderer = match text {
                         "cpu" => RendererKind::Cpu,
@@ -361,12 +530,11 @@ impl DesktopOptions {
                     _ => bail!("DESKTOP_ISOLATION: expected off or strict"),
                 },
                 "--events" => {
-                    result.actions = serde_json::from_slice(&read_bounded(
+                    result.actions = parse_desktop_event_script(&read_bounded(
                         Path::new(&value),
                         16384,
                         "DESKTOP_EVENTS",
-                    )?)
-                    .context("DESKTOP_EVENTS_INVALID")?;
+                    )?)?;
                 }
                 _ => bail!("DESKTOP_UNKNOWN_OPTION: {flag}"),
             }
@@ -388,7 +556,7 @@ impl DesktopOptions {
                     } else {
                         result.duration_ms
                     }
-                || (step.action.app() == 0 && !matches!(step.action, DesktopAction::Shutdown))
+                || (step.action.app() == 0 && !matches!(step.action, DesktopAction::Shutdown | DesktopAction::Install { .. }))
             {
                 bail!("DESKTOP_EVENT_ORDER");
             }
@@ -418,6 +586,11 @@ impl DesktopOptions {
                     if !(1..=15).contains(key) || modifiers & !15 != 0 =>
                 {
                     bail!("DESKTOP_KEY_INVALID");
+                }
+                DesktopAction::Install { source } => {
+                    if !source.is_absolute() || source.as_os_str().len() > 4096 {
+                        bail!("DESKTOP_INSTALL_SOURCE");
+                    }
                 }
                 _ => {}
             }

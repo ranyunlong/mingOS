@@ -969,6 +969,11 @@ fn wait_service_budget(delay: Duration, live: Option<&ViewBridge>) -> Result<()>
         if live.is_some_and(|v| v.cancel.load(Ordering::SeqCst)) {
             bail!("APP_CANCELLED");
         }
+        // Once the terminal reply is written, only application cleanup remains.
+        // Do not add another service-budget sleep that can consume the close grace.
+        if live.is_some_and(|v| v.worker_lifecycle().terminal_reply_written.is_some()) {
+            return Ok(());
+        }
         thread::sleep(
             until
                 .saturating_duration_since(Instant::now())
@@ -1022,6 +1027,18 @@ mod service_delay_tests {
         bridge.cancel.store(true, Ordering::SeqCst);
         let error = wait_service_budget(Duration::from_millis(2), Some(&bridge)).unwrap_err();
         assert_eq!(error.to_string(), "APP_CANCELLED");
+    }
+
+    #[test]
+    fn terminal_close_reply_does_not_add_service_budget_wait() {
+        let (bridge, _sender) = ViewBridge::new();
+        bridge.terminal_reply_written(crate::ui::TerminalReplyKind::Close);
+        let started = Instant::now();
+        wait_service_budget(Duration::from_millis(40), Some(&bridge)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "terminal cleanup must not wait for a new service-budget delay"
+        );
     }
 }
 

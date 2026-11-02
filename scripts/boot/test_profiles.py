@@ -3,7 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from bootlib import sha256
+from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_UPDATE_INSTALL_ROOT, checked_session, sha256
 from bundle import verify_payload
 
 class ProfileTests(unittest.TestCase):
@@ -94,6 +94,101 @@ class ProfileTests(unittest.TestCase):
     def test_bounded_public_probe_does_not_require_input_script(self):
         from bootlib import validate_reviewed_input
         validate_reviewed_input({'profile':'public-probe'}, None)
+
+    def test_update_profile_requires_install_root_on_persistent_data_mount(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            (root / 'ming-app-host').write_bytes(b'host')
+            (root / 'catalog.json').write_text('{}')
+            review = {
+                'reviewed': True,
+                'reviewer': 'main test fixture',
+                'profile': 'data-text-update',
+                'sessionMode': 'long-lived',
+                'extraArgs': ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
+                              '--state-file', '/run/evidence/desktop-state.json'],
+                'budgetEvidence': 'synthetic unit test',
+                'installRoot': '/data/mingos-install-root',
+                'hostSha256': sha256(root / 'ming-app-host'),
+                'catalogSha256': sha256(root / 'catalog.json'),
+            }
+            with self.assertRaises(ValueError):
+                checked_session(review, root)
+            review['installRoot'] = PERSISTENT_UPDATE_INSTALL_ROOT
+            self.assertIs(checked_session(review, root), review)
+
+    def test_install_lifecycle_profile_requires_reviewed_signed_source_contract(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            (root / 'ming-app-host').write_bytes(b'\x7fELFsynthetic-test-only')
+            for name in ('initial', 'new'):
+                package = root / 'packages' / name
+                package.mkdir(parents=True)
+                (package / 'main.wasm').write_bytes(b'\0asm\x01\0\0\0fixture-' + name.encode())
+            self.put(root / 'catalog.json', {
+                'schemaVersion': 3,
+                'apps': [{'id': 1, 'title': 'Text Lab', 'packageId': 'dev.ming.text-entry-demo'}],
+                'autostart': [1],
+            })
+            events = {
+                'schemaVersion': 1,
+                'requireApps': [1],
+                'steps': [
+                    {'name': 'native-install', 'afterMs': 1000, 'events': [
+                        {'kind': 'pointer', 'x': 1140, 'y': 12},
+                        {'kind': 'button', 'button': 'left', 'down': True},
+                        {'kind': 'button', 'button': 'left', 'down': False},
+                    ], 'expect': {'storagePrompt': {
+                        'mode': 16, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'hasAllow': True,
+                    }}},
+                    {'name': 'script-launch', 'afterMs': 8000, 'action': {
+                        'op': 'launch', 'app': 2,
+                    }, 'events': [], 'expect': {}},
+                    {'name': 'wait-install', 'events': [], 'expect': {'storagePrompt': {
+                        'mode': 16, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'hasAllow': True,
+                    }}},
+                    {'name': 'allow-install', 'events': [
+                        {'kind': 'pointer', 'x': 880, 'y': 478},
+                        {'kind': 'button', 'button': 'left', 'down': True},
+                        {'kind': 'button', 'button': 'left', 'down': False},
+                    ], 'expect': {'storagePrompt': None}},
+                    {'name': 'wait-new-app', 'events': [], 'expect': {'apps': [
+                        {'app': 2, 'generation': 1, 'state': 'running'},
+                    ]}},
+                    {'name': 'power-off', 'events': [
+                        {'kind': 'pointer', 'x': 1250, 'y': 12},
+                        {'kind': 'button', 'button': 'left', 'down': True},
+                        {'kind': 'button', 'button': 'left', 'down': False},
+                    ], 'expect': {'phase': 'stopped'}},
+                ],
+            }
+            self.put(root / 'install-events.json', events)
+            review = {
+                'reviewed': True,
+                'reviewer': 'main test fixture',
+                'profile': 'install-lifecycle',
+                'sessionMode': 'long-lived',
+                'extraArgs': ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
+                              '--state-file', '/run/evidence/desktop-state.json'],
+                'budgetEvidence': 'synthetic unit test',
+                'installRoot': INSTALL_LIFECYCLE_INSTALL_ROOT,
+                'installEvents': INSTALL_LIFECYCLE_EVENTS,
+                'installEventsSha256': sha256(root / 'install-events.json'),
+                'installSource': INSTALL_LIFECYCLE_SOURCE,
+                'installFixture': {
+                    'helper': '/opt/mingos/prepare-install-fixture',
+                    'installRoot': INSTALL_LIFECYCLE_INSTALL_ROOT,
+                    'initialWasm': '/opt/mingos/packages/initial/main.wasm',
+                    'sourceWasm': '/opt/mingos/packages/new/main.wasm',
+                    'sourceManifest': '/opt/mingos/install-source/app.json',
+                    'receipt': '/run/evidence/install-fixture.json',
+                },
+                'installLifecycle': {'initialPackageId': 'dev.ming.text-entry-demo',
+                                     'newPackageId': 'dev.ming.install-demo', 'newVersion': '1.0.0'},
+            }
+            review.update(hostSha256=sha256(root / 'ming-app-host'), catalogSha256=sha256(root / 'catalog.json'))
+            self.assertEqual(verify_payload(root, review), json.loads((root / 'catalog.json').read_text()))
+            self.assertIs(checked_session(review, root), review)
 
     def test_data_grant_and_identity_are_exact(self):
         changes = [lambda c: c['apps'][0].update(dataKey='other'), lambda c: c['apps'][0].update(slots=[1,2]),

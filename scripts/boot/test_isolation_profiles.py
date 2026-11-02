@@ -8,6 +8,14 @@ import isolation_profiles
 
 
 class IsolationProfileTests(unittest.TestCase):
+    def test_isolation_probe_wrapper_is_linux_only(self):
+        wrapper = (
+            Path(__file__).resolve().parents[2]
+            / "crates/ming-app-host/examples/isolation_probe_v2.rs"
+        ).read_text()
+        self.assertIn('#[cfg(target_os = "linux")]', wrapper)
+        self.assertIn('#[cfg(not(target_os = "linux"))]', wrapper)
+
     def test_source_v2_prepare_checks_shell_parent_status(self):
         prepare = (
             Path(__file__).resolve().parents[2]
@@ -35,6 +43,16 @@ class IsolationProfileTests(unittest.TestCase):
                 "vm-prepare.sh": "511336a8661fc3eb991e6c8b168c5615c7420f22baf3134eba72f3a111e15ac4",
             },
         )
+
+    def test_legacy_frozen_artifacts_match_hash_gate(self):
+        frozen = (
+            Path(__file__).resolve().parents[2]
+            / "artifacts/linux-isolation/frozen"
+        )
+        for name, expected in isolation_profiles.LEGACY_PROBE_HASHES.items():
+            path = frozen / name
+            self.assertTrue(path.is_file(), path)
+            self.assertEqual(isolation_profiles.sha256(path), expected, path)
 
     def fixture(self, root):
         repo = root / "repo"

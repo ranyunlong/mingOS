@@ -1,0 +1,1 @@
+trojan://YOUR_TROJAN_PASSWORD@your.server.example:443?security=tls&sni=your.server.example&type=tcp#Trojan

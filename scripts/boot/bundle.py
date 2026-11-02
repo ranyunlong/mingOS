@@ -12,7 +12,7 @@ from pathlib import Path
 from bootlib import checked_path, checked_session, sha256, validate_kernel_config
 from infra import validate_fault_injection
 from isolation_profiles import verify_review_and_files
-from payload_profiles import verify_data_text, verify_data_text_private_probe, verify_data_text_public_probe, verify_public_probe
+from payload_profiles import verify_data_text, verify_data_text_update, verify_install_lifecycle, verify_data_text_private_probe, verify_data_text_public_probe, verify_public_probe
 from wayland_receipt import POINTER_SYNC_POLICY
 
 MODULES = ("virtio_pci", "virtio_gpu", "virtio_input", "virtio_console", "virtio_rng", "evdev", "virtio_blk", "ext4")
@@ -39,7 +39,7 @@ def install_fault_injection(root, scripts, fault_config):
 def verify_payload(payload, review):
     checked_session(review, payload)
     profile = review.get("profile", "desktop")
-    if profile not in ("desktop", "data-text", "data-text-private-probe", "data-text-public-probe", "public-probe"):
+    if profile not in ("desktop", "data-text", "data-text-update", "install-lifecycle", "data-text-private-probe", "data-text-public-probe", "public-probe"):
         raise ValueError("unknown reviewed payload profile")
     if any(item.is_symlink() for item in payload.rglob("*")):
         raise ValueError("frozen payload must contain no symlinks")
@@ -50,6 +50,10 @@ def verify_payload(payload, review):
     catalog = json.loads((payload / "catalog.json").read_text())
     if profile == "data-text":
         return verify_data_text(payload, review, catalog)
+    if profile == "data-text-update":
+        return verify_data_text_update(payload, review, catalog)
+    if profile == "install-lifecycle":
+        return verify_install_lifecycle(payload, review, catalog)
     if profile == "data-text-private-probe":
         return verify_data_text_private_probe(payload, review, catalog)
     if profile == "data-text-public-probe":
@@ -158,7 +162,7 @@ def main():
     review = json.loads(args.review.read_text())
     fault_config = fault_config_from_review(review)
     catalog = verify_payload(args.payload, review)  # before any large filesystem write
-    if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-private-probe", "data-text-public-probe", "public-probe") or not args.isolation_probes):
+    if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-update", "install-lifecycle", "data-text-private-probe", "data-text-public-probe", "public-probe") or not args.isolation_probes):
         raise ValueError("input diagnostics requires reviewed data-text with strict probes")
     if args.wayland_client_diagnostics and not args.input_diagnostics:
         raise ValueError("Wayland client logging requires diagnostic-only input bundle")
@@ -206,6 +210,13 @@ def main():
     (root / "etc/hostname").write_text("mingos-dev\n")
     shutil.copytree(args.payload, root / "opt/mingos", dirs_exist_ok=True)
     (root / "opt/mingos/ming-app-host").chmod(0o755)
+    install_root = root / "opt/mingos/install-root"
+    if install_root.exists():
+        # The host-side payload may be made readable for the unprivileged
+        # bundler, but the guest registry requires a root-only install root.
+        for item in sorted(install_root.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+            item.chmod(0o700 if item.is_dir() else 0o600)
+        install_root.chmod(0o700)
     for name in ("init", "guest.py", "guest_platform.py", "infra.py", "bounded_log.py", "wayland_receipt.py", "worker_resources.py", "weston.ini"):
         target = root / ("init" if name == "init" else "etc/mingos/" + name)
         shutil.copyfile(scripts / name, target)

@@ -1,7 +1,7 @@
 """Closed, main-reviewed payload profiles. No build or guest execution on import."""
 import json
 from pathlib import Path
-from bootlib import checked_path, sha256
+from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_UPDATE_INSTALL_ROOT, checked_path, sha256
 
 DATA_TEXT_ARGS = ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
                   '--state-file', '/run/evidence/desktop-state.json']
@@ -70,6 +70,100 @@ def verify_data_text(payload, review, catalog):
                     and all(receipt.get(k) == v for k, v in hashes.items()), 'flat desktop receipt mismatch')
             info = read_object(package/'build-info.json')
             require(all(info.get(k) == v for k, v in hashes.items()), 'text build-info mismatch')
+    return catalog
+
+def verify_data_text_update(payload, review, catalog):
+    """Validate the schema-3 catalog used by the persistent update fixture."""
+    require(review.get('sessionMode') == 'long-lived' and review.get('extraArgs') == DATA_TEXT_ARGS,
+            'exact reviewed strict/data/state session required')
+    require(isinstance(catalog, dict) and catalog.get('schemaVersion') == 3, 'catalog schema')
+    apps, start = catalog.get('apps'), catalog.get('autostart')
+    require(isinstance(apps, list) and len(apps) == 2, 'exactly two apps required')
+    require(isinstance(start, list) and len(start) == 2 and set(start) == {1, 2}, 'autostart must be exactly apps 1/2')
+    by_id = {app.get('id'): app for app in apps if isinstance(app, dict)}
+    require(set(by_id) == {1, 2}, 'app IDs must be 1/2')
+    require(by_id[1].get('packageId') == 'dev.ming.app-data-desktop'
+            and by_id[1].get('dataKey') == 'counter-main' and by_id[1].get('slots') == [1],
+            'app1 package/data binding')
+    require(by_id[2].get('packageId') == 'dev.ming.text-entry-demo'
+            and 'dataKey' not in by_id[2] and 'slots' not in by_id[2],
+            'app2 package/data binding')
+    fixture = review.get('updateFixture')
+    require(fixture == {
+        'helper': '/opt/mingos/prepare-update-fixture',
+        'installRoot': PERSISTENT_UPDATE_INSTALL_ROOT,
+        'updateManifest': '/tmp/mingos-update-fixture/1/app.json',
+        'receipt': '/run/evidence/update-fixture.json',
+    }, 'update fixture contract')
+    for number, package_id in ((1, 'dev.ming.app-data-desktop'), (2, 'dev.ming.text-entry-demo')):
+        package = payload / 'packages' / str(number)
+        manifest = package / 'app.json'
+        data = read_object(manifest)
+        require(data.get('schemaVersion') == 1 and data.get('id') == package_id
+                and data.get('version') == '0.1.0' and data.get('sdkVersion') == 6
+                and data.get('entry') == 'main.wasm',
+                'initial package identity/private storage')
+        for name in ('compiler.wasm', 'main.wasm'):
+            with (package / name).open('rb') as source:
+                require(source.read(8) == b'\0asm\x01\0\0\0', 'real Wasm header required: ' + name)
+        receipt = read_object(package / 'build-receipt.json')
+        require(receipt.get('status') == 'passed', 'initial package receipt')
+    helper = payload / 'prepare-update-fixture'
+    require(helper.is_file(), 'update fixture helper missing')
+    with helper.open('rb') as source:
+        require(source.read(4) == b'\x7fELF', 'update fixture helper must be Linux ELF')
+    require(isinstance(review.get('updateMigration'), dict)
+            and review['updateMigration'].get('fromVersion') == '0.1.0'
+            and review['updateMigration'].get('toVersion') == '0.2.0'
+            and review['updateMigration'].get('movedFile') == 'counter -> state/counter',
+            'update migration receipt contract')
+    return catalog
+
+def verify_install_lifecycle(payload, review, catalog):
+    """Validate a parent-triggered install flow with a signed source package."""
+    require(review.get('sessionMode') == 'long-lived' and review.get('extraArgs') == DATA_TEXT_ARGS,
+            'exact reviewed strict/data/state session required')
+    require(review.get('installRoot') == INSTALL_LIFECYCLE_INSTALL_ROOT
+            and review.get('installEvents') == INSTALL_LIFECYCLE_EVENTS
+            and review.get('installSource') == INSTALL_LIFECYCLE_SOURCE,
+            'install root/event path contract')
+    require(isinstance(catalog, dict) and catalog == {
+        'schemaVersion': 3,
+        'apps': [{'id': 1, 'title': 'Text Lab', 'packageId': 'dev.ming.text-entry-demo'}],
+        'autostart': [1],
+    }, 'single initial installed app catalog required')
+    events = payload / 'install-events.json'
+    require(events.is_file() and review.get('installEventsSha256') == sha256(events),
+            'reviewed install event file required')
+    actions = read_object(events)
+    require(actions.get('schemaVersion') == 1 and isinstance(actions.get('steps'), list),
+            'install event schema')
+    require(not any(step.get('action', {}).get('op') == 'install' for step in actions['steps'] if isinstance(step, dict)),
+            'install must be activated through the native header')
+    require(any(any(event.get('kind') == 'pointer' and event.get('x') == 1140 and event.get('y') == 12
+                       for event in step.get('events', []) if isinstance(event, dict))
+                for step in actions['steps'] if isinstance(step, dict)),
+            'native header INSTALL pointer event required')
+    require(any(step.get('action', {}).get('op') == 'launch' and step.get('action', {}).get('app') == 2
+                for step in actions['steps'] if isinstance(step, dict)),
+            'new app launch action required')
+    fixture = review.get('installFixture')
+    require(fixture == {
+        'helper': '/opt/mingos/prepare-install-fixture',
+        'installRoot': INSTALL_LIFECYCLE_INSTALL_ROOT,
+        'initialWasm': '/opt/mingos/packages/initial/main.wasm',
+        'sourceWasm': '/opt/mingos/packages/new/main.wasm',
+        'sourceManifest': '/opt/mingos/install-source/app.json',
+        'receipt': '/run/evidence/install-fixture.json',
+    }, 'install fixture contract')
+    for relative in ('packages/initial/main.wasm', 'packages/new/main.wasm'):
+        wasm = checked_path(payload, relative)
+        require(wasm.read_bytes()[:8] == b'\0asm\x01\0\0\0', 'real Wasm install fixture required')
+    require(isinstance(review.get('installLifecycle'), dict)
+            and review['installLifecycle'].get('initialPackageId') == 'dev.ming.text-entry-demo'
+            and review['installLifecycle'].get('newPackageId') == 'dev.ming.install-demo'
+            and review['installLifecycle'].get('newVersion') == '1.0.0',
+            'install lifecycle identity contract')
     return catalog
 
 def verify_data_text_private_probe(payload, review, catalog):

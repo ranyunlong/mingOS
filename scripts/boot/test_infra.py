@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from infra import contained, regular_file, validate_state, state_ready, input_events, classify_guest, validate_cold_pair, InputPlan
+from infra import contained, regular_file, validate_state, state_ready, state_input_ready, input_events, classify_guest, validate_cold_pair, InputPlan
 
 class InfraTests(unittest.TestCase):
     def test_paths_reject_escape_and_symlink(self):
@@ -38,6 +38,7 @@ class InfraTests(unittest.TestCase):
         try: validate_state(initial,'boot-1')
         except ValueError as error: self.fail('host initial null root must be accepted: '+str(error))
         self.assertFalse(state_ready(initial,[1]))
+        self.assertFalse(state_input_ready(initial,[1]))
         initial['phase']='ready'
         with self.assertRaises(ValueError): validate_state(initial,'boot-1')
 
@@ -65,6 +66,25 @@ class InfraTests(unittest.TestCase):
         self.assertFalse(state_ready(s, [1]))
         s = self.state(); s["root"]["presentedSequence"] = 0
         self.assertFalse(state_ready(s, [1]))
+
+    def test_state_input_ready_allows_prompt_phase_for_required_apps_only(self):
+        state = self.state()
+        state["phase"] = "starting"
+        state["apps"][0].update(state="closed", inputReady=False, presentedSourceSequence=5)
+        state["apps"].append({"app": 2, "generation": 1, "workerPid": 21, "state": "running",
+                               "sourceSequence": 5, "presentedSourceSequence": 5, "inputReady": True})
+        self.assertTrue(state_input_ready(state, [2]))
+        self.assertFalse(state_input_ready(state, [1]))
+        state["apps"][1]["inputReady"] = False
+        self.assertFalse(state_input_ready(state, [2]))
+
+    def test_state_input_ready_allows_active_prompt_without_closed_app(self):
+        state = self.state()
+        state["phase"] = "starting"
+        state["root"]["storagePrompt"] = {
+            "mode": 16, "packageId": "dev.ming.install-demo", "version": "1.0.0", "hasAllow": True,
+        }
+        self.assertTrue(state_input_ready(state, [1]))
 
     def test_input_is_vm_protocol_only_and_checks_geometry(self):
         s = self.state()
@@ -141,6 +161,33 @@ class InfraTests(unittest.TestCase):
             self.assertEqual([len(batch) for batch in batches],[2,1,1])
             self.assertEqual([event for batch in batches for event in batch],input_events(events,self.state()))
             self.assertFalse(plan.complete)
+
+    def test_pointer_steps_split_transactions_without_diagnostic_mode(self):
+        class Transport:
+            def __init__(self): self.calls = []
+            def execute(self, command, args=None): self.calls.append((command, args)); return {}
+        with tempfile.TemporaryDirectory() as work:
+            events = [{"kind": "pointer", "x": 120, "y": 200},
+                      {"kind": "button", "button": "left", "down": True},
+                      {"kind": "button", "button": "left", "down": False}]
+            spec = {"schemaVersion": 1, "requireApps": [1], "steps": [{"name": "same-click", "events": events}]}
+            plan = InputPlan(spec, Path(work) / "inputs.jsonl", 10)
+            qmp = Transport(); plan.advance(self.state(), qmp)
+            batches = [args["events"] for command, args in qmp.calls if command == "input-send-event"]
+            self.assertEqual([len(batch) for batch in batches], [2, 1, 1])
+
+    def test_button_steps_split_down_and_up_transactions(self):
+        class Transport:
+            def __init__(self): self.calls = []
+            def execute(self, command, args=None): self.calls.append((command, args)); return {}
+        with tempfile.TemporaryDirectory() as work:
+            events = [{"kind": "button", "button": "left", "down": True},
+                      {"kind": "button", "button": "left", "down": False}]
+            spec = {"schemaVersion": 1, "requireApps": [1], "steps": [{"name": "button-click", "events": events}]}
+            plan = InputPlan(spec, Path(work) / "inputs.jsonl", 10)
+            qmp = Transport(); plan.advance(self.state(), qmp)
+            batches = [args["events"] for command, args in qmp.calls if command == "input-send-event"]
+            self.assertEqual([len(batch) for batch in batches], [1, 1])
 
     def test_virtual_evdev_decoder_has_x86_64_record_boundary(self):
         import importlib.util,struct

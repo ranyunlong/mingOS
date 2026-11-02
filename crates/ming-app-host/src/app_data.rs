@@ -15,6 +15,8 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+#[cfg(target_os = "linux")]
+use crate::package::{DataMigration, MigrationStep};
 
 pub const MAX_SLOT_BYTES: usize = 65_536;
 pub const MAX_SLOTS: usize = 8;
@@ -83,6 +85,12 @@ pub(crate) fn validate_private_path(path: &str) -> Result<Vec<&str>> {
         return Err(AppDataError::InvalidArgument);
     }
     Ok(components)
+}
+
+pub(crate) fn valid_migration_backup_name(name: &str) -> bool {
+    name.len() <= 128 && name.strip_prefix(".ming-update-backup-").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    })
 }
 
 /// A committed write. False means directory durability was not confirmed; the value is committed.
@@ -171,6 +179,12 @@ struct PackageAuthorization {
 pub(crate) struct AuthorizationSnapshot {
     pub(crate) fingerprint: Option<[u8; 32]>,
     generation: Arc<AtomicBool>,
+}
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct PrivateMigrationTransaction {
+    pub(crate) package_id: String,
+    pub(crate) backup_name: String,
 }
 #[cfg(target_os = "linux")]
 impl AuthorizationSnapshot {
@@ -465,6 +479,113 @@ impl PackageStorageAuthority {
             entry.generation.store(false, Ordering::Release);
         }
         Ok(removed)
+    }
+    /// Applies a validated, declarative update plan to one package's private files.
+    /// The package must have no live private session. The old `files` directory remains
+    /// authoritative until the staged tree has been fully validated and atomically swapped.
+    #[cfg(target_os = "linux")]
+    pub fn begin_private_data_migration(&self, package_id: &str, migration: &DataMigration) -> Result<PrivateMigrationTransaction> {
+        let backup_name = format!(".ming-update-backup-{}-{}", std::process::id(), TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+        self.begin_private_data_migration_with_backup(package_id, migration, &backup_name)
+    }
+    #[cfg(target_os = "linux")]
+    pub fn begin_private_data_migration_with_backup(&self, package_id: &str, migration: &DataMigration, backup_name: &str) -> Result<PrivateMigrationTransaction> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        if !valid_migration_backup_name(backup_name) {
+            return Err(AppDataError::InvalidArgument);
+        }
+        let authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if authorized.contains_key(package_id) { return Err(AppDataError::Denied); }
+        let mut private = self.private.lock().map_err(|_| AppDataError::Denied)?;
+        if let Some(entry) = private.get_mut(package_id) {
+            entry.sessions.retain(|session| session.strong_count() != 0);
+            if entry.sessions.iter().any(|session| session.strong_count() != 0) {
+                return Err(AppDataError::Denied);
+            }
+        }
+        let package = platform::Directory::open(&self.root.root, &package_directory_name(package_id))?;
+        let files = package.child("files", true)?;
+        files.usage()?;
+        let staging_name = format!("{backup_name}.staging");
+        let staging = package.new_child(&staging_name)?;
+        let result = (|| {
+            platform::copy_private_tree(&files, &staging)?;
+            for step in &migration.steps {
+                platform::apply_migration_step(&staging, step)?;
+                staging.usage()?;
+            }
+            staging.usage()?;
+            if !staging.sync() { return Err(AppDataError::Io); }
+            package.rename_no_replace("files", &package, backup_name)?;
+            if let Err(error) = package.rename_no_replace(&staging_name, &package, "files") {
+                let _ = package.rename_no_replace(&backup_name, &package, "files");
+                return Err(error);
+            }
+            if !package.sync() { return Err(AppDataError::Io); }
+            Ok(PrivateMigrationTransaction { package_id: package_id.to_owned(), backup_name: backup_name.to_owned() })
+        })();
+        if result.is_err() { package.remove_tree(&staging_name).ok(); }
+        if result.is_ok() {
+            if let Some(entry) = private.remove(package_id) { entry.generation.store(false, Ordering::Release); }
+        }
+        result
+    }
+    #[cfg(target_os = "linux")]
+    pub fn commit_private_data_migration(&self, transaction: &PrivateMigrationTransaction) -> Result<bool> {
+        if !valid_package_id(&transaction.package_id) || !valid_migration_backup_name(&transaction.backup_name) {
+            return Err(AppDataError::InvalidArgument);
+        }
+        let package = platform::Directory::open(&self.root.root, &package_directory_name(&transaction.package_id))?;
+        let removed = package.remove_tree(&transaction.backup_name)?;
+        if !package.sync() { return Err(AppDataError::Io); }
+        Ok(removed)
+    }
+    #[cfg(target_os = "linux")]
+    pub fn rollback_private_data_migration(&self, transaction: &PrivateMigrationTransaction) -> Result<()> {
+        if !valid_package_id(&transaction.package_id) || !valid_migration_backup_name(&transaction.backup_name) {
+            return Err(AppDataError::InvalidArgument);
+        }
+        let authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if authorized.contains_key(&transaction.package_id) { return Err(AppDataError::Denied); }
+        let mut private = self.private.lock().map_err(|_| AppDataError::Denied)?;
+        if let Some(entry) = private.get_mut(&transaction.package_id) {
+            entry.sessions.retain(|session| session.strong_count() != 0);
+            if !entry.sessions.is_empty() { return Err(AppDataError::Denied); }
+        }
+        let package = platform::Directory::open(&self.root.root, &package_directory_name(&transaction.package_id))?;
+        let staging_name = format!("{}.staging", transaction.backup_name);
+        let current_name = format!("{}.discard", transaction.backup_name);
+        // A crash after the old tree was restored but before the journal was
+        // cleared must be harmless on the next open. In that state the backup
+        // is gone and the restored files directory is already authoritative.
+        match package.child(&transaction.backup_name, false) {
+            Ok(_) => {}
+            Err(AppDataError::NotFound) => {
+                package.child("files", true)?;
+                package.remove_tree(&staging_name)?;
+                package.remove_tree(&current_name)?;
+                if !package.sync() { return Err(AppDataError::Io); }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        match package.child("files", false) {
+            Ok(_) => package.rename_no_replace("files", &package, &current_name)?,
+            Err(AppDataError::NotFound) => {},
+            Err(error) => return Err(error),
+        }
+        package.rename_no_replace(&transaction.backup_name, &package, "files")?;
+        if !package.sync() { return Err(AppDataError::Io); }
+        package.remove_tree(&current_name)?;
+        package.remove_tree(&staging_name)?;
+        if !package.sync() { return Err(AppDataError::Io); }
+        if let Some(entry) = private.remove(&transaction.package_id) { entry.generation.store(false, Ordering::Release); }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub fn migrate_private_data(&self, package_id: &str, migration: &DataMigration) -> Result<bool> {
+        let transaction = self.begin_private_data_migration(package_id, migration)?;
+        self.commit_private_data_migration(&transaction)
     }
     /// Creates a parent-owned capability for the shared public directory.
     #[cfg(target_os = "linux")]
@@ -844,10 +965,13 @@ impl Drop for PackageStorageAuthority {
         for shared in authorized.values_mut().flat_map(|entry| entry.grants.drain(..)).filter_map(|grant| grant.upgrade()) {
             AppDataGrant { shared }.revoke();
         }
-        let public = self.public_authorized.get_mut().unwrap_or_else(|poison| poison.into_inner());
-        for entry in public.values_mut() {
-            for session in entry.sessions.drain(..).filter_map(|session| session.upgrade()) {
-                *session.lock().unwrap_or_else(|poison| poison.into_inner()) = false;
+        #[cfg(target_os = "linux")]
+        {
+            let public = self.public_authorized.get_mut().unwrap_or_else(|poison| poison.into_inner());
+            for entry in public.values_mut() {
+                for session in entry.sessions.drain(..).filter_map(|session| session.upgrade()) {
+                    *session.lock().unwrap_or_else(|poison| poison.into_inner()) = false;
+                }
             }
         }
     }
@@ -1361,6 +1485,15 @@ mod platform {
         }
     }
     impl Directory {
+        pub fn new_child(&self, name: &str) -> Result<Self> {
+            private_directory(&self.0)?;
+            let name_c = CString::new(name).map_err(|_| AppDataError::InvalidArgument)?;
+            if unsafe { libc::mkdirat(self.0.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+                return Err(io_error(std::io::Error::last_os_error()));
+            }
+            self.0.sync_all().map_err(io_error)?;
+            self.child(name, false)
+        }
         pub fn child(&self, name: &str, create: bool) -> Result<Self> {
             private_directory(&self.0)?;
             let name_c = CString::new(name).map_err(|_| AppDataError::InvalidArgument)?;
@@ -1424,6 +1557,16 @@ mod platform {
             } else {
                 Err(io_error(std::io::Error::last_os_error()))
             }
+        }
+        pub fn remove_tree(&self, name: &str) -> Result<bool> {
+            let child = match self.child(name, false) {
+                Ok(child) => child,
+                Err(AppDataError::NotFound) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            child.remove_contents()?;
+            self.remove_directory(name)?;
+            Ok(true)
         }
         fn remove_contents(&self) -> Result<()> {
             private_directory(&self.0)?;
@@ -1646,12 +1789,124 @@ mod platform {
             open_at(&self.0, name, libc::O_WRONLY, 0)
         }
     }
+
+    pub fn copy_private_tree(source: &Directory, destination: &Directory) -> Result<()> {
+        for entry in source.list()? {
+            if entry.is_directory {
+                let child = destination.child(&entry.name, true)?;
+                let source_child = source.child(&entry.name, false)?;
+                copy_private_tree(&source_child, &child)?;
+                if !child.sync() { return Err(AppDataError::Io); }
+            } else {
+                let mut input = source.read_private_file(&entry.name)?;
+                let before = stamp_private(&input)?;
+                let mut bytes = vec![0; before.length() as usize];
+                input.read_exact(&mut bytes).map_err(io_error)?;
+                source.unchanged_private(&entry.name, &input, &before)?;
+                let (temporary, mut output) = destination.new_temp()?;
+                let result = (|| {
+                    output.write_all(&bytes).map_err(io_error)?;
+                    output.sync_all().map_err(io_error)?;
+                    destination.rename_no_replace(&temporary, destination, &entry.name)
+                })();
+                drop(output);
+                if let Err(error) = result {
+                    destination.remove_temp(&temporary);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn directory_for_path(base: &Directory, components: &[&str], create: bool) -> Result<Directory> {
+        let mut current = Directory(open_at(&base.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?);
+        for component in components {
+            current = current.child(component, create)?;
+        }
+        Ok(current)
+    }
+
+    fn file_parent<'a>(base: &Directory, path: &'a str) -> Result<(Directory, &'a str)> {
+        let components = validate_private_path(path)?;
+        let (name, ancestors) = components.split_last().ok_or(AppDataError::InvalidArgument)?;
+        Ok((directory_for_path(base, ancestors, false)?, *name))
+    }
+
+    fn ensure_directory(base: &Directory, path: &str) -> Result<()> {
+        let components = validate_private_path(path)?;
+        directory_for_path(base, &components, true)?.sync().then_some(()).ok_or(AppDataError::Io)
+    }
+
+    pub fn apply_migration_step(base: &Directory, step: &MigrationStep) -> Result<()> {
+        match step {
+            MigrationStep::EnsureDir { path } => ensure_directory(base, path),
+            MigrationStep::DeleteFile { path } => {
+                let (parent, name) = file_parent(base, path)?;
+                match parent.read_private_file(name) {
+                    Ok(_) => {},
+                    Err(AppDataError::NotFound) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+                match parent.delete(name) {
+                    Ok(()) | Err(AppDataError::NotFound) => parent.sync().then_some(()).ok_or(AppDataError::Io),
+                    Err(error) => Err(error),
+                }
+            }
+            MigrationStep::RenameFile { from, to } => {
+                let (destination_parent, destination_name) = file_parent(base, to)?;
+                let (source_parent, source_name) = file_parent(base, from)?;
+                let source = match source_parent.read_private_file(source_name) {
+                    Ok(source) => source,
+                    Err(AppDataError::NotFound) => {
+                        return match destination_parent.read_private_file(destination_name) {
+                            Ok(_) => Ok(()),
+                            Err(error) => Err(error),
+                        };
+                    }
+                    Err(error) => return Err(error),
+                };
+                let stamp = stamp_private(&source)?;
+                source_parent.unchanged_private(source_name, &source, &stamp)?;
+                destination_parent.check_private_target(destination_name)?;
+                source_parent.rename_no_replace(source_name, &destination_parent, destination_name)?;
+                if !source_parent.sync() || !destination_parent.sync() { return Err(AppDataError::Io); }
+                Ok(())
+            }
+            MigrationStep::CopyFile { from, to } => {
+                let (source_parent, source_name) = file_parent(base, from)?;
+                let (destination_parent, destination_name) = file_parent(base, to)?;
+                let mut source = source_parent.read_private_file(source_name)?;
+                let stamp = stamp_private(&source)?;
+                let mut bytes = vec![0; stamp.length() as usize];
+                source.read_exact(&mut bytes).map_err(io_error)?;
+                source_parent.unchanged_private(source_name, &source, &stamp)?;
+                if let Ok(mut existing) = destination_parent.read_private_file(destination_name) {
+                    let mut existing_bytes = Vec::new();
+                    existing.read_to_end(&mut existing_bytes).map_err(io_error)?;
+                    if existing_bytes == bytes { return Ok(()); }
+                    return Err(AppDataError::Io);
+                }
+                let (temporary, mut output) = destination_parent.new_temp()?;
+                let result = (|| {
+                    output.write_all(&bytes).map_err(io_error)?;
+                    output.sync_all().map_err(io_error)?;
+                    destination_parent.rename_no_replace(&temporary, &destination_parent, destination_name)
+                })();
+                drop(output);
+                if let Err(error) = result { destination_parent.remove_temp(&temporary); return Err(error); }
+                if !destination_parent.sync() { return Err(AppDataError::Io); }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
 mod platform {
     use super::*;
     use std::{
+        ffi::OsString,
         fs::{self, OpenOptions},
         os::windows::{
             ffi::OsStrExt,
@@ -1685,11 +1940,12 @@ mod platform {
     pub struct Root { path: PathBuf, _handle: File }
     impl Root {
         pub fn open(path: &Path) -> Result<Self> {
-            check_chain(path)?;
-            let handle = OpenOptions::new().read(true).share_mode(7).custom_flags(0x02000000 | OPEN_REPARSE).open(path).map_err(io_error)?;
+            let path = verbatim_path(path);
+            check_chain(&path)?;
+            let handle = OpenOptions::new().read(true).share_mode(7).custom_flags(0x02000000 | OPEN_REPARSE).open(&path).map_err(io_error)?;
             let m = handle.metadata().map_err(io_error)?;
             if !m.is_dir() || m.file_attributes() & REPARSE != 0 { return Err(AppDataError::Io); }
-            Ok(Self { path: path.to_owned(), _handle: handle })
+            Ok(Self { path, _handle: handle })
         }
     }
     pub struct Directory(PathBuf);
@@ -1734,6 +1990,16 @@ mod platform {
             }
         }
         Ok(())
+    }
+    fn verbatim_path(path: &Path) -> PathBuf {
+        match path.components().next() {
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)) => {
+                let mut value = OsString::from(r"\\?\");
+                value.push(path.as_os_str());
+                PathBuf::from(value)
+            }
+            _ => path.to_owned(),
+        }
     }
     pub fn stamp(file: &File) -> Result<Stamp> {
         let m = file.metadata().map_err(io_error)?;

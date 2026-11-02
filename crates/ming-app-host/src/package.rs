@@ -9,6 +9,7 @@ use std::{
 };
 
 pub const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MIGRATION_STEPS: usize = 128;
 
 pub fn open_regular(path: &Path, label: &str) -> Result<File> {
     let info = fs::symlink_metadata(path).with_context(|| format!("{label}_OPEN"))?;
@@ -65,9 +66,27 @@ pub struct Manifest {
     #[serde(default)]
     pub public_storage: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_migration: Option<DataMigration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher_key_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DataMigration {
+    pub from_version: String,
+    pub steps: Vec<MigrationStep>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "camelCase", deny_unknown_fields)]
+pub enum MigrationStep {
+    EnsureDir { path: String },
+    CopyFile { from: String, to: String },
+    RenameFile { from: String, to: String },
+    DeleteFile { path: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -78,7 +97,7 @@ pub struct Package {
 
 #[cfg(target_os = "linux")]
 impl Package {
-    pub(crate) fn storage_fingerprint(&self) -> [u8; 32] {
+    pub fn storage_fingerprint(&self) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"ming-private-storage-package-v1\0");
         hash.update(self.manifest.schema_version.to_be_bytes());
@@ -91,6 +110,12 @@ impl Package {
         hash.update(&self.bytes);
         if self.manifest.private_storage { hash.update(b"\0private-storage-required-v1"); }
         if self.manifest.public_storage { hash.update(b"\0public-storage-requested-v1"); }
+        if let Some(migration) = &self.manifest.data_migration {
+            hash.update(b"\0data-migration-v1");
+            let bytes = serde_json::to_vec(migration).expect("validated migration serializes");
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
         if let Some(key_id) = &self.manifest.publisher_key_id {
             hash.update(b"\0publisher-key-id-v1");
             hash.update((key_id.len() as u64).to_be_bytes());
@@ -155,6 +180,7 @@ pub fn load_package(path: &Path) -> Result<Package> {
     if manifest.public_storage && manifest.sdk_version < 6 {
         bail!("MANIFEST_PUBLIC_STORAGE_SDK");
     }
+    validate_data_migration(&manifest)?;
     if !valid_id(&manifest.id) {
         bail!("MANIFEST_INVALID_ID");
     }
@@ -190,4 +216,52 @@ pub fn load_package(path: &Path) -> Result<Package> {
         bail!("MODULE_INVALID: expected binary Wasm");
     }
     Ok(Package { manifest, bytes })
+}
+
+fn validate_data_migration(manifest: &Manifest) -> Result<()> {
+    let Some(plan) = &manifest.data_migration else { return Ok(()); };
+    if manifest.sdk_version < 6 { bail!("MANIFEST_MIGRATION_SDK"); }
+    if !valid_version(&plan.from_version) || !version_is_newer(&manifest.version, &plan.from_version) {
+        bail!("MANIFEST_MIGRATION_VERSION");
+    }
+    if plan.steps.is_empty() || plan.steps.len() > MAX_MIGRATION_STEPS {
+        bail!("MANIFEST_MIGRATION_STEPS");
+    }
+    for step in &plan.steps {
+        match step {
+            MigrationStep::EnsureDir { path } | MigrationStep::DeleteFile { path } => validate_migration_path(path)?,
+            MigrationStep::CopyFile { from, to } | MigrationStep::RenameFile { from, to } => {
+                validate_migration_path(from)?;
+                validate_migration_path(to)?;
+                if from == to { bail!("MANIFEST_MIGRATION_SAME_PATH"); }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_migration_path(path: &str) -> Result<()> {
+    crate::app_data::validate_private_path(path).context("MANIFEST_MIGRATION_PATH")?;
+    Ok(())
+}
+
+/// Numeric comparison without integer overflow, including the existing support
+/// for leading zeroes in three-component manifest versions.
+pub(crate) fn version_is_newer(candidate: &str, previous: &str) -> bool {
+    if !valid_version(candidate) || !valid_version(previous) { return false; }
+    for (candidate, previous) in candidate.split('.').zip(previous.split('.')) {
+        let candidate = candidate.trim_start_matches('0');
+        let previous = previous.trim_start_matches('0');
+        match candidate.len().cmp(&previous.len()).then_with(|| candidate.cmp(previous)) {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    false
+}
+
+fn valid_version(version: &str) -> bool {
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }

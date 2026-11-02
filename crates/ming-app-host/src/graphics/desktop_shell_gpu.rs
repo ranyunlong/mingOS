@@ -43,6 +43,7 @@ impl GpuDesktopShell {
         windows: &[ShellWindow],
         apps: &[ShellApp],
         prompt: Option<&StoragePrompt>,
+        install_available: bool,
     ) -> Result<RenderedFrame> {
         // All shape/identity validation ran in DesktopShell::draw. Backend and
         // device checks must also precede with_gpu's terminal error boundary.
@@ -53,7 +54,7 @@ impl GpuDesktopShell {
             bail!("GPU_SESSION_MISMATCH");
         }
         let start = Instant::now();
-        let parameters = pack(root, windows, apps, prompt);
+        let parameters = pack(root, windows, apps, prompt, install_available);
         let pack_micros = start.elapsed().as_micros();
         let execute = Instant::now();
         let buffer = self.session.with_gpu(|gpu| {
@@ -139,13 +140,13 @@ impl GpuDesktopShell {
 // Base layout: header[4], windows[4][36], apps[4][16], ASCII[95][7].
 // An optional bounded prompt extends the metadata only while visible.
 // Contains only coordinates, flags, character codes and font::glyph rows.
-fn pack(root: &RenderedFrame, windows: &[ShellWindow], apps: &[ShellApp], prompt: Option<&StoragePrompt>) -> Vec<u32> {
+fn pack(root: &RenderedFrame, windows: &[ShellWindow], apps: &[ShellApp], prompt: Option<&StoragePrompt>, install_available: bool) -> Vec<u32> {
     let mut p = vec![0; if prompt.is_some() { 1656 } else { 877 }];
     p[..4].copy_from_slice(&[
         root.width as u32,
         root.height as u32,
         windows.len() as u32,
-        apps.len() as u32,
+        apps.len() as u32 | if install_available { 0x8000_0000 } else { 0 },
     ]);
     for (i, w) in windows.iter().enumerate() {
         let a = shell::app_for(w, apps);
@@ -226,6 +227,34 @@ mod tests {
         let module = naga::front::wgsl::parse_str(include_str!("desktop_shell.wgsl")).unwrap();
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module).unwrap();
+    }
+
+    #[test]
+    fn trusted_shell_shader_selects_destructive_labels_before_drawing() {
+        let shader = include_str!("desktop_shell.wgsl");
+        assert!(shader.contains("if(p[878u]==10u)"));
+        assert!(shader.contains("(p[878u]==10u || p[878u]==13u || p[878u]==16u || p[878u]==17u)"));
+        assert!(!shader.contains("if(p[878u]==10u && cx>=dw-100"));
+        assert!(!shader.contains("if(p[878u]==13u && cx>=dw-100"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_prompt_metadata_encodes_delete_and_retry_paths() {
+        let root = Compositor::cpu().compose(320, 240, 0xff123456, &[]).unwrap();
+        let apps = [ShellApp { id: 1, title: "Purge".into(), state: ShellAppState::Closed }];
+        let fingerprint = "f".repeat(64);
+        let delete = StoragePrompt::purge("dev.example.purge", "1.0.0", &fingerprint, false).unwrap();
+        let retry = StoragePrompt::purge("dev.example.purge", "1.0.0", &fingerprint, true).unwrap();
+        let delete_metadata = pack(&root, &[], &apps, Some(&delete), false);
+        let retry_metadata = pack(&root, &[], &apps, Some(&retry), false);
+        assert_eq!(delete_metadata[877], 1);
+        assert_eq!(delete_metadata[878], 13);
+        assert_eq!(retry_metadata[878], 14);
+        assert_eq!(delete_metadata[879], delete.lines(304).len() as u32);
+        assert_eq!(retry_metadata[879], retry.lines(304).len() as u32);
+        assert!(delete_metadata[880..].iter().any(|value| *value == u32::from(b'D')));
+        assert!(retry_metadata[880..].iter().any(|value| *value == u32::from(b'R')));
     }
 
     #[test]

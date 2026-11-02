@@ -9,7 +9,7 @@ use crate::{
     ming_desktop::{DesktopOutcome, Session},
 };
 #[cfg(target_os = "linux")]
-use crate::graphics::desktop_shell::dock_uninstall_cell;
+use crate::graphics::desktop_shell::{dock_purge_cell, dock_uninstall_cell, install_cell};
 use anyhow::{Context, Result, bail};
 use std::{
     num::NonZeroU32,
@@ -44,6 +44,8 @@ fn shell_for(
     }
 }
 fn render(session: &mut Session, shell: &mut DesktopShell) -> Result<RenderedFrame> {
+    #[cfg(target_os = "linux")]
+    shell.set_install_available(session.options.install_source.is_some());
     let root = session.compose()?;
     let windows: Vec<_> = session
         .views()
@@ -157,11 +159,15 @@ struct NativeDesktop {
     mouse: Option<(i32, i32)>,
     left: bool,
     #[cfg(target_os = "linux")]
-    storage_press: Option<bool>,
+    storage_press: Option<(bool, u64)>,
     #[cfg(target_os = "linux")]
     storage_dock_press: Option<(u16, u64)>,
     #[cfg(target_os = "linux")]
     uninstall_dock_press: Option<(u16, u64)>,
+    #[cfg(target_os = "linux")]
+    purge_dock_press: Option<(u16, u64)>,
+    #[cfg(target_os = "linux")]
+    install_press: Option<u64>,
     drag: Option<Drag>,
     active: bool,
     input: crate::desktop_input::NativeInput,
@@ -187,6 +193,10 @@ impl NativeDesktop {
             storage_dock_press: None,
             #[cfg(target_os = "linux")]
             uninstall_dock_press: None,
+            #[cfg(target_os = "linux")]
+            purge_dock_press: None,
+            #[cfg(target_os = "linux")]
+            install_press: None,
             drag: None,
             active: true,
             input: crate::desktop_input::NativeInput::default(),
@@ -337,11 +347,19 @@ impl NativeDesktop {
         let session = self.session.as_mut().context("DESKTOP_SESSION")?;
         #[cfg(target_os = "linux")]
         if session.storage_prompt().is_some() {
-            self.storage_press = session.storage_prompt_hit(x, y);
+            self.storage_press = session.storage_prompt_target(x, y);
             self.drag = None;
             return Ok(());
         }
         if !session.pointer_sink_ready() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if session.options.install_source.is_some()
+            && install_cell(session.options.width, session.options.height).contains(x, y)
+        {
+            self.install_press = Some(session.frames_presented);
+            self.drag = None;
             return Ok(());
         }
         if crate::graphics::desktop_shell::power_cell(session.options.width, session.options.height)
@@ -359,6 +377,11 @@ impl NativeDesktop {
             )
             .contains(x, y)
             {
+                #[cfg(target_os = "linux")]
+                if dock_purge_cell(session.options.width, session.options.height, index, apps.len()).contains(x, y) {
+                    self.purge_dock_press = Some((app.id, session.frames_presented));
+                    return Ok(());
+                }
                 #[cfg(target_os = "linux")]
                 if dock_uninstall_cell(session.options.width, session.options.height, index, apps.len()).contains(x, y) {
                     self.uninstall_dock_press = Some((app.id, session.frames_presented));
@@ -450,12 +473,39 @@ impl NativeDesktop {
         Ok(true)
     }
     #[cfg(target_os = "linux")]
+    fn purge_dock_release(&mut self) -> Result<bool> {
+        let Some((id, presented)) = self.purge_dock_press.take() else { return Ok(false); };
+        let session = self.session.as_mut().context("DESKTOP_SESSION")?;
+        if session.pointer_sink_ready() && session.frames_presented == presented && session.storage_prompt().is_none()
+            && let Some((x, y)) = self.mouse
+            && let Some(index) = session.catalog.apps.iter().position(|app| app.id == id)
+            && dock_purge_cell(session.options.width, session.options.height, index, session.catalog.apps.len()).contains(x, y) {
+            let _ = session.begin_uninstall_with_purge(id);
+        }
+        Ok(true)
+    }
+    #[cfg(target_os = "linux")]
+    fn install_release(&mut self) -> Result<bool> {
+        let Some(presented) = self.install_press.take() else { return Ok(false); };
+        let session = self.session.as_mut().context("DESKTOP_SESSION")?;
+        if session.pointer_sink_ready()
+            && session.frames_presented == presented
+            && session.storage_prompt().is_none()
+            && session.options.install_source.is_some()
+            && let Some((x, y)) = self.mouse
+            && install_cell(session.options.width, session.options.height).contains(x, y)
+        {
+            session.begin_install_from_dock()?;
+        }
+        Ok(true)
+    }
+    #[cfg(target_os = "linux")]
     fn storage_release(&mut self) -> Result<bool> {
         if !self.session.as_ref().is_some_and(|session| session.storage_prompt().is_some()) { return Ok(false); }
         let pressed = self.storage_press.take();
         let session = self.session.as_mut().context("DESKTOP_SESSION")?;
-        if let (Some(pressed), Some((x, y))) = (pressed, self.mouse)
-            && session.storage_prompt_hit(x, y) == Some(pressed) {
+        if let (Some((pressed, sequence)), Some((x, y))) = (pressed, self.mouse)
+            && session.storage_prompt_target(x, y) == Some((pressed, sequence)) {
             session.respond_storage_prompt(pressed)?;
         }
         Ok(true)
@@ -466,7 +516,7 @@ impl NativeDesktop {
         };
         let session = self.session.as_mut().context("DESKTOP_SESSION")?;
         #[cfg(target_os = "linux")]
-        if session.storage_prompt().is_some() || self.storage_dock_press.is_some() { return Ok(()); }
+        if session.storage_prompt().is_some() || self.storage_dock_press.is_some() || self.purge_dock_press.is_some() || self.uninstall_dock_press.is_some() || self.install_press.is_some() { return Ok(()); }
         if let Some(drag) = self.drag
             && self.left
         {
@@ -585,7 +635,7 @@ impl ApplicationHandler for NativeDesktop {
                         self.left = false;
                         self.drag = None;
                         #[cfg(target_os = "linux")]
-                        { self.storage_press = None; self.storage_dock_press = None; self.uninstall_dock_press = None; }
+                        { self.storage_press = None; self.storage_dock_press = None; self.uninstall_dock_press = None; self.purge_dock_press = None; self.install_press = None; }
                         self.session
                             .as_mut()
                             .context("DESKTOP_SESSION")?
@@ -612,9 +662,13 @@ impl ApplicationHandler for NativeDesktop {
                     } else {
                         self.drag = None;
                         #[cfg(target_os = "linux")]
+                        if self.purge_dock_release()? { return Ok(()); }
+                        #[cfg(target_os = "linux")]
                         if self.uninstall_dock_release()? { return Ok(()); }
                         #[cfg(target_os = "linux")]
                         if self.storage_dock_release()? { return Ok(()); }
+                        #[cfg(target_os = "linux")]
+                        if self.install_release()? { return Ok(()); }
                         #[cfg(target_os = "linux")]
                         if self.storage_release()? { return Ok(()); }
                         if let Some((x, y)) = self.mouse {
@@ -869,6 +923,148 @@ mod input_tests {
         assert!(app.uninstall_dock_release().unwrap());
         assert!(app.session.as_ref().unwrap().storage_prompt().is_some());
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_header_requires_same_presented_frame_and_opens_confirmation() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let install = temp.path().join("install");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&install).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&install, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("source.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.native-install","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+        let catalog = Catalog { apps: vec![], autostart: vec![] };
+        let mut options = DesktopOptions::parse([
+            "unused".into(), "--renderer".into(), "cpu".into(),
+            "--data-root".into(), data.into_os_string(),
+            "--install-source".into(), manifest.clone().into_os_string(),
+        ]).unwrap();
+        options.install_root = Some(install);
+        options.install_registry = Some(registry);
+        let mut app = NativeDesktop::new(options, catalog);
+        let (options, catalog) = app.pending.take().unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        session.start().unwrap();
+        app.session = Some(session);
+        let mut shell = DesktopShell::cpu();
+        let first = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+        app.session.as_mut().unwrap().accepted(first.sequence, false).unwrap();
+        let control = install_cell(1280, 800);
+        app.mouse = Some((control.x + 1, control.y + 1));
+        app.down().unwrap();
+        app.session.as_mut().unwrap().changed();
+        let second = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+        app.session.as_mut().unwrap().accepted(second.sequence, false).unwrap();
+        assert!(app.install_release().unwrap());
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+
+        let third = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+        app.session.as_mut().unwrap().accepted(third.sequence, false).unwrap();
+        app.mouse = Some((control.x + 1, control.y + 1));
+        app.down().unwrap();
+        assert!(app.install_release().unwrap());
+        assert_eq!(app.session.as_ref().unwrap().storage_prompt().unwrap().mode, 16);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_dock_requires_matching_presented_press_and_opens_confirmation() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let install = temp.path().join("install");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&install).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&install, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.purge.native","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+        registry.install_package(&package).unwrap();
+        let catalog = Catalog {
+            apps: vec![crate::desktop_catalog::CatalogEntry {
+                id: 1,
+                title: "Purge".into(),
+                package_fingerprint: package.storage_fingerprint(),
+                manifest_path: manifest,
+                package_id: package.manifest.id.clone(),
+            }],
+            autostart: vec![],
+        };
+        let mut options = DesktopOptions::parse([
+            "unused".into(),
+            "--renderer".into(),
+            "cpu".into(),
+            "--data-root".into(),
+            data.into_os_string(),
+        ])
+        .unwrap();
+        options.install_registry = Some(registry);
+        options.install_root = Some(install);
+        let mut app = NativeDesktop::new(options, catalog);
+        let (options, catalog) = app.pending.take().unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        let mut shell = DesktopShell::cpu();
+        let first = render(&mut session, &mut shell).unwrap();
+        session.accepted(first.sequence, false).unwrap();
+        app.session = Some(session);
+
+        let control = crate::graphics::desktop_shell::dock_purge_cell(1280, 800, 0, 1);
+        app.mouse = Some((control.x + 1, control.y + 1));
+        app.down().unwrap();
+        let second = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+        app.session.as_mut().unwrap().accepted(second.sequence, false).unwrap();
+        assert!(app.purge_dock_release().unwrap());
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+
+        let third = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+        app.session.as_mut().unwrap().accepted(third.sequence, false).unwrap();
+        app.mouse = Some((control.x + 1, control.y + 1));
+        app.down().unwrap();
+        assert!(app.purge_dock_release().unwrap());
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn storage_confirmation_press_cannot_authorize_after_prompt_redraw() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("app.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.prompt-redraw","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","publicStorage":true}"#).unwrap();
+        let mut app = storage_test_app(manifest, &root);
+        let mut shell = DesktopShell::cpu();
+        let first = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+        app.session.as_mut().unwrap().accepted(first.sequence, false).unwrap();
+        let geometry = crate::graphics::desktop_shell::storage_prompt_geometry(1280, 800, false).unwrap();
+        let allow = geometry.allow.unwrap();
+        app.mouse = Some((allow.x + 1, allow.y + 1));
+        app.down().unwrap();
+
+        app.session.as_mut().unwrap().changed();
+        let second = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+        app.session.as_mut().unwrap().accepted(second.sequence, false).unwrap();
+        app.storage_release().unwrap();
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_some());
+
+        app.mouse = Some((allow.x + 1, allow.y + 1));
+        app.down().unwrap();
+        app.storage_release().unwrap();
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+    }
+
     #[cfg(target_os = "linux")]
     fn storage_test_app(manifest: std::path::PathBuf, root: &std::path::Path) -> NativeDesktop {
         let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), root.as_os_str().to_owned()]).unwrap();

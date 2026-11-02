@@ -107,7 +107,7 @@ def sample_worker(proc, cgroup_root=Path("/sys/fs/cgroup/mingos"), *, clock_tick
     return receipt
 
 
-def process_table(proc_root=Path("/proc"), cgroup_root=Path("/sys/fs/cgroup/mingos"), *, resources=False):
+def process_table(proc_root=Path("/proc"), cgroup_root=Path("/sys/fs/cgroup/mingos"), *, resources=False, clock_ticks=None):
     """Keep every visible host process, including workers whose sample failed."""
     records = []
     for proc in proc_root.iterdir():
@@ -121,6 +121,6 @@ def process_table(proc_root=Path("/proc"), cgroup_root=Path("/sys/fs/cgroup/ming
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
         if resources and "__worker" in argv:
-            record["resources"] = sample_worker(proc, cgroup_root)
+            record["resources"] = sample_worker(proc, cgroup_root, clock_ticks=clock_ticks)
         records.append(record)
     return records

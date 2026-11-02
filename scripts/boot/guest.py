@@ -162,7 +162,69 @@ def main():
             if weston.poll() is not None or time.monotonic() >= deadline: raise RuntimeError("Weston DRM socket not ready")
             time.sleep(0.1)
         session = json.loads(Path("/etc/mingos/session.json").read_text())
+        fixture = session.get("updateFixture")
+        if fixture is not None:
+            expected = {
+                "helper": "/opt/mingos/prepare-update-fixture",
+                "installRoot": "/data/mingos/install-root",
+                "updateManifest": "/tmp/mingos-update-fixture/1/app.json",
+                "receipt": "/run/evidence/update-fixture.json",
+            }
+            if fixture != expected:
+                raise RuntimeError("unexpected update fixture contract")
+            result = subprocess.run([
+                fixture["helper"], "/data/mingos", fixture["installRoot"],
+                fixture["updateManifest"], fixture["receipt"],
+            ], capture_output=True, text=True, timeout=60)
+            receipt = None
+            receipt_path = Path(fixture["receipt"])
+            if receipt_path.exists():
+                receipt = json.loads(receipt_path.read_text())
+            emit("update-fixture", code=result.returncode, stdout=result.stdout,
+                 stderr=result.stderr, receipt=receipt)
+            if result.returncode:
+                raise RuntimeError("update fixture failed: " + result.stderr.strip())
+        install_fixture = session.get("installFixture")
+        if install_fixture is not None:
+            expected = {
+                "helper": "/opt/mingos/prepare-install-fixture",
+                "installRoot": "/opt/mingos/install-root",
+                "initialWasm": "/opt/mingos/packages/initial/main.wasm",
+                "sourceWasm": "/opt/mingos/packages/new/main.wasm",
+                "sourceManifest": "/opt/mingos/install-source/app.json",
+                "receipt": "/run/evidence/install-fixture.json",
+            }
+            if install_fixture != expected:
+                raise RuntimeError("unexpected install fixture contract")
+            result = subprocess.run([
+                install_fixture["helper"], install_fixture["installRoot"],
+                install_fixture["initialWasm"], install_fixture["sourceWasm"],
+                install_fixture["sourceManifest"], install_fixture["receipt"],
+            ], capture_output=True, text=True, timeout=60)
+            receipt = None
+            receipt_path = Path(install_fixture["receipt"])
+            if receipt_path.exists():
+                receipt = json.loads(receipt_path.read_text())
+            emit("install-fixture", code=result.returncode, stdout=result.stdout,
+                 stderr=result.stderr, receipt=receipt)
+            if result.returncode:
+                raise RuntimeError("install fixture failed: " + result.stderr.strip())
         argv = ["/opt/mingos/ming-app-host", "desktop", "/opt/mingos/catalog.json", "--renderer", "cpu"] + session["extraArgs"]
+        if session.get("installRoot") is not None:
+            argv += ["--install-root", session["installRoot"]]
+        if session.get("profile") == "install-lifecycle":
+            source = session.get("installSource")
+            if source != "/opt/mingos/install-source/app.json" or not Path(source).is_file():
+                raise RuntimeError("reviewed install source missing")
+            argv += ["--install-source", source]
+            events = Path(session.get("installEvents", ""))
+            if str(events) != "/opt/mingos/install-events.json" or not events.is_file():
+                raise RuntimeError("reviewed install event file missing")
+            expected_hash = session.get("installEventsSha256")
+            actual_hash = hashlib.sha256(events.read_bytes()).hexdigest()
+            if not isinstance(expected_hash, str) or actual_hash != expected_hash:
+                raise RuntimeError("reviewed install event hash mismatch")
+            argv += ["--events", str(events)]
         desktop = launch(argv, "desktop", desktop_debug=True)
         if fault_config:
             fault_injector = launch(["python3", "-B", "/etc/mingos/fault_injector.py", "--config",

@@ -1,0 +1,2 @@
+trojan://demo-password@192.0.2.1:443?sni=example.com&type=tcp#Demo-Trojan
+ss://YWVzLTI1Ni1nY206ZGVtby1wYXNzd29yZA==@192.0.2.2:8388#Demo-SS

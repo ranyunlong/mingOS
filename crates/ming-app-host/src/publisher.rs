@@ -130,6 +130,10 @@ impl Package {
         put_text(&mut message, &self.manifest.entry);
         message.push(u8::from(self.manifest.private_storage));
         message.push(u8::from(self.manifest.public_storage));
+        let migration = serde_json::to_vec(&self.manifest.data_migration)
+            .context("PACKAGE_MIGRATION_SERIALIZE")?;
+        message.extend_from_slice(&(migration.len() as u64).to_be_bytes());
+        message.extend_from_slice(&migration);
         message.extend_from_slice(&(self.bytes.len() as u64).to_be_bytes());
         message.extend_from_slice(&self.bytes);
         Ok(message)

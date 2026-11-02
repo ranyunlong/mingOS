@@ -71,3 +71,91 @@ fn public_storage_request_is_explicit_and_requires_sdk_six() {
     fs::write(&file, manifest.to_string()).unwrap();
     assert!(load_package(&file).is_err());
 }
+
+#[test]
+fn data_migration_plan_is_loaded_and_is_part_of_package_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    let file = dir.path().join("app.json");
+    let base = json!({
+        "schemaVersion":1,
+        "id":"dev.ming.app",
+        "version":"1.1.0",
+        "sdkVersion":6,
+        "entry":"main.wasm"
+    });
+    fs::write(&file, base.to_string()).unwrap();
+    let without = load_package(&file).unwrap();
+    let without_identity = serde_json::to_vec(&without.manifest.data_migration).unwrap();
+
+    let mut migrated = base;
+    migrated["dataMigration"] = json!({
+        "fromVersion":"1.0.0",
+        "steps":[
+            {"op":"ensureDir","path":"state"},
+            {"op":"renameFile","from":"counter","to":"state/counter"}
+        ]
+    });
+    fs::write(&file, migrated.to_string()).unwrap();
+    let with = load_package(&file).unwrap();
+    assert!(with.manifest.data_migration.is_some());
+    let with_identity = serde_json::to_vec(&with.manifest.data_migration).unwrap();
+    assert_ne!(without_identity, with_identity);
+}
+
+#[test]
+fn data_migration_plan_rejects_unknown_operations_and_unsafe_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    let file = dir.path().join("app.json");
+    for plan in [
+        json!({"fromVersion":"1.0.0","steps":[{"op":"runCode","path":"x"}]}),
+        json!({"fromVersion":"1.0.0","steps":[{"op":"deleteFile","path":"../escape"}]}),
+    ] {
+        let manifest = json!({
+            "schemaVersion":1,
+            "id":"dev.ming.app",
+            "version":"1.1.0",
+            "sdkVersion":6,
+            "entry":"main.wasm",
+            "dataMigration":plan
+        });
+        fs::write(&file, manifest.to_string()).unwrap();
+        assert!(load_package(&file).is_err());
+    }
+}
+
+#[test]
+fn migration_versions_use_numeric_components() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    let file = dir.path().join("app.json");
+    for (from, to, accepted) in [
+        ("1.9.0", "1.10.0", true),
+        ("1.10.0", "1.9.0", false),
+        ("1.0.9", "1.0.10", true),
+        ("01.00.0", "1.0.0", false),
+        ("1.0.0", "2.0.0", true),
+    ] {
+        let manifest = json!({"schemaVersion":1,"id":"dev.ming.app","version":to,
+            "sdkVersion":6,"entry":"main.wasm","dataMigration":{"fromVersion":from,
+            "steps":[{"op":"ensureDir","path":"state"}]}});
+        fs::write(&file, manifest.to_string()).unwrap();
+        assert_eq!(load_package(&file).is_ok(), accepted, "{from} -> {to}");
+    }
+}
+
+#[test]
+fn migration_paths_follow_private_file_component_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    let file = dir.path().join("app.json");
+    for (path, accepted) in [("x".repeat(256), false), ("x".repeat(255), true),
+        ("状态/计数".to_owned(), true), ("/escape".to_owned(), false)] {
+        let manifest = json!({"schemaVersion":1,"id":"dev.ming.app","version":"1.1.0",
+            "sdkVersion":6,"entry":"main.wasm","dataMigration":{"fromVersion":"1.0.0",
+            "steps":[{"op":"ensureDir","path":path}]}});
+        fs::write(&file, manifest.to_string()).unwrap();
+        assert_eq!(load_package(&file).is_ok(), accepted, "{path}");
+    }
+}

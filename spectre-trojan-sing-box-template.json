@@ -1,0 +1,3421 @@
+{
+  "$schema": "https://sing-box.sagernet.org/schema.json",
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "trojan",
+      "tag": "proxy",
+      "server": "your.server.example",
+      "server_port": 443,
+      "password": "YOUR_TROJAN_PASSWORD",
+      "network": "tcp",
+      "tls": {
+        "enabled": true,
+        "server_name": "your.server.example",
+        "insecure": false
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "domain_suffix": [
+          "ghcr.io"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "googleapis.cn"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "googleapis.cn"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain": [
+          "safebrowsing.urlsec.qq.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain": [
+          "safebrowsing.googleapis.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain": [
+          "ocsp.apple.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "digicert.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "entrust.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain": [
+          "ocsp.verisign.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "apps.apple.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain": [
+          "itunes.apple.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "blobstore.apple.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "music.apple.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "mzstatic.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "itunes.apple.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "icloud.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "icloud-content.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "me.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "mzstatic.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "akadns.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "aaplimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "cdn-apple.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "apple.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "apple-cloudkit.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain": [
+          "e.crashlytics.com"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_suffix": [
+          "cn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "-cn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "126.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "126.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "127.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "163.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "360buyimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "36kr.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "acfun.tv"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "air-matters.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "aixifan.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "akamaized.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "alicdn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "alipay"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "taobao"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "amap.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "autonavi.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "baidu"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "bdimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "bdstatic.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "bilibili.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "bilivideo.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "caiyunapp.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "clouddn.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "cnbeta.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "cnbetacdn.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "cootekservice.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "csdn.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "ctrip.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "dgtle.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "dianping.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "douban.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "doubanio.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "duokan.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "easou.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "ele.me"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "feng.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "fir.im"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "frdic.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "g-cores.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "godic.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "gtimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain": [
+          "cdn.hockeyapp.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "hongxiu.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "hxcdn.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "iciba.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "ifeng.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "ifengimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "ipip.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "iqiyi.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "jd.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "jianshu.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "knewone.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "le.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "lecloud.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "lemicp.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "licdn.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "linkedin.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "luoo.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "meituan.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "meituan.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "mi.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "miaopai.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "microsoft.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "microsoftonline.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "miui.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "miwifi.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "mob.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "netease.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "office.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "office365.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "officecdn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "oschina.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "ppsimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "pstatp.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qcloud.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qdaily.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qdmm.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qhimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qhres.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qidian.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qihucdn.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qiniu.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qiniucdn.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qiyipic.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qq.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "qqurl.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "rarbg.to"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "ruguoapp.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "segmentfault.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "sinaapp.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "smzdm.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "snapdrop.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "sogou.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "sogoucdn.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "sohu.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "soku.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "speedtest.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "sspai.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "suning.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "taobao.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "tencent.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "tenpay.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "tianyancha.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "tmall.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "tudou.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "umetrip.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "upaiyun.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "upyun.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "veryzhun.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "weather.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "weibo.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "xiami.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "xiami.net"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "xiaomicp.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "ximalaya.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "xmcdn.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "xunlei.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "yhd.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "yihaodianimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "yinxiang.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "ykimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "youdao.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "youku.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "zealer.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "zhihu.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "zhimg.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "zimuzu.tv"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "zoho.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "amazon"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "google"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "gmail"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "youtube"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "facebook"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "fb.me"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "fbcdn.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "twitter"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "instagram"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "dropbox"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "twimg.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "blogspot"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "youtu.be"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "whatsapp"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "admarvel"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "admaster"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "adsage"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "adsmogo"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "adsrvmedia"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "adwords"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "adservice"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "domob"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "duomeng"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "dwtrack"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "guanggao"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "lianmeng"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_suffix": [
+          "mmstat.com"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "omgmta"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "openx"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "partnerad"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "pingfore"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "supersonicads"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "uedas"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "umeng"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "usage"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "wlmonitor"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": [
+          "zjtoolbar"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_suffix": [
+          "9to5mac.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "abpchina.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "adblockplus.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "adobe.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "alfredapp.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "amplitude.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ampproject.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "android.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "angularjs.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "aolcdn.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "apkpure.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "appledaily.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "appshopper.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "appspot.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "arcgis.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "archive.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "armorgames.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "aspnetcdn.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "att.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "awsstatic.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "azureedge.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "azurewebsites.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "bing.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "bintray.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "bit.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "bit.ly"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "bitbucket.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "bjango.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "bkrtx.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "blog.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "blogcdn.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "blogger.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "blogsmithmedia.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "blogspot.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "blogspot.hk"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "bloomberg.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "box.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "box.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "cachefly.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "chromium.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "cl.ly"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "cloudflare.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "cloudfront.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "cloudmagic.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "cmail19.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "cnet.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "cocoapods.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "comodoca.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "crashlytics.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "culturedcode.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "d.pr"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "danilo.to"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "dayone.me"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "db.tt"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "deskconnect.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "disq.us"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "disqus.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "disquscdn.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "dnsimple.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "docker.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "dribbble.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "droplr.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "duckduckgo.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "dueapp.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "dytt8.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "edgecastcdn.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "edgekey.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "edgesuite.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "engadget.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "entrust.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "eurekavpt.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "evernote.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "fabric.io"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "fast.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "fastly.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "fc2.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "feedburner.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "feedly.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "feedsportal.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "fiftythree.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "firebaseio.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "flexibits.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "flickr.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "flipboard.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "g.co"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "gabia.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "geni.us"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "gfx.ms"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ggpht.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ghostnoteapp.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "git.io"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_keyword": [
+          "github"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "globalsign.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "gmodules.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "godaddy.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "golang.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "gongm.in"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "goo.gl"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "goodreaders.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "goodreads.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "gravatar.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "gstatic.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "gvt0.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "hockeyapp.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "hotmail.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "icons8.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ifixit.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ift.tt"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ifttt.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "iherb.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "imageshack.us"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "img.ly"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "imgur.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "imore.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "instapaper.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ipn.li"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "is.gd"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "issuu.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "itgonglun.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "itun.es"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ixquick.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "j.mp"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "js.revsci.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "jshint.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "jtvnw.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "justgetflux.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "kat.cr"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "klip.me"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "libsyn.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "linode.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "lithium.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "littlehj.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "live.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "live.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "livefilestore.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "llnwd.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "macid.co"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "macromedia.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "macrumors.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "mashable.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "mathjax.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "medium.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "mega.co.nz"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "mega.nz"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "megaupload.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "microsofttranslator.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "mindnode.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "mobile01.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "modmyi.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "msedge.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "myfontastic.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "name.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "nextmedia.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "nsstatic.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "nssurge.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "nyt.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "nytimes.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "omnigroup.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "onedrive.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "onenote.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ooyala.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "openvpn.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "openwrt.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "orkut.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "osxdaily.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "outlook.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ow.ly"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "paddleapi.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "parallels.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "parse.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "pdfexpert.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "periscope.tv"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "pinboard.in"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "pinterest.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "pixelmator.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "pixiv.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "playpcesor.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "playstation.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "playstation.com.hk"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "playstation.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "playstationnetwork.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "pushwoosh.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "rime.im"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "servebom.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "sfx.ms"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "shadowsocks.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "sharethis.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "shazam.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "skype.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "smartdnsProxy.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "smartmailcloud.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "sndcdn.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "sony.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "soundcloud.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "sourceforge.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "spotify.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "squarespace.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "sstatic.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "st.luluku.pw"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "stackoverflow.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "startpage.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "staticflickr.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "steamcommunity.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "symauth.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "symcb.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "symcd.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tapbots.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tapbots.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tdesktop.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "techcrunch.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "techsmith.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "thepiratebay.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "theverge.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "time.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "timeinc.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tiny.cc"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tinypic.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tmblr.co"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "todoist.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "trello.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "trustasiassl.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tumblr.co"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tumblr.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tweetdeck.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "tweetmarker.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "twitch.tv"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "txmblr.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "typekit.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ubertags.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ublock.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ubnt.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ulyssesapp.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "urchin.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "usertrust.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "v.gd"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "v2ex.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "vimeo.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "vimeocdn.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "vine.co"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "vivaldi.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "vox-cdn.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "vsco.co"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "vultr.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "w.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "w3schools.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "webtype.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wikiwand.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wikileaks.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wikimedia.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wikipedia.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wikipedia.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "windows.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "windows.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wire.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wordpress.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "workflowy.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wp.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wsj.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "wsj.net"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "xda-developers.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "xeeno.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "xiti.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "yahoo.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "yimg.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ying.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "yoyo.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "ytimg.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "telegra.ph"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "telegram.org"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "raksmart.com"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "ip_cidr": [
+          "91.108.4.0/22"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "ip_cidr": [
+          "91.108.8.0/22"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "ip_cidr": [
+          "91.108.12.0/22"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "ip_cidr": [
+          "91.108.16.0/22"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "ip_cidr": [
+          "91.108.56.0/22"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "ip_cidr": [
+          "149.154.160.0/22"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "ip_cidr": [
+          "149.154.164.0/22"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "ip_cidr": [
+          "149.154.168.0/22"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "ip_cidr": [
+          "149.154.172.0/22"
+        ],
+        "action": "route",
+        "outbound": "proxy"
+      },
+      {
+        "domain_suffix": [
+          "local"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "127.0.0.0/8"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "172.16.0.0/12"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "192.168.0.0/16"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "10.0.0.0/8"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "17.0.0.0/8"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "100.64.0.0/10"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": [
+          "geoip-cn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      }
+    ],
+    "auto_detect_interface": true,
+    "final": "proxy",
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        "download_detour": "proxy"
+      }
+    ]
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "cn-dns",
+        "server": "223.5.5.5"
+      },
+      {
+        "type": "https",
+        "tag": "remote-dns",
+        "server": "8.8.8.8",
+        "path": "/dns-query",
+        "tls": {
+          "enabled": true,
+          "server_name": "dns.google"
+        },
+        "detour": "proxy"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": [
+          "geosite-cn"
+        ],
+        "server": "cn-dns"
+      },
+      {
+        "domain_suffix": [
+          "cn",
+          "google.cn",
+          "googleapis.cn"
+        ],
+        "server": "cn-dns"
+      }
+    ],
+    "final": "remote-dns",
+    "strategy": "ipv4_only",
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+        "download_detour": "direct"
+      }
+    ]
+  }
+}

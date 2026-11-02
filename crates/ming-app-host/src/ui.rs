@@ -81,6 +81,16 @@ impl ViewBridge {
         // Serialize the decision and cancel store with Result acceptance.
         let lifecycle = self.worker_lifecycle.lock().expect("worker lifecycle");
         if lifecycle.result_accepted.is_none() {
+            // A normal Close reply means the worker has received the terminal
+            // event and is unwinding its application state. Let the existing
+            // native-exit watchdog bound that cleanup instead of converting a
+            // valid Close into APP_CANCELLED at the UI grace deadline.
+            if lifecycle
+                .terminal_reply_written
+                .is_some_and(|(_, kind)| matches!(kind, TerminalReplyKind::Close))
+            {
+                return (Instant::now(), false);
+            }
             self.cancel.store(true, Ordering::SeqCst);
             (Instant::now(), true)
         } else {

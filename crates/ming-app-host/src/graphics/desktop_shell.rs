@@ -77,17 +77,55 @@ impl StoragePrompt {
         if !crate::app_data::valid_package_id(id) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
         Ok(Self { id: id.into(), version: String::new(), fingerprint: String::new(), replacement: true, mode: 12 })
     }
+    #[cfg(target_os = "linux")]
+    pub fn purge(id: &str, version: &str, fingerprint: &str, retry: bool) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) || version.is_empty() || version.len() > 16_384
+            || !version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            || fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            bail!("DESKTOP_STORAGE_PROMPT_INVALID");
+        }
+        Ok(Self { id: id.into(), version: version.into(), fingerprint: fingerprint.into(), replacement: false, mode: if retry { 14 } else { 13 } })
+    }
+    #[cfg(target_os = "linux")]
+    pub fn purge_retry(id: &str, version: &str, fingerprint: &str) -> Result<Self> {
+        Self::purge(id, version, fingerprint, true)
+    }
+    #[cfg(target_os = "linux")]
+    pub fn purge_blocked(id: &str) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
+        Ok(Self { id: id.into(), version: String::new(), fingerprint: String::new(), replacement: true, mode: 15 })
+    }
+    #[cfg(target_os = "linux")]
+    pub fn install(id: &str, version: &str, fingerprint: &str, update: bool, retry: bool, blocked: bool) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) || version.is_empty() || version.len() > 16_384
+            || !version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            || fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            bail!("DESKTOP_INSTALL_PROMPT_INVALID");
+        }
+        let mode = if blocked { 21 } else if retry { if update { 19 } else { 18 } } else if update { 17 } else { 16 };
+        Ok(Self { id: id.into(), version: version.into(), fingerprint: fingerprint.into(), replacement: blocked, mode })
+    }
     pub(super) fn buttons(&self) -> (&'static [u8], Option<&'static [u8]>) {
         match self.mode {
-            1 | 4 | 5 | 12 => (b"CLOSE", None),
+            1 | 4 | 5 | 12 | 15 | 21 => (b"CLOSE", None),
             2 | 8 => (b"CANCEL", Some(b"REVOKE")),
-            3 | 7 | 9 => (b"CANCEL", Some(b"RETRY")),
+            3 | 7 | 9 | 11 | 14 | 18 | 19 => (b"CANCEL", Some(b"RETRY")),
             10 => (b"CANCEL", Some(b"UNINSTALL")),
-            11 => (b"CANCEL", Some(b"RETRY")),
+            13 => (b"CANCEL", Some(b"DELETE")),
+            16 => (b"CANCEL", Some(b"INSTALL")),
+            17 => (b"CANCEL", Some(b"UPDATE")),
             _ => (b"DENY", Some(b"ALLOW")),
         }
     }
     pub(crate) fn has_allow(&self) -> bool { self.buttons().1.is_some() }
+    pub(crate) fn state_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "mode": self.mode,
+            "packageId": self.id,
+            "version": self.version,
+            "hasAllow": self.has_allow(),
+        })
+    }
     pub(crate) fn lines(&self, width: i32) -> Vec<Vec<u8>> {
         let capacity = ((width - 24) / 6) as usize;
         if self.mode == 8 || self.mode == 9 {
@@ -115,12 +153,31 @@ impl StoragePrompt {
             if self.mode == 11 { lines.push(b"UNINSTALL NOT SAVED".to_vec()); }
             return lines;
         }
-        if self.mode == 12 {
+        if self.mode == 13 || self.mode == 14 {
+            let mut lines = vec![b"DELETE PRIVATE DATA".to_vec()];
+            lines.extend(format!("APP ID: {}", self.id).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.extend(format!("VERSION: {}", self.version).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.extend(format!("SHA256: {}", self.fingerprint).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.push(if self.mode == 13 { b"PRIVATE DATA WILL BE DELETED".to_vec() } else { b"PRIVATE DATA NOT DELETED".to_vec() });
+            return lines;
+        }
+        if self.mode == 12 || self.mode == 15 || self.mode == 21 {
             return vec![
-                b"UNINSTALL APP".to_vec(),
+                if self.mode == 15 { b"DELETE PRIVATE DATA".to_vec() } else if self.mode == 21 { b"UPDATE APP".to_vec() } else { b"UNINSTALL APP".to_vec() },
                 format!("APP ID: {}", self.id).into_bytes(),
                 b"CLOSE APP FIRST".to_vec(),
             ];
+        }
+        if (16..=19).contains(&self.mode) {
+            let update = matches!(self.mode, 17 | 19);
+            let retry = matches!(self.mode, 18 | 19);
+            let mut lines = vec![if update { b"UPDATE APP".to_vec() } else { b"INSTALL APP".to_vec() }];
+            lines.extend(format!("APP ID: {}", self.id).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.extend(format!("VERSION: {}", self.version).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.extend(format!("SHA256: {}", self.fingerprint).as_bytes().chunks(capacity).map(|part| part.to_vec()));
+            lines.push(if update { b"PUBLISHER VERIFIED; DATA UPDATE MAY RUN".to_vec() } else { b"PUBLISHER SIGNATURE VERIFIED".to_vec() });
+            if retry { lines.push(if update { b"UPDATE NOT SAVED".to_vec() } else { b"INSTALL NOT SAVED".to_vec() }); }
+            return lines;
         }
         if self.mode >= 4 {
             let mut lines = vec![b"PRIVATE STORAGE ACCESS".to_vec()];
@@ -207,6 +264,13 @@ pub fn dock_uninstall_cell(width: i32, height: i32, index: usize, count: usize) 
     Rect { x: cell.x + 4, y: cell.y + 4, width: 16, height: 16 }
 }
 
+#[cfg(target_os = "linux")]
+pub fn dock_purge_cell(width: i32, height: i32, index: usize, count: usize) -> Rect {
+    let cell = dock_cell(width, height, index, count);
+    if cell.width == 0 { return cell; }
+    Rect { x: cell.x + 25, y: cell.y + 4, width: 16, height: 16 }
+}
+
 /// Trusted system control, in the same logical coordinates as the rendered header.
 pub fn power_cell(width: i32, height: i32) -> Rect {
     if !valid_screen(width as usize, height as usize) {
@@ -224,13 +288,22 @@ pub fn power_cell(width: i32, height: i32) -> Rect {
         height: TOP,
     }
 }
+#[cfg(target_os = "linux")]
+pub fn install_cell(width: i32, height: i32) -> Rect {
+    if !valid_screen(width as usize, height as usize) {
+        return Rect { x: 0, y: 0, width: 0, height: 0 };
+    }
+    Rect { x: width - 180, y: 0, width: 96, height: TOP }
+}
 pub struct DesktopShell {
+    install_available: bool,
     #[cfg(feature = "gpu")]
     gpu: Option<super::desktop_shell_gpu::GpuDesktopShell>,
 }
 impl DesktopShell {
     pub fn cpu() -> Self {
         Self {
+            install_available: false,
             #[cfg(feature = "gpu")]
             gpu: None,
         }
@@ -239,8 +312,13 @@ impl DesktopShell {
     #[cfg(feature = "gpu")]
     pub fn gpu(session: &super::GpuSession) -> Result<Self> {
         Ok(Self {
+            install_available: false,
             gpu: Some(super::desktop_shell_gpu::GpuDesktopShell::new(session)?),
         })
+    }
+    #[cfg(target_os = "linux")]
+    pub fn set_install_available(&mut self, available: bool) {
+        self.install_available = available;
     }
     #[cfg(feature = "gpu")]
     pub fn gpu_stats(&self) -> Result<Option<super::GpuStats>> {
@@ -266,7 +344,7 @@ impl DesktopShell {
         validate(root, windows, apps)?;
         #[cfg(feature = "gpu")]
         if let Some(gpu) = &self.gpu {
-            return gpu.draw(root, windows, apps, prompt);
+            return gpu.draw(root, windows, apps, prompt, self.install_available);
         }
         let Some(source) = root.cpu_pixels() else {
             bail!("DESKTOP_SHELL_CPU_FRAME_REQUIRED");
@@ -294,6 +372,13 @@ impl DesktopShell {
                     {
                         color = INK;
                     }
+                    #[cfg(target_os = "linux")]
+                    if self.install_available
+                        && install_cell(root.width as i32, root.height as i32).contains(x, y)
+                        && text_at_2x(b"INSTALL", x - (root.width as i32 - 168), y - 5, 84)
+                    {
+                        color = INK;
+                    }
                 } else if y >= root.height as i32 - DOCK {
                     color = BAR;
                     for (i, a) in apps.iter().enumerate() {
@@ -311,11 +396,20 @@ impl DesktopShell {
                         #[cfg(target_os = "linux")]
                         {
                             let uninstall = dock_uninstall_cell(root.width as i32, root.height as i32, i, apps.len());
+                            let purge = dock_purge_cell(root.width as i32, root.height as i32, i, apps.len());
                             let storage = dock_storage_cell(root.width as i32, root.height as i32, i, apps.len());
-                            if uninstall.contains(x, y) || storage.contains(x, y) {
-                                let (icon, offset) = if uninstall.contains(x, y) { (b"U".as_slice(), 4) } else { (b"S".as_slice(), 46) };
+                            if uninstall.contains(x, y) || purge.contains(x, y) || storage.contains(x, y) {
+                                let (icon, offset, y_offset) = if uninstall.contains(x, y) {
+                                    (b"U".as_slice(), 4, -1)
+                                } else if purge.contains(x, y) {
+                                    // Keep the centered app label's final two
+                                    // rows clear of the destructive glyph.
+                                    (b"D".as_slice(), 25, 1)
+                                } else {
+                                    (b"S".as_slice(), 46, -1)
+                                };
                                 color = TILE;
-                                if text_at_2x(icon, cx - offset, cy - 1, 12) { color = INK; }
+                                if text_at_2x(icon, cx - offset, cy + y_offset, 12) { color = INK; }
                             }
                         }
                         if text_at_2x(&labels[i][..labels[i].len().min(1)], cx - 27, cy - 14, 12)
@@ -509,6 +603,7 @@ mod storage_prompt_tests {
         assert_eq!(retry.buttons(), (b"CANCEL".as_slice(), Some(b"RETRY".as_slice())));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn uninstall_prompt_keeps_data_and_has_retry_and_blocked_states() {
         let id = "dev.example.app";
@@ -525,14 +620,108 @@ mod storage_prompt_tests {
         assert_eq!(blocked.buttons(), (b"CLOSE".as_slice(), None));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_prompt_deletes_data_and_has_retry_and_blocked_states() {
+        let id = "dev.example.app";
+        let fingerprint = "f".repeat(64);
+        let prompt = StoragePrompt::purge(id, "1.0.0", &fingerprint, false).unwrap();
+        assert!(prompt.lines(304).iter().any(|line| line == b"PRIVATE DATA WILL BE DELETED"));
+        assert_eq!(prompt.buttons(), (b"CANCEL".as_slice(), Some(b"DELETE".as_slice())));
+        let retry = StoragePrompt::purge(id, "1.0.0", &fingerprint, true).unwrap();
+        assert!(retry.lines(304).iter().any(|line| line == b"PRIVATE DATA NOT DELETED"));
+        assert_eq!(retry.buttons(), (b"CANCEL".as_slice(), Some(b"RETRY".as_slice())));
+        let named_retry = StoragePrompt::purge_retry(id, "1.0.0", &fingerprint).unwrap();
+        assert_eq!(named_retry.mode, retry.mode);
+        let blocked = StoragePrompt::purge_blocked(id).unwrap();
+        assert!(blocked.lines(304).iter().any(|line| line == b"CLOSE APP FIRST"));
+        assert_eq!(blocked.buttons(), (b"CLOSE".as_slice(), None));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn uninstall_and_storage_dock_cells_are_separate_and_bounded() {
         let uninstall = dock_uninstall_cell(1280, 800, 0, 1);
         let storage = dock_storage_cell(1280, 800, 0, 1);
+        let purge = dock_purge_cell(1280, 800, 0, 1);
         let cell = dock_cell(1280, 800, 0, 1);
         assert!(cell.contains(uninstall.x, uninstall.y));
+        assert!(cell.contains(purge.x, purge.y));
         assert!(cell.contains(storage.x, storage.y));
         assert!(!uninstall.contains(storage.x, storage.y));
+        assert!(!uninstall.contains(purge.x, purge.y));
+        assert!(!purge.contains(storage.x, storage.y));
         assert!(!storage.contains(uninstall.x, uninstall.y));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_header_cell_is_bounded_and_cpu_label_is_opt_in() {
+        let src = crate::graphics::compositor::Compositor::cpu()
+            .compose(320, 240, 0xff123456, &[])
+            .unwrap();
+        let cell = install_cell(320, 240);
+        assert_eq!(cell, Rect { x: 140, y: 0, width: 96, height: TOP });
+        assert!(cell.contains(cell.x, cell.y));
+        assert!(!cell.contains(cell.x - 1, cell.y));
+
+        let disabled = DesktopShell::cpu().draw(&src, &[], &[]).unwrap();
+        let mut enabled_shell = DesktopShell::cpu();
+        enabled_shell.set_install_available(true);
+        let enabled = enabled_shell.draw(&src, &[], &[]).unwrap();
+        assert_ne!(disabled.cpu_pixels(), enabled.cpu_pixels());
+        assert!((cell.y..cell.y + cell.height).any(|y| {
+            (cell.x..cell.x + cell.width)
+                .any(|x| enabled.cpu_pixels().unwrap()[y as usize * 320 + x as usize] == 0xff26313f)
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dock_renders_distinct_purge_uninstall_and_storage_glyphs() {
+        let src = crate::graphics::compositor::Compositor::cpu()
+            .compose(320, 240, 0xff123456, &[])
+            .unwrap();
+        let out = DesktopShell::cpu().draw(&src, &[], &[ShellApp { id: 1, title: "App".into(), state: ShellAppState::Running }]).unwrap();
+        let pixels = out.cpu_pixels().unwrap();
+        let masks: Vec<Vec<(i32, i32)>> = [
+            dock_purge_cell(320, 240, 0, 1),
+            dock_uninstall_cell(320, 240, 0, 1),
+            dock_storage_cell(320, 240, 0, 1),
+        ].into_iter().map(|cell| {
+            let mask = (cell.y..cell.y + cell.height).flat_map(|y| {
+                (cell.x..cell.x + cell.width).filter_map(move |x| {
+                    (pixels[(y as usize) * 320 + x as usize] == 0xff26313f).then_some((x, y))
+                })
+            }).collect::<Vec<_>>();
+            assert!(!mask.is_empty(), "dock glyph has no visible ink: {cell:?}");
+            mask
+        }).collect();
+        assert_ne!(masks[0], masks[1]);
+        assert_ne!(masks[0], masks[2]);
+        assert_ne!(masks[1], masks[2]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_d_glyph_stays_inside_its_bounded_dock_target() {
+        let src = crate::graphics::compositor::Compositor::cpu()
+            .compose(320, 240, 0xff123456, &[])
+            .unwrap();
+        let out = DesktopShell::cpu()
+            .draw(&src, &[], &[ShellApp { id: 1, title: "App".into(), state: ShellAppState::Running }])
+            .unwrap();
+        let pixels = out.cpu_pixels().unwrap();
+        let cell = dock_purge_cell(320, 240, 0, 1);
+        let ink: Vec<_> = (cell.y..cell.y + cell.height)
+            .flat_map(|y| {
+                (cell.x..cell.x + cell.width).filter_map(move |x| {
+                    (pixels[y as usize * 320 + x as usize] == 0xff26313f).then_some((x, y))
+                })
+            })
+            .collect();
+        assert!(!ink.is_empty());
+        assert!(ink.iter().all(|(x, y)| cell.contains(*x, *y)));
+        assert!(ink.iter().any(|(x, _)| *x >= cell.x + 4 && *x < cell.x + 13));
     }
 }

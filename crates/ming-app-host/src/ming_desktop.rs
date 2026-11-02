@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -19,6 +19,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppRecord {
@@ -91,6 +95,8 @@ pub struct DesktopOutcome {
     pub surface_gpu_stats: Option<crate::graphics::GpuStats>,
 }
 struct Instance {
+    #[cfg(target_os = "linux")]
+    update_startup: Option<UpdateStartupIdentity>,
     app_data: supervisor::AppDataService,
     app: u16,
     window: Option<WindowId>,
@@ -110,6 +116,40 @@ struct Instance {
     #[cfg(feature = "gpu")]
     gpu: Option<crate::graphics::GpuSession>,
 }
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UpdateStartupIdentity {
+    package_id: String,
+    version: String,
+    fingerprint: [u8; 32],
+    app: u16,
+    generation: u64,
+    window: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone)]
+struct UpdateStartupEvidence {
+    identity: UpdateStartupIdentity,
+    worker_pid: u32,
+    input_ready: bool,
+    presented_source_sequence: u64,
+    completed: bool,
+    result_accepted: bool,
+    native_exit_ok: bool,
+    reaped: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl UpdateStartupEvidence {
+    fn confirms(&self, expected: &UpdateStartupIdentity) -> bool {
+        self.identity == *expected && !expected.package_id.is_empty()
+            && expected.app != 0 && expected.generation != 0 && expected.window != 0
+            && self.worker_pid != 0 && self.input_ready && self.presented_source_sequence != 0
+            && self.completed && self.result_accepted && self.native_exit_ok && self.reaped
+    }
+}
 #[cfg(target_os = "linux")]
 struct PendingDesktopStorage {
     app: u16,
@@ -117,15 +157,29 @@ struct PendingDesktopStorage {
     prompt: crate::graphics::desktop_shell::StoragePrompt,
     composed: Option<u64>,
     presented: bool,
+    presented_sequence: Option<u64>,
 }
 #[cfg(target_os = "linux")]
 enum DesktopStorageDecision {
+    Install { package_id: String, version: String, fingerprint: String, manifest_path: PathBuf, update: bool, retry: bool },
     Management(crate::storage_consent::StorageManagement),
     PublicManagement(crate::storage_consent::PublicStorageManagement),
     Public(crate::storage_consent::PendingPublicConsent),
-    Uninstall { package_id: String, version: String, fingerprint: String },
+    Uninstall { package_id: String, version: String, fingerprint: String, manifest_path: PathBuf },
     UninstallBlocked,
+    Purge { package_id: String, version: String, fingerprint: String, manifest_path: PathBuf, retry: bool },
+    PurgeBlocked,
     Information,
+}
+
+#[cfg(target_os = "linux")]
+fn package_fingerprint_hex(package: &crate::package::Package) -> String {
+    let mut fingerprint = String::with_capacity(64);
+    for byte in package.storage_fingerprint() {
+        use std::fmt::Write as _;
+        write!(&mut fingerprint, "{byte:02x}").expect("string write");
+    }
+    fingerprint
 }
 impl Instance {
     fn lifecycle_trace(&mut self) -> Vec<(Instant, &'static str, &'static str)> {
@@ -204,9 +258,16 @@ impl Session {
         let strict_session = if options.isolation == crate::desktop_catalog::IsolationMode::Strict {
             Some(StrictSessionLock::acquire()?)
         } else { None };
+        // A reviewed install script may launch the newly assigned app after the
+        // install action has committed the catalog entry.  The entry cannot be
+        // present in the initial catalog, so defer that one identity check to
+        // the normal runtime lookup instead of rejecting the reviewed script at
+        // session construction time.
+        let reviewed_install_script = options.actions.iter().any(|step| matches!(step.action, DesktopAction::Install { .. }));
         for step in &options.actions {
-            if !matches!(step.action, DesktopAction::Shutdown)
+            if !matches!(step.action, DesktopAction::Shutdown | DesktopAction::Install { .. })
                 && !catalog.apps.iter().any(|a| a.id == step.action.app())
+                && !(reviewed_install_script && matches!(step.action, DesktopAction::Launch { .. }) && (1..=4).contains(&step.action.app()))
             {
                 bail!("DESKTOP_EVENT_UNKNOWN_APP");
             }
@@ -408,7 +469,11 @@ impl Session {
         self.dirty = true;
         self.sink_ready = false;
         #[cfg(target_os = "linux")]
-        if let Some(pending) = &mut self.pending_storage { pending.composed = None; pending.presented = false; }
+        if let Some(pending) = &mut self.pending_storage {
+            pending.composed = None;
+            pending.presented = false;
+            pending.presented_sequence = None;
+        }
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn storage_prompt(&self) -> Option<&crate::graphics::desktop_shell::StoragePrompt> {
@@ -419,12 +484,13 @@ impl Session {
         if let Some(pending) = &mut self.pending_storage { pending.composed = Some(sequence); }
     }
     #[cfg(target_os = "linux")]
-    pub(crate) fn storage_prompt_hit(&self, x: i32, y: i32) -> Option<bool> {
+    pub(crate) fn storage_prompt_target(&self, x: i32, y: i32) -> Option<(bool, u64)> {
         let pending = self.pending_storage.as_ref()?;
         if !pending.presented || !self.sink_ready { return None; }
+        let sequence = pending.presented_sequence?;
         let geometry = crate::graphics::desktop_shell::storage_prompt_geometry(self.options.width, self.options.height, !pending.prompt.has_allow())?;
-        if geometry.deny.contains(x, y) { Some(false) }
-        else if geometry.allow.is_some_and(|r| r.contains(x, y)) { Some(true) }
+        if geometry.deny.contains(x, y) { Some((false, sequence)) }
+        else if geometry.allow.is_some_and(|r| r.contains(x, y)) { Some((true, sequence)) }
         else { None }
     }
     #[cfg(target_os = "linux")]
@@ -435,6 +501,92 @@ impl Session {
         let pending = self.pending_storage.take().expect("checked pending");
         let app = pending.app;
         match pending.pending {
+            DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update, retry: _ } => {
+                if !allow {
+                    self.changed();
+                    self.launch_pending_autostart()?;
+                    return Ok(());
+                }
+                let registry = self.options.install_registry.as_ref().context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?;
+                let package = crate::package::load_package(&manifest_path).context("DESKTOP_INSTALL_PACKAGE")?;
+                let actual_fingerprint = package_fingerprint_hex(&package);
+                if package.manifest.id != package_id || package.manifest.version != version || actual_fingerprint != fingerprint {
+                    self.log(0, 0, 0, "install_not_saved", "package identity changed".into());
+                    let prompt = crate::graphics::desktop_shell::StoragePrompt::install(&package_id, &version, &fingerprint, update, true, false)?;
+                    self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update, retry: true }, prompt, composed: None, presented: false, presented_sequence: None });
+                    self.changed();
+                    return Ok(());
+                }
+                if let Err(error) = registry.verify_package_source(&package) {
+                    self.log(0, 0, 0, "install_not_saved", format!("{error:#}"));
+                    let prompt = crate::graphics::desktop_shell::StoragePrompt::install(&package_id, &version, &fingerprint, update, true, false)?;
+                    self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update, retry: true }, prompt, composed: None, presented: false, presented_sequence: None });
+                    self.changed();
+                    return Ok(());
+                }
+                let previous_catalog = self.catalog.clone();
+                let authority = if update {
+                    if self.storage_authority.is_none() {
+                        let root = self.app_data.root.clone().context("DESKTOP_DATA_ROOT_REQUIRED")?;
+                        self.storage_authority = Some(Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(root).context("DESKTOP_STORAGE_AUTHORITY")?));
+                    }
+                    self.storage_authority.clone()
+                } else { None };
+                let install_rollback = if update {
+                    None
+                } else {
+                    Some(registry.prepare_install_rollback(&package_id)?)
+                };
+                let install_result = if update {
+                    registry.update_from_manifest(&manifest_path, authority.as_deref().context("DESKTOP_STORAGE_AUTHORITY")?)
+                } else {
+                    registry.install_from_manifest(&manifest_path)
+                };
+                let install_state = match install_result {
+                    Ok(state) => state,
+                    Err(error) => {
+                    self.log(0, 0, 0, "install_not_saved", format!("{error:#}"));
+                    let prompt = crate::graphics::desktop_shell::StoragePrompt::install(&package_id, &version, &fingerprint, update, true, false)?;
+                    self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update, retry: true }, prompt, composed: None, presented: false, presented_sequence: None });
+                    self.changed();
+                    return Ok(());
+                    }
+                };
+                let active_manifest = registry.active_manifest_path(&package_id)?;
+                if update {
+                    let entry = self.catalog.apps.iter_mut().find(|entry| entry.package_id == package_id).context("DESKTOP_INSTALL_CATALOG_ENTRY")?;
+                    entry.manifest_path = active_manifest;
+                    entry.package_fingerprint = package.storage_fingerprint();
+                } else {
+                    let id = self.catalog.apps.iter().map(|entry| entry.id).max().unwrap_or(0).checked_add(1).context("DESKTOP_INSTALL_APP_ID")?;
+                    self.catalog.apps.push(crate::desktop_catalog::CatalogEntry {
+                        id,
+                        title: package.manifest.id.chars().take(20).collect(),
+                        manifest_path: active_manifest,
+                        package_id: package_id.clone(),
+                        package_fingerprint: package.storage_fingerprint(),
+                    });
+                }
+                if let Err(error) = crate::desktop_catalog::persist_installed_catalog(&self.options.catalog_path, &self.catalog, &self.app_data.grants) {
+                    self.catalog = previous_catalog;
+                    if update {
+                        if let Some(authority) = authority.as_deref() { let _ = registry.rollback_pending_update(authority); }
+                    } else if !matches!(install_state, crate::package_install::InstallState::Unchanged) {
+                        if let Some(rollback) = install_rollback {
+                            let _ = registry.rollback_install(rollback, &version, package.storage_fingerprint());
+                        }
+                    }
+                    self.log(0, 0, 0, "install_not_saved", format!("{error:#}"));
+                    let prompt = crate::graphics::desktop_shell::StoragePrompt::install(&package_id, &version, &fingerprint, update, true, false)?;
+                    self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update, retry: true }, prompt, composed: None, presented: false, presented_sequence: None });
+                    self.changed();
+                    return Ok(());
+                }
+                self.log(0, 0, 0, if update { "updated" } else { "installed" }, package_id);
+                self.changed();
+                self.launch_pending_autostart()?;
+                return Ok(());
+            }
             DesktopStorageDecision::Management(management) => {
                 if allow {
                     match management.revoke() {
@@ -444,7 +596,7 @@ impl Session {
                         result => {
                             self.log(app, 0, 0, "storage_revoke_not_saved", format!("{result:?}"));
                             let prompt = crate::graphics::desktop_shell::StoragePrompt::management(management.app_id(), management.fingerprint().as_deref(), true)?;
-                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Management(management), prompt, composed: None, presented: false });
+                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Management(management), prompt, composed: None, presented: false, presented_sequence: None });
                             self.changed();
                             return Ok(());
                         }
@@ -463,7 +615,7 @@ impl Session {
                         result => {
                             self.log(app, 0, 0, "public_storage_revoke_not_saved", format!("{result:?}"));
                             let prompt = crate::graphics::desktop_shell::StoragePrompt::public_management(management.app_id(), management.fingerprint().as_deref(), true)?;
-                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::PublicManagement(management), prompt, composed: None, presented: false });
+                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::PublicManagement(management), prompt, composed: None, presented: false, presented_sequence: None });
                             self.changed();
                             return Ok(());
                         }
@@ -473,8 +625,23 @@ impl Session {
                 self.launch_pending_autostart()?;
                 return Ok(());
             }
-            DesktopStorageDecision::Uninstall { package_id, version, fingerprint } => {
+            DesktopStorageDecision::Uninstall { package_id, version, fingerprint, manifest_path } => {
                 if allow {
+                    let package = crate::package::load_package(&manifest_path).context("DESKTOP_UNINSTALL_PACKAGE")?;
+                    let actual_fingerprint = package_fingerprint_hex(&package);
+                    if package.manifest.id != package_id
+                        || package.manifest.version != version
+                        || actual_fingerprint != fingerprint
+                    {
+                        self.changed();
+                        bail!("DESKTOP_PACKAGE_CHANGED");
+                    }
+                    self.options
+                        .install_registry
+                        .as_ref()
+                        .context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?
+                        .verify_package(&package)
+                        .context("DESKTOP_UNINSTALL_PACKAGE")?;
                     let result = self
                         .options
                         .install_registry
@@ -493,10 +660,11 @@ impl Session {
                             let prompt = crate::graphics::desktop_shell::StoragePrompt::uninstall(&package_id, &version, &fingerprint, true)?;
                             self.pending_storage = Some(PendingDesktopStorage {
                                 app,
-                                pending: DesktopStorageDecision::Uninstall { package_id, version, fingerprint },
+                                pending: DesktopStorageDecision::Uninstall { package_id, version, fingerprint, manifest_path },
                                 prompt,
                                 composed: None,
                                 presented: false,
+                                presented_sequence: None,
                             });
                             self.changed();
                             return Ok(());
@@ -508,6 +676,93 @@ impl Session {
                 return Ok(());
             }
             DesktopStorageDecision::UninstallBlocked => {
+                self.changed();
+                self.launch_pending_autostart()?;
+                return Ok(());
+            }
+            DesktopStorageDecision::Purge { package_id, version, fingerprint, manifest_path, retry } => {
+                if allow {
+                    let package = crate::package::load_package(&manifest_path).context("DESKTOP_UNINSTALL_PACKAGE")?;
+                    let actual_fingerprint = package_fingerprint_hex(&package);
+                    if package.manifest.id != package_id
+                        || package.manifest.version != version
+                        || actual_fingerprint != fingerprint
+                    {
+                        self.changed();
+                        bail!("DESKTOP_PACKAGE_CHANGED");
+                    }
+                    let registry = self.options.install_registry.as_ref().context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?;
+                    if retry {
+                        registry.verify_package_identity(&package).context("DESKTOP_UNINSTALL_PACKAGE")?;
+                        if !registry.is_removed(&package_id)? {
+                            self.changed();
+                            bail!("DESKTOP_PACKAGE_STATE_CHANGED");
+                        }
+                    } else {
+                        registry.verify_package(&package).context("DESKTOP_UNINSTALL_PACKAGE")?;
+                    }
+                    let root = self.app_data.root.clone().context("DESKTOP_DATA_ROOT_REQUIRED")?;
+                    let authority = if let Some(authority) = &self.storage_authority {
+                        authority.clone()
+                    } else {
+                        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(root).context("DESKTOP_STORAGE_AUTHORITY")?);
+                        self.storage_authority = Some(authority.clone());
+                        authority
+                    };
+                    let result = self
+                        .options
+                        .install_registry
+                        .as_ref()
+                        .context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?
+                        .uninstall_with_data_policy(&package_id, crate::package_install::UninstallDataPolicy::PurgePrivateData(&authority));
+                    match result {
+                        Ok(_) => {
+                            self.catalog.apps.retain(|entry| entry.package_id != package_id);
+                            self.catalog.autostart.retain(|id| self.catalog.apps.iter().any(|entry| entry.id == *id));
+                            self.pending_autostart.retain(|id| self.catalog.apps.iter().any(|entry| entry.id == *id));
+                            self.log(app, 0, 0, "uninstalled_and_purged", package_id);
+                        }
+                        Err(error) => {
+                            let removed = self.options.install_registry.as_ref()
+                                .and_then(|registry| registry.is_removed(&package_id).ok())
+                                .unwrap_or(false);
+                            if removed {
+                                self.catalog.apps.retain(|entry| entry.package_id != package_id);
+                                self.catalog.autostart.retain(|id| self.catalog.apps.iter().any(|entry| entry.id == *id));
+                                self.pending_autostart.retain(|id| self.catalog.apps.iter().any(|entry| entry.id == *id));
+                                self.log(app, 0, 0, "private_data_purge_not_saved", format!("{error:#}"));
+                                let prompt = crate::graphics::desktop_shell::StoragePrompt::purge_retry(&package_id, &version, &fingerprint)?;
+                                self.pending_storage = Some(PendingDesktopStorage {
+                                    app,
+                                    pending: DesktopStorageDecision::Purge { package_id, version, fingerprint, manifest_path, retry: true },
+                                    prompt,
+                                    composed: None,
+                                    presented: false,
+                                    presented_sequence: None,
+                                });
+                                self.changed();
+                                return Ok(());
+                            }
+                            self.log(app, 0, 0, "uninstall_not_saved", format!("{error:#}"));
+                            let prompt = crate::graphics::desktop_shell::StoragePrompt::purge(&package_id, &version, &fingerprint, false)?;
+                            self.pending_storage = Some(PendingDesktopStorage {
+                                app,
+                                pending: DesktopStorageDecision::Purge { package_id, version, fingerprint, manifest_path, retry: false },
+                                prompt,
+                                composed: None,
+                                presented: false,
+                                presented_sequence: None,
+                            });
+                            self.changed();
+                            return Ok(());
+                        }
+                    }
+                }
+                self.changed();
+                self.launch_pending_autostart()?;
+                return Ok(());
+            }
+            DesktopStorageDecision::PurgeBlocked => {
                 self.changed();
                 self.launch_pending_autostart()?;
                 return Ok(());
@@ -533,7 +788,7 @@ impl Session {
                                 crate::storage_consent::PublicConsentRequest::Allowed(_) => bail!("DESKTOP_PUBLIC_STORAGE_NOT_DURABLE"),
                             };
                             let prompt = crate::graphics::desktop_shell::StoragePrompt::public_retry(&package.manifest.id)?;
-                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Public(pending), prompt, composed: None, presented: false });
+                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Public(pending), prompt, composed: None, presented: false, presented_sequence: None });
                             self.changed();
                             return Ok(());
                         }
@@ -576,7 +831,68 @@ impl Session {
             }
             (package, _) => (DesktopStorageDecision::Information, crate::graphics::desktop_shell::StoragePrompt::status(package.as_ref().map(|p| p.manifest.id.as_str()), false)?),
         };
-        self.pending_storage = Some(PendingDesktopStorage { app, pending, prompt, composed: None, presented: false });
+        self.pending_storage = Some(PendingDesktopStorage { app, pending, prompt, composed: None, presented: false, presented_sequence: None });
+        self.reset_input()?;
+        self.changed();
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_install_from_dock(&mut self) -> Result<()> {
+        let source = self
+            .options
+            .install_source
+            .clone()
+            .context("DESKTOP_INSTALL_SOURCE_REQUIRED")?;
+        self.begin_install(&source)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_install(&mut self, source: &std::path::Path) -> Result<()> {
+        if self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen {
+            bail!("DESKTOP_INSTALL_UNAVAILABLE");
+        }
+        if !source.is_absolute() {
+            bail!("DESKTOP_INSTALL_SOURCE");
+        }
+        let registry = self.options.install_registry.as_ref().context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?;
+        let package = crate::package::load_package(source).context("DESKTOP_INSTALL_PACKAGE")?;
+        registry.verify_package_source(&package).context("DESKTOP_INSTALL_PUBLISHER")?;
+        let existing = self.catalog.apps.iter().find(|entry| entry.package_id == package.manifest.id).cloned();
+        let (update, app) = if let Some(entry) = existing {
+            let current = crate::package::load_package(&entry.manifest_path).context("DESKTOP_INSTALL_CURRENT")?;
+            if !crate::package::version_is_newer(&package.manifest.version, &current.manifest.version) {
+                bail!("DESKTOP_INSTALL_VERSION");
+            }
+            (true, entry.id)
+        } else {
+            if self.catalog.apps.len() >= 4 { bail!("DESKTOP_CATALOG_LIMIT"); }
+            (false, 0)
+        };
+        let mut fingerprint = package_fingerprint_hex(&package);
+        let blocked = update && self.instances.iter().any(|instance| instance.app == app);
+        let prompt = crate::graphics::desktop_shell::StoragePrompt::install(
+            &package.manifest.id,
+            &package.manifest.version,
+            &fingerprint,
+            update,
+            false,
+            blocked,
+        )?;
+        self.pending_storage = Some(PendingDesktopStorage {
+            app,
+            pending: DesktopStorageDecision::Install {
+                package_id: package.manifest.id,
+                version: package.manifest.version,
+                fingerprint: std::mem::take(&mut fingerprint),
+                manifest_path: source.to_path_buf(),
+                update,
+                retry: false,
+            },
+            prompt,
+            composed: None,
+            presented: false,
+            presented_sequence: None,
+        });
         self.reset_input()?;
         self.changed();
         Ok(())
@@ -600,11 +916,48 @@ impl Session {
                     package_id: package.manifest.id.clone(),
                     version: package.manifest.version.clone(),
                     fingerprint: fingerprint.clone(),
+                    manifest_path: entry.manifest_path.clone(),
                 },
                 crate::graphics::desktop_shell::StoragePrompt::uninstall(&package.manifest.id, &package.manifest.version, &fingerprint, false)?,
             )
         };
-        self.pending_storage = Some(PendingDesktopStorage { app, pending, prompt, composed: None, presented: false });
+        self.pending_storage = Some(PendingDesktopStorage { app, pending, prompt, composed: None, presented: false, presented_sequence: None });
+        self.reset_input()?;
+        self.changed();
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_uninstall_with_purge(&mut self, app: u16) -> Result<()> {
+        if self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen {
+            bail!("DESKTOP_UNINSTALL_UNAVAILABLE");
+        }
+        let root = self.app_data.root.clone().context("DESKTOP_DATA_ROOT_REQUIRED")?;
+        if self.storage_authority.is_none() {
+            let authority = crate::app_data::PackageStorageAuthority::open_default_private(root)
+                .context("DESKTOP_STORAGE_AUTHORITY")?;
+            self.storage_authority = Some(Arc::new(authority));
+        }
+        let entry = self.catalog.apps.iter().find(|entry| entry.id == app).context("DESKTOP_UNKNOWN_APP")?;
+        let registry = self.options.install_registry.as_ref().context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?;
+        let package = crate::package::load_package(&entry.manifest_path).context("DESKTOP_UNINSTALL_PACKAGE")?;
+        registry.verify_package(&package).context("DESKTOP_UNINSTALL_PACKAGE")?;
+        let (pending, prompt) = if self.instances.iter().any(|instance| instance.app == app) {
+            (DesktopStorageDecision::PurgeBlocked, crate::graphics::desktop_shell::StoragePrompt::purge_blocked(&package.manifest.id)?)
+        } else {
+            let mut fingerprint = String::with_capacity(64);
+            for byte in package.storage_fingerprint() { use std::fmt::Write as _; write!(&mut fingerprint, "{byte:02x}").expect("string write"); }
+            (
+                DesktopStorageDecision::Purge {
+                    package_id: package.manifest.id.clone(),
+                    version: package.manifest.version.clone(),
+                    fingerprint: fingerprint.clone(),
+                    manifest_path: entry.manifest_path.clone(),
+                    retry: false,
+                },
+                crate::graphics::desktop_shell::StoragePrompt::purge(&package.manifest.id, &package.manifest.version, &fingerprint, false)?,
+            )
+        };
+        self.pending_storage = Some(PendingDesktopStorage { app, pending, prompt, composed: None, presented: false, presented_sequence: None });
         self.reset_input()?;
         self.changed();
         Ok(())
@@ -696,7 +1049,7 @@ impl Session {
                         crate::storage_consent::PublicConsentRequest::Allowed(granted) => Some((granted.app_id, granted.session)),
                         crate::storage_consent::PublicConsentRequest::Prompt(pending) if !self.options.offscreen => {
                             let prompt = crate::graphics::desktop_shell::StoragePrompt::public_request(&package.manifest.id)?;
-                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Public(pending), prompt, composed: None, presented: false });
+                            self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Public(pending), prompt, composed: None, presented: false, presented_sequence: None });
                             self.reset_input()?;
                             self.changed();
                             return Ok(());
@@ -758,6 +1111,18 @@ impl Session {
             Some(supervisor::StrictLaunch::new(app, generation, self.next_isolation_uid)?)
         } else { None };
         let (window, effects) = self.scene.model_mut().open(app).map_err(model_error)?;
+        #[cfg(target_os = "linux")]
+        let update_startup = if let Some(registry) = self.options.install_registry.as_ref() {
+            match registry.pending_update()?.filter(|pending| pending.package_id == entry.package_id) {
+                Some(pending) => {
+                    if pending.new_fingerprint != entry.package_fingerprint { bail!("DESKTOP_UPDATE_PACKAGE_CHANGED"); }
+                    registry.begin_update_startup(&pending.package_id, pending.new_fingerprint)?;
+                    Some(UpdateStartupIdentity { package_id: pending.package_id, version: pending.new_version,
+                        fingerprint: pending.new_fingerprint, app, generation, window: window.0 })
+                }
+                None => None,
+            }
+        } else { None };
         let record = self.records.len();
         self.records.push(AppRecord {
             module_source: None, fuel_consumed: None,
@@ -786,6 +1151,8 @@ impl Session {
         });
         let (tx, result) = mpsc::sync_channel(1);
         self.instances.push(Instance {
+            #[cfg(target_os = "linux")]
+            update_startup,
             app_data: app_data.clone(),
             app,
             window: Some(window),
@@ -832,6 +1199,12 @@ impl Session {
     pub fn perform(&mut self, action: &DesktopAction) -> Result<()> {
         if matches!(action, DesktopAction::Shutdown) {
             return self.begin_shutdown();
+        }
+        if let DesktopAction::Install { source } = action {
+            #[cfg(target_os = "linux")]
+            { return self.begin_install(source); }
+            #[cfg(not(target_os = "linux"))]
+            { let _ = source; bail!("DESKTOP_INSTALL_UNSUPPORTED"); }
         }
         #[cfg(target_os = "linux")]
         if self.pending_storage.is_some() { bail!("DESKTOP_STORAGE_PROMPT_ACTIVE"); }
@@ -950,6 +1323,7 @@ impl Session {
                 return Ok(());
             }
             DesktopAction::Launch { .. }
+            | DesktopAction::Install { .. }
             | DesktopAction::Shutdown
             | DesktopAction::Text { .. }
             | DesktopAction::Preedit { .. }
@@ -1163,7 +1537,13 @@ impl Session {
                     let record = &self.records[a.record];
                     diagnostic_trace.push((at, record.app, record.window, record.generation,
                         if cancelled { "close-deadline-cancel" } else { "close-deadline-skipped" },
-                        if cancelled { format!("graceMs={}", close_grace.as_millis()) } else { "result-accepted".into() }));
+                        if cancelled {
+                            format!("graceMs={}", close_grace.as_millis())
+                        } else if a.bridge.worker_lifecycle().result_accepted.is_some() {
+                            "result-accepted".into()
+                        } else {
+                            "terminal-reply-written".into()
+                        }));
                     a.deadline_cancel_logged = true;
                 }
             }
@@ -1217,6 +1597,11 @@ impl Session {
         for (index, result) in completed.into_iter().rev() {
             let mut a = self.instances.remove(index);
             let join = a.worker.take().map(|w| w.join());
+            #[cfg(target_os = "linux")]
+            let update_startup = a.update_startup.take();
+            #[cfg(target_os = "linux")]
+            let native_exit_ok = result.as_ref().is_ok_and(|out| out.exit_code == 0)
+                && !join.as_ref().is_some_and(|result| result.is_err());
             // Acceptance/reap can happen after the snapshot above and before the
             // final channel receive. Joining makes this last snapshot complete.
             for (at, kind, detail) in a.lifecycle_trace() {
@@ -1274,6 +1659,46 @@ impl Session {
             self.log(app, window, generation, "worker-result", error.clone());
             self.log(app, window, generation, status, error);
             self.changed();
+            #[cfg(target_os = "linux")]
+            if let Some(expected) = update_startup {
+                let record = &self.records[a.record];
+                let lifecycle = a.bridge.worker_lifecycle();
+                let evidence = UpdateStartupEvidence {
+                    identity: UpdateStartupIdentity { package_id: record.package_id.clone().unwrap_or_default(),
+                        version: expected.version.clone(), fingerprint: expected.fingerprint,
+                        app: record.app, generation: record.generation, window: record.window },
+                    worker_pid: record.worker_pid,
+                    input_ready: record.first_ready_ms.is_some(),
+                    presented_source_sequence: record.presented_source_sequence,
+                    completed: record.completed && record.error.is_none(),
+                    result_accepted: lifecycle.result_accepted.is_some(),
+                    native_exit_ok,
+                    reaped: lifecycle.reaped.is_some(),
+                };
+                // Release every private-file session before rollback can swap
+                // the failed generation's directory back to the old layout.
+                drop(a);
+                self.finish_update_startup(&expected, &evidence)?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn finish_update_startup(&mut self, expected: &UpdateStartupIdentity, evidence: &UpdateStartupEvidence) -> Result<()> {
+        let registry = self.options.install_registry.as_ref().context("DESKTOP_UPDATE_REGISTRY")?;
+        let authority = self.storage_authority.as_ref().context("DESKTOP_UPDATE_STORAGE_AUTHORITY")?;
+        if evidence.confirms(expected) {
+            registry.confirm_pending_update(authority, &expected.package_id, &expected.version, expected.fingerprint)?;
+            self.log(expected.app, expected.window, expected.generation, "startup-confirmed", expected.package_id.clone());
+        } else {
+            registry.rollback_pending_update(authority).context("DESKTOP_UPDATE_ROLLBACK")?;
+            let manifest_path = registry.active_manifest_path(&expected.package_id)?;
+            let package = crate::package::load_package(&manifest_path)?;
+            let entry = self.catalog.apps.iter_mut().find(|entry| entry.id == expected.app).context("DESKTOP_UPDATE_CATALOG")?;
+            entry.manifest_path = manifest_path;
+            entry.package_fingerprint = package.storage_fingerprint();
+            self.log(expected.app, expected.window, expected.generation, "update-rolled-back", expected.package_id.clone());
+            if self.closing.is_none() { self.launch(expected.app)?; }
         }
         Ok(())
     }
@@ -1363,6 +1788,7 @@ impl Session {
         #[cfg(target_os = "linux")]
         if let Some(pending) = &mut self.pending_storage {
             pending.presented = !offscreen && pending.composed == Some(sequence);
+            pending.presented_sequence = pending.presented.then_some(sequence);
             pending.composed = None;
         }
         let ready: Vec<_> = self.views().into_iter().filter(|v| v.input_ready).collect();
@@ -1454,7 +1880,17 @@ impl Session {
             if let Some(data)=&r.app_data { value["appData"]=serde_json::to_value(data).expect("app data serialization"); }
             value
         }).collect();
-        let root=self.last_accepted.map(|(sequence,width,height)|serde_json::json!({"width":width,"height":height,"presentedSequence":sequence}));
+        let root = self.last_accepted.map(|(sequence, width, height)| {
+            let mut value = serde_json::json!({"width":width,"height":height,"presentedSequence":sequence});
+            #[cfg(target_os = "linux")]
+            let storage_prompt = self.pending_storage.as_ref()
+                .map(|pending| pending.prompt.state_value())
+                .unwrap_or(serde_json::Value::Null);
+            #[cfg(not(target_os = "linux"))]
+            let storage_prompt = serde_json::Value::Null;
+            value["storagePrompt"] = storage_prompt;
+            value
+        });
         let state = serde_json::json!({"schemaVersion":1,"bootId":self.state_boot,"sessionId":self.state_session,"revision":revision,"phase":phase,"root":root,"apps":apps,"error":self.state_error});
         let parent = path
             .parent()
@@ -1576,7 +2012,22 @@ pub fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<De
         bail!("DESKTOP_INSTALL_REGISTRY_UNSUPPORTED");
     }
     #[cfg(target_os = "linux")]
+    let update_registry_root = options.install_root.clone();
+    #[cfg(target_os = "linux")]
+    let update_data_root = options.app_data.root.clone();
+    #[cfg(target_os = "linux")]
+    let update_was_pending = options.install_registry.as_ref()
+        .map(|registry| registry.has_pending_update())
+        .transpose()?
+        .unwrap_or(false);
+    #[cfg(target_os = "linux")]
     let (catalog, data_bindings) = if let Some(registry) = options.install_registry.as_ref() {
+        if registry.has_pending_update()? {
+            let data_root = options.app_data.root.clone().context("DESKTOP_UPDATE_DATA_ROOT_REQUIRED")?;
+            let authority = crate::app_data::PackageStorageAuthority::open_default_private(data_root)
+                .context("DESKTOP_UPDATE_STORAGE_AUTHORITY")?;
+            registry.recover_pending_update(&authority).context("DESKTOP_UPDATE_RECOVERY")?;
+        }
         crate::desktop_catalog::load_catalog_with_install_registry(&options.catalog_path, registry)?
     } else {
         load_catalog_with_data(&options.catalog_path)?
@@ -1584,11 +2035,33 @@ pub fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<De
     #[cfg(not(target_os = "linux"))]
     let (catalog, data_bindings) = load_catalog_with_data(&options.catalog_path)?;
     options.app_data.grants = data_bindings;
-    if options.offscreen {
+    let result = if options.offscreen {
         crate::desktop_native::offscreen(options, catalog)
     } else {
         crate::desktop_native::native(options, catalog)
+    };
+    #[cfg(target_os = "linux")]
+    if update_was_pending {
+        if let Some(root) = update_registry_root {
+            let registry = crate::package_install::PackageInstallRegistry::open_verified(&root)
+                .context("DESKTOP_UPDATE_REGISTRY_REOPEN")?;
+            if registry.has_pending_update()? {
+                let data_root = update_data_root.clone().context("DESKTOP_UPDATE_DATA_ROOT_REQUIRED")?;
+                let authority = crate::app_data::PackageStorageAuthority::open_default_private(data_root)
+                    .context("DESKTOP_UPDATE_STORAGE_AUTHORITY")?;
+                match &result {
+                    Ok(_) => {
+                        registry.rollback_pending_update(&authority).context("DESKTOP_UPDATE_STARTUP_ROLLBACK")?;
+                        return Err(anyhow!("DESKTOP_UPDATE_STARTUP_UNCONFIRMED"));
+                    }
+                    Err(_) => {
+                        registry.rollback_pending_update(&authority).context("DESKTOP_UPDATE_FAILURE_ROLLBACK")?;
+                    }
+                }
+            }
+        }
     }
+    result
 }
 
 #[cfg(test)]
@@ -1620,6 +2093,41 @@ mod input_backpressure_tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("PUBLISHER_KEYRING_FILE"), "{error:#}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_catalog_failure_restores_the_registry_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = temp.path().join("source");
+        let install = temp.path().join("install");
+        let catalog_path = temp.path().join("catalog.json");
+        for path in [&source, &install] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        let manifest = source.join("app.json");
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.install.rollback","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        std::fs::write(&catalog_path, r#"{"schemaVersion":3,"apps":[],"autostart":[]}"#).unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+        let catalog = Catalog { apps: Vec::new(), autostart: Vec::new() };
+        let mut options = DesktopOptions::parse([catalog_path.into_os_string(), "--renderer".into(), "cpu".into()]).unwrap();
+        options.install_root = Some(install);
+        options.install_registry = Some(registry);
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        session.begin_install(&manifest).unwrap();
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.options.catalog_path = temp.path().join("missing-parent").join("catalog.json");
+        session.respond_storage_prompt(true).unwrap();
+        let registry = session.options.install_registry.as_ref().unwrap();
+        assert!(registry.active_manifest_path("dev.example.install.rollback").is_err());
+        assert!(!registry.is_removed("dev.example.install.rollback").unwrap());
+        assert!(session.storage_prompt().is_some());
     }
 
     #[cfg(target_os = "linux")]
@@ -1891,6 +2399,188 @@ mod input_backpressure_tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
+    fn purge_prompt_removes_private_data_after_presented_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let install = temp.path().join("install");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&install).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&install, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.purge","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","publicStorage":true}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(crate::app_data::AppDataRoot::open(&data).unwrap()).unwrap());
+        authority.default_private_session_for_package(&package).unwrap().write_file("delete", b"data").unwrap();
+        let sibling = crate::package::Package {
+            manifest: crate::package::Manifest {
+                schema_version: 1,
+                id: "dev.example.sibling".into(),
+                version: "1.0.0".into(),
+                sdk_version: 6,
+                entry: "main.wasm".into(),
+                private_storage: false,
+                public_storage: true,
+                data_migration: None,
+                publisher_key_id: None,
+                publisher_signature: None,
+            },
+            bytes: b"\0asm\x01\0\0\0".to_vec(),
+        };
+        let sibling_private = authority.default_private_session_for_package(&sibling).unwrap();
+        sibling_private.write_file("keep", b"sibling").unwrap();
+        drop(sibling_private);
+        authority.authorize_public(&package.manifest.id).unwrap();
+        authority.authorize_public(&sibling.manifest.id).unwrap();
+        let target_public = authority.public_session(&package.manifest.id).unwrap();
+        target_public.write_file("shared", b"target-shared").unwrap();
+        let sibling_public = authority.public_session(&sibling.manifest.id).unwrap();
+        sibling_public.write_file("shared", b"sibling-shared").unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+        registry.install_package(&package).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Purge".into(), package_fingerprint: package.storage_fingerprint(), manifest_path: manifest, package_id: package.manifest.id.clone() }], autostart: vec![] };
+        let mut options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.clone().into_os_string()]).unwrap();
+        options.install_registry = Some(registry);
+        options.install_root = Some(install);
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.storage_authority = Some(authority.clone());
+        session.begin_uninstall_with_purge(1).unwrap();
+        assert!(session.storage_prompt().unwrap().lines(600).iter().any(|line| line == b"PRIVATE DATA WILL BE DELETED"));
+        assert!(session.respond_storage_prompt(true).is_err());
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.respond_storage_prompt(true).unwrap();
+        assert!(session.storage_prompt().is_none());
+        assert!(session.catalog.apps.is_empty());
+        assert!(session.options.install_registry.as_ref().unwrap().active_manifest_path("dev.example.purge").is_err());
+        let fresh = authority.default_private_session_for_package(&package).unwrap();
+        assert_eq!(fresh.read_file("delete"), Err(crate::app_data::AppDataError::NotFound));
+        let sibling_private = authority.default_private_session_for_package(&sibling).unwrap();
+        assert_eq!(sibling_private.read_file("keep").unwrap(), b"sibling");
+        // Linux public storage is a single shared user directory.  The later
+        // write through the sibling session is therefore visible here too.
+        assert_eq!(target_public.read_file("shared").unwrap(), b"sibling-shared");
+        assert_eq!(sibling_public.read_file("shared").unwrap(), b"sibling-shared");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_failure_removes_catalog_and_retries_after_session_closes() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let install = temp.path().join("install");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&install).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&install, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.purge.retry","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(crate::app_data::AppDataRoot::open(&data).unwrap()).unwrap());
+        let held = authority.default_private_session_for_package(&package).unwrap();
+        held.write_file("retry", b"data").unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+        registry.install_package(&package).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Purge".into(), package_fingerprint: package.storage_fingerprint(), manifest_path: manifest, package_id: package.manifest.id.clone() }], autostart: vec![] };
+        let mut options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        options.install_registry = Some(registry);
+        options.install_root = Some(install);
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.storage_authority = Some(authority.clone());
+        session.begin_uninstall_with_purge(1).unwrap();
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.respond_storage_prompt(true).unwrap();
+        assert!(session.catalog.apps.is_empty());
+        assert!(session.storage_prompt().unwrap().lines(600).iter().any(|line| line == b"PRIVATE DATA NOT DELETED"));
+        drop(held);
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.respond_storage_prompt(true).unwrap();
+        assert!(session.storage_prompt().is_none());
+        let fresh = authority.default_private_session_for_package(&package).unwrap();
+        assert_eq!(fresh.read_file("retry"), Err(crate::app_data::AppDataError::NotFound));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_entry_requires_data_root_before_showing_confirmation() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let install = temp.path().join("install");
+        std::fs::create_dir(&install).unwrap();
+        std::fs::set_permissions(&install, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.purge.no-root","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+        registry.install_package(&package).unwrap();
+        let catalog = Catalog {
+            apps: vec![crate::desktop_catalog::CatalogEntry {
+                id: 1,
+                title: "Purge".into(),
+                package_fingerprint: package.storage_fingerprint(),
+                manifest_path: manifest,
+                package_id: package.manifest.id.clone(),
+            }],
+            autostart: vec![],
+        };
+        let mut options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into()]).unwrap();
+        options.install_registry = Some(registry);
+        options.install_root = Some(install);
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        let error = session.begin_uninstall_with_purge(1).unwrap_err();
+        assert!(format!("{error:#}").contains("DESKTOP_DATA_ROOT_REQUIRED"), "{error:#}");
+        assert!(session.storage_prompt().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn purge_confirmation_rejects_changed_package_fingerprint() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let install = temp.path().join("install");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&install).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&install, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = temp.path().join("manifest.json");
+        let wasm = temp.path().join("main.wasm");
+        std::fs::write(&wasm, b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.purge.changed","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let package = crate::package::load_package(&manifest).unwrap();
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(crate::app_data::AppDataRoot::open(&data).unwrap()).unwrap());
+        authority.default_private_session_for_package(&package).unwrap().write_file("keep", b"data").unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+        registry.install_package(&package).unwrap();
+        let catalog = Catalog { apps: vec![crate::desktop_catalog::CatalogEntry { id: 1, title: "Purge".into(), package_fingerprint: package.storage_fingerprint(), manifest_path: manifest.clone(), package_id: package.manifest.id.clone() }], autostart: vec![] };
+        let mut options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.into_os_string()]).unwrap();
+        options.install_registry = Some(registry);
+        options.install_root = Some(install);
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.storage_authority = Some(authority.clone());
+        session.begin_uninstall_with_purge(1).unwrap();
+        std::fs::write(&wasm, b"\0asm\x01\0\0\0changed").unwrap();
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        let error = session.respond_storage_prompt(true).unwrap_err();
+        assert!(format!("{error:#}").contains("DESKTOP_PACKAGE_CHANGED"));
+        assert!(session.storage_prompt().is_none());
+        assert!(!session.catalog.apps.is_empty());
+        assert!(!session.options.install_registry.as_ref().unwrap().is_removed("dev.example.purge.changed").unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn declared_private_storage_launch_does_not_request_consent() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
@@ -2029,6 +2719,8 @@ mod input_backpressure_tests {
                 app_data: None,
             });
             session.instances.push(Instance {
+                #[cfg(target_os = "linux")]
+                update_startup: None,
                 app,
                 window: Some(id),
                 record,
@@ -2180,6 +2872,8 @@ mod close_grace_tests {
             events:None, gpu_stats:None, error:None, isolation:None,
         });
         session.instances.push(Instance {
+            #[cfg(target_os = "linux")]
+            update_startup: None,
             app:1, window:None, record:0, bridge:bridge.clone(), events, result,
             worker:None, pid:Arc::new(AtomicU32::new(0)), sequence:0,
             closing:Some(Instant::now()-Duration::from_millis(250)),
@@ -2356,11 +3050,168 @@ mod close_grace_tests {
         }
     }
 
+    #[test]
+    fn normal_close_reply_does_not_inject_deadline_cancel_before_result() {
+        let (bridge, _events) = ViewBridge::new();
+        bridge.terminal_reply_written(crate::ui::TerminalReplyKind::Close);
+        let (_, cancelled) = bridge.cancel_if_executing();
+        assert!(!cancelled);
+        assert!(!bridge.cancel.load(Ordering::SeqCst));
+    }
+
 }
 
 #[cfg(test)]
 mod startup_policy_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+
+    #[cfg(target_os = "linux")]
+    fn pending_update_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<crate::app_data::PackageStorageAuthority>, [u8; 32], [u8; 32]) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let source = temp.path().join("source");
+        let install_root = temp.path().join("install");
+        let data_root = temp.path().join("data");
+        for path in [&source, &install_root, &data_root] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        let manifest = source.join("app.json");
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.desktop-update","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install_root).unwrap();
+        assert_eq!(registry.install_from_manifest(&manifest).unwrap(), crate::package_install::InstallState::Installed);
+        let old_manifest = registry.active_manifest_path("dev.example.desktop-update").unwrap();
+        let old_fingerprint = crate::package::load_package(&old_manifest).unwrap().storage_fingerprint();
+        drop(registry);
+
+        let authority = Arc::new(crate::app_data::PackageStorageAuthority::new(crate::app_data::AppDataRoot::open(&data_root).unwrap()));
+        authority.authorize("dev.example.desktop-update").unwrap();
+        authority.file_session("dev.example.desktop-update").unwrap().write_file("counter", b"42").unwrap();
+        authority.revoke("dev.example.desktop-update").unwrap();
+
+        fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0\x00").unwrap();
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.desktop-update","version":"1.1.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true,"dataMigration":{"fromVersion":"1.0.0","steps":[{"op":"ensureDir","path":"state"},{"op":"renameFile","from":"counter","to":"state/counter"}]}}"#).unwrap();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install_root).unwrap();
+        assert_eq!(registry.update_from_manifest(&manifest, &authority).unwrap(), crate::package_install::InstallState::Updated);
+        let new_manifest = registry.active_manifest_path("dev.example.desktop-update").unwrap();
+        let new_fingerprint = crate::package::load_package(&new_manifest).unwrap().storage_fingerprint();
+        drop(registry);
+        (temp, install_root, data_root, authority, old_fingerprint, new_fingerprint)
+    }
+    #[test]
+    fn update_confirmation_requires_exact_identity_and_complete_lifecycle() {
+        let expected = UpdateStartupIdentity { package_id: "dev.example.app".into(), version: "1.1.0".into(), fingerprint: [3; 32], app: 1, generation: 2, window: 7 };
+        let valid = UpdateStartupEvidence { identity: expected.clone(), worker_pid: 123, input_ready: true,
+            presented_source_sequence: 5, completed: true, result_accepted: true, native_exit_ok: true, reaped: true };
+        assert!(valid.confirms(&expected));
+        for field in 0..12 {
+            let mut invalid = valid.clone();
+            match field {
+                0 => invalid.identity.package_id = "dev.example.sibling".into(),
+                1 => invalid.identity.fingerprint = [4; 32],
+                2 => invalid.identity.app = 2,
+                3 => invalid.identity.generation = 1,
+                4 => invalid.identity.window = 6,
+                5 => invalid.worker_pid = 0,
+                6 => invalid.input_ready = false,
+                7 => invalid.presented_source_sequence = 0,
+                8 => invalid.completed = false,
+                9 => invalid.result_accepted = false,
+                10 => invalid.native_exit_ok = false,
+                11 => invalid.reaped = false,
+                _ => unreachable!(),
+            }
+            assert!(!invalid.confirms(&expected), "missing confirmation field {field}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_startup_confirmation_commits_pending_update() {
+        let (_temp, install_root, data_root, authority, _old_fingerprint, new_fingerprint) = pending_update_fixture();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install_root).unwrap();
+        let catalog = Catalog {
+            apps: vec![crate::desktop_catalog::CatalogEntry {
+                id: 1,
+                title: "Updated".into(),
+                manifest_path: registry.active_manifest_path("dev.example.desktop-update").unwrap(),
+                package_id: "dev.example.desktop-update".into(),
+                package_fingerprint: new_fingerprint,
+            }],
+            autostart: vec![],
+        };
+        let mut options = DesktopOptions::parse([
+            "unused".into(), "--renderer".into(), "cpu".into(),
+            "--data-root".into(), data_root.clone().into_os_string(),
+        ]).unwrap();
+        options.install_root = Some(install_root);
+        options.install_registry = Some(registry);
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        session.storage_authority = Some(authority.clone());
+        let expected = UpdateStartupIdentity {
+            package_id: "dev.example.desktop-update".into(), version: "1.1.0".into(),
+            fingerprint: new_fingerprint, app: 1, generation: 2, window: 9,
+        };
+        assert!(session.options.install_registry.as_ref().unwrap().begin_update_startup("dev.example.desktop-update", new_fingerprint).unwrap());
+        let evidence = UpdateStartupEvidence {
+            identity: expected.clone(), worker_pid: 123, input_ready: true,
+            presented_source_sequence: 4, completed: true, result_accepted: true,
+            native_exit_ok: true, reaped: true,
+        };
+        session.finish_update_startup(&expected, &evidence).unwrap();
+        assert!(!session.options.install_registry.as_ref().unwrap().has_pending_update().unwrap());
+        authority.authorize("dev.example.desktop-update").unwrap();
+        assert_eq!(authority.file_session("dev.example.desktop-update").unwrap().read_file("state/counter").unwrap(), b"42");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_startup_failure_rolls_back_catalog_and_private_data() {
+        let (_temp, install_root, data_root, authority, old_fingerprint, new_fingerprint) = pending_update_fixture();
+        let registry = crate::package_install::PackageInstallRegistry::open(&install_root).unwrap();
+        let catalog = Catalog {
+            apps: vec![crate::desktop_catalog::CatalogEntry {
+                id: 1,
+                title: "Updated".into(),
+                manifest_path: registry.active_manifest_path("dev.example.desktop-update").unwrap(),
+                package_id: "dev.example.desktop-update".into(),
+                package_fingerprint: new_fingerprint,
+            }],
+            autostart: vec![],
+        };
+        let mut options = DesktopOptions::parse([
+            "unused".into(), "--renderer".into(), "cpu".into(),
+            "--data-root".into(), data_root.clone().into_os_string(),
+        ]).unwrap();
+        options.install_root = Some(install_root);
+        options.install_registry = Some(registry);
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        session.storage_authority = Some(authority.clone());
+        session.closing = Some(Instant::now());
+        let expected = UpdateStartupIdentity {
+            package_id: "dev.example.desktop-update".into(), version: "1.1.0".into(),
+            fingerprint: new_fingerprint, app: 1, generation: 2, window: 9,
+        };
+        assert!(session.options.install_registry.as_ref().unwrap().begin_update_startup("dev.example.desktop-update", new_fingerprint).unwrap());
+        let evidence = UpdateStartupEvidence {
+            identity: expected.clone(), worker_pid: 123, input_ready: true,
+            presented_source_sequence: 4, completed: false, result_accepted: true,
+            native_exit_ok: true, reaped: true,
+        };
+        session.finish_update_startup(&expected, &evidence).unwrap();
+        let entry = &session.catalog.apps[0];
+        assert_eq!(entry.package_fingerprint, old_fingerprint);
+        assert_eq!(crate::package::load_package(&entry.manifest_path).unwrap().manifest.version, "1.0.0");
+        assert!(!session.options.install_registry.as_ref().unwrap().has_pending_update().unwrap());
+        authority.authorize("dev.example.desktop-update").unwrap();
+        let session_data = authority.file_session("dev.example.desktop-update").unwrap();
+        assert_eq!(session_data.read_file("counter").unwrap(), b"42");
+        assert_eq!(session_data.read_file("state/counter"), Err(crate::app_data::AppDataError::NotFound));
+    }
+
     fn session() -> (Session, SyncSender<Result<Outcome>>) {
         let (mut s, _bridge, tx) = super::close_grace_tests::closing_session(crate::desktop_catalog::IsolationMode::Off);
         s.options.isolation = crate::desktop_catalog::IsolationMode::Strict;

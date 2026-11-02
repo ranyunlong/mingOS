@@ -82,6 +82,14 @@ def validate_state(state, boot_id, session_id=None, revision=None):
             raise ValueError("state root geometry")
         if root.get("presentedSequence") is not None and not integer(root["presentedSequence"]):
             raise ValueError("state root sequence")
+        prompt = root.get("storagePrompt")
+        if prompt is not None:
+            if (not isinstance(prompt, dict) or set(prompt) != {"mode", "packageId", "version", "hasAllow"}
+                or not integer(prompt.get("mode"), 0, 255)
+                or not isinstance(prompt.get("packageId"), str) or len(prompt["packageId"]) > 256
+                or not isinstance(prompt.get("version"), str) or len(prompt["version"]) > 16384
+                or type(prompt.get("hasAllow")) is not bool):
+                raise ValueError("state storage prompt")
     apps = state.get("apps")
     if not isinstance(apps, list) or len(apps) > 4:
         raise ValueError("state app count")
@@ -104,14 +112,35 @@ def validate_state(state, boot_id, session_id=None, revision=None):
     return state
 
 def state_ready(state, required):
-    if state.get("phase") != "ready" or (state.get("root", {}).get("presentedSequence") or 0) < 1:
+    root = state.get("root") or {}
+    if state.get("phase") != "ready" or (root.get("presentedSequence") or 0) < 1:
         return False
-    if state["root"]["width"] < 2 or state["root"]["height"] < 2:
+    if root.get("width", 0) < 2 or root.get("height", 0) < 2:
         return False
     apps = {app["app"]: app for app in state["apps"]}
     return all(app in apps and apps[app]["state"] in ("running", "ready") and apps[app].get("inputReady") is True
                and not apps[app].get("minimized", False) and (apps[app].get("workerPid") or 0) > 0
                and (apps[app].get("presentedSourceSequence") or 0) > 0 for app in required)
+
+def state_input_ready(state, required):
+    """Allow a step to target ready required apps while another desktop prompt is active."""
+    root = state.get("root") or {}
+    if state.get("phase") not in ("starting", "ready") or (root.get("presentedSequence") or 0) < 1:
+        return False
+    if root.get("width", 0) < 2 or root.get("height", 0) < 2:
+        return False
+    apps = {app["app"]: app for app in state["apps"]}
+    if state["phase"] == "starting" and root.get("storagePrompt") is None and not any(
+        app_id not in required and app.get("state") == "closed"
+        for app_id, app in apps.items()
+    ):
+        return False
+    return all(app in apps and apps[app]["state"] in ("running", "ready") and apps[app].get("inputReady") is True
+               and not apps[app].get("minimized", False) and (apps[app].get("workerPid") or 0) > 0
+               and (apps[app].get("presentedSourceSequence") or 0) > 0 for app in required)
+
+def now_root_prompt(state):
+    return (state.get("root") or {}).get("storagePrompt")
 
 KEYS = set("abcdefghijklmnopqrstuvwxyz0123456789") | {"esc", "ret", "spc", "tab", "backspace", "delete", "left", "right", "up", "down", "home", "end", "shift", "shift_r", "ctrl", "ctrl_r", "alt", "alt_r", "meta_l", "meta_r"}
 
@@ -199,7 +228,7 @@ class InputPlan:
             if not isinstance(apps, list) or any(not integer(x, 1, 65535) for x in apps):
                 raise ValueError("step requireApps")
             expect = step.get("expect", {})
-            if not isinstance(expect, dict) or set(expect) - {"phase", "rootAdvance", "sourceAdvance", "apps"}:
+            if not isinstance(expect, dict) or set(expect) - {"phase", "rootAdvance", "sourceAdvance", "apps", "storagePrompt"}:
                 raise ValueError("input expectation")
             if "phase" in expect and expect["phase"] not in ("ready", "stopping", "stopped", "failed"):
                 raise ValueError("input expected phase")
@@ -207,6 +236,14 @@ class InputPlan:
                 raise ValueError("input rootAdvance")
             if "sourceAdvance" in expect and (not isinstance(expect["sourceAdvance"], list) or any(not integer(x, 1, 65535) for x in expect["sourceAdvance"])):
                 raise ValueError("input sourceAdvance")
+            if "storagePrompt" in expect:
+                prompt = expect["storagePrompt"]
+                if prompt is not None and (not isinstance(prompt, dict) or set(prompt) != {"mode", "packageId", "version", "hasAllow"}
+                    or not integer(prompt.get("mode"), 0, 255)
+                    or not isinstance(prompt.get("packageId"), str)
+                    or not isinstance(prompt.get("version"), str)
+                    or type(prompt.get("hasAllow")) is not bool):
+                    raise ValueError("input storage prompt")
             if "apps" in expect:
                 conditions = expect["apps"]
                 if not isinstance(conditions, list) or not 1 <= len(conditions) <= 4:
@@ -245,7 +282,7 @@ class InputPlan:
                 and integer(receipt.get("pointer"), 1) and integer(receipt.get("surface"), 1)
                 and (self.root_surface is None or receipt["surface"] == self.root_surface)
                 and all(type(receipt.get(axis)) in (int, float) and abs(receipt[axis]-point[axis]) <= 1 for axis in ("x", "y")))
-            if not matching or not state_ready(state, step.get("requireApps", self.spec["requireApps"])): return
+            if not matching or not state_input_ready(state, step.get("requireApps", self.spec["requireApps"])): return
             self.root_surface = receipt["surface"]
             append_record(self.output, {"type": "input-pointer-ready", "step": step["name"], "receipt": receipt, "afterLogOffset": pending["afterLogOffset"], "state": state})
             self._send_transactions(qmp, pending["transactions"][1:])
@@ -264,6 +301,8 @@ class InputPlan:
             now = {a["app"]: a for a in state["apps"]}; old = {a["app"]: a for a in self.base["apps"]}
             if any(app not in now or (now[app].get("presentedSourceSequence") or 0) <= (old.get(app, {}).get("presentedSourceSequence") or 0) for app in expected.get("sourceAdvance", [])):
                 return
+            if "storagePrompt" in expected and now_root_prompt(state) != expected["storagePrompt"]:
+                return
             if any(condition["app"] not in now
                    or now[condition["app"]]["generation"] != condition["generation"]
                    or now[condition["app"]]["state"] != condition["state"]
@@ -272,7 +311,7 @@ class InputPlan:
             append_record(self.output, {"type": "input-expectation", "step": step["name"], "state": state})
             self.index += 1; self.waiting = False
             return
-        if not state_ready(state, step.get("requireApps", self.spec["requireApps"])):
+        if not state_input_ready(state, step.get("requireApps", self.spec["requireApps"])):
             return
         events = input_events(step["events"], state)
         if self.split_transactions and not self.routing_recorded:
@@ -280,7 +319,7 @@ class InputPlan:
             append_record(self.output, {"type": "input-routing", "mice": routing, "state": state})
             self.routing_recorded = True
         transactions = [events]
-        if self.split_transactions:
+        if self.split_transactions or any(event["type"] in ("abs", "btn") for event in events):
             transactions, absolute = [], []
             for event in events:
                 if event["type"] == "abs":

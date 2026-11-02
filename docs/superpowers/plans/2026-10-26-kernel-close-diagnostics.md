@@ -20,7 +20,7 @@
 - [x] 先写失败测试：stat 的带空格/括号 comm、CPU 与限流计数、路径边界、文件大小上限、进程退出与 PID/cgroup 身份变化。
 - [x] 最小实现采样模块，接入诊断 process-table，并同步 bundle 文件清单和源码摘要。
 - [x] 运行定向测试、全部 Boot 回归及 JavaScript 基础检查；核对工作区 diff。
-- [ ] 环境恢复后补父侧共用 Instant 的 Close 请求、SDK 回复写出、Result 接受及取消时间线，并以真实 kernel 恢复场景复验。
+- [x] 环境恢复后补父侧共用 Instant 的 Close 请求、SDK 回复写出、Result 接受及取消时间线，并以真实 kernel 恢复场景复验。
 
 ## 第一轮本机执行边界（后续状态见下文）
 
@@ -71,9 +71,13 @@ JavaScript 与 Boot Python 语法检查通过。新增测试先因采样模块/�
 
 工具镜像预加载 v2 已经验证内核包 SHA-256，但随后 QEMU/Weston 等多个包 HTTP 连接失败，镜像构建仍未成功。
 完整失败日志保留；HTTPS 尝试的证书校验失败也保留，未关闭证书或 APT 签名校验。原构建器要求的
-`mingos-isolation-probe`（SHA-256 `d213382d37e1496c5d5eb8ba31081d712395eb7b4e7ae19c7a4d7fd8aa028ccd`）
-与 `vm-prepare.sh`（`511336a8661fc3eb991e6c8b168c5615c7420f22baf3134eba72f3a111e15ac4`）不在当前仓库或 Git 历史中；
-也未找到生成源码。不能以重新生成不同字节或修改硬编码哈希冒充原冻结资格。缺失项清单见本轮证据目录的 `missing-frozen-probes.json`。
+此前记录的“冻结 probe 缺失”已在 2026-10-31 复核中纠正：
+`artifacts/linux-isolation/frozen/mingos-isolation-probe` 的 SHA-256 为
+`d213382d37e1496c5d5eb8ba31081d712395eb7b4e7ae19c7a4d7fd8aa028ccd`，
+`artifacts/linux-isolation/frozen/vm-prepare.sh` 的 SHA-256 为
+`511336a8661fc3eb991e6c8b168c5615c7420f22baf3134eba72f3a111e15ac4`，
+均与 legacy-v1 硬编码门槛精确匹配。source-v2 的 profile、源码和构建产物也存在，且 profile 中声明的两个 source-v2 artifact hash 与当前文件匹配；新增实际冻结文件回归后，隔离 profile 专项为 `8/8`，完整 Boot Python 套件为 `81/81`。
+v23 的 `session-review.json` 也已通过 `legacy-v1` review hash 绑定校验。这只解除冻结输入查找前置条件，不能替代 Docker/QEMU 运行、当前 Host/bundle 重建或 kernel recovery 验收。旧的 `missing-frozen-probes.json` 仍保留为历史诊断证据，不再代表当前文件状态。
 
 Counter 构建脚本原先在 macOS 的 JAVA_HOME 下拼接 `bin/java.exe`，已先实际复现 ENOENT，再按平台选择 Java 名称，
 保留 Windows 的默认 JBR 路径和专用 JVM 选项。新的 `local-package-20261026` 构建成功，SDK/Compose 保护哈希不变，
@@ -93,6 +97,14 @@ Counter 构建脚本原先在 macOS 的 JAVA_HOME 下拼接 `bin/java.exe`，已
 本轮最终本地基础检查：Boot55/55、Node24/24、JS 语法与 `git diff --check` 通过。
 严格 guest/QMP/Dock 资格与父侧同源时间线仍未完成；缺失冻结探针和工具镜像下载问题保持可追踪。
 
+## 2026-11-01 当前修复的真实 kernel 复验
+
+当前修复把 deadline cancellation 限定为尚未写出正常 Close 回复的 worker；正常 Close 回复已写出后由既有 native-exit watchdog 约束清理，不扩大 fuel、CPU、memory、pids 或 Result 预算。Windows 定向回归、新 trusted Host v9 release build、source-v2 bundle 重建均通过。
+
+使用原始七步 InputPlan 做两次 fresh QEMU cold boot，独立新盘 UUID `ab0a759c-ba21-4e19-8885-615b8cb5c7d6`，bundle identity `79313543769d60c13e4f014f8c30156e2b7d12ece2f2332e5931a0af542f0812`。独立审计 15/15 通过：6/6 lifecycle instances natural outcome、0 `APP_CANCELLED`、6/6 `result-accepted`、worker reap/cgroup cleanup、数据同步卸载、kernel PowerDown 和诊断完整性均通过。
+
+证据：`artifacts/linux-current-20261101/current-source-recovery-v3/independent-audit.json`、`root-fix-review-v1.json`。该轮只验证当前 trusted Host 与 kernel recovery scope；完整系统交付仍需物理输入/硬件 GPU、发布者安装生命周期、多用户身份和跨平台安装服务等独立门槛。
+
 
 ## 2026-10-27 父侧时间线续进
 
@@ -100,3 +112,11 @@ Counter 构建脚本原先在 macOS 的 JAVA_HOME 下拼接 `bin/java.exe`，已
 release库203/203、桌面1/1、帧时钟7/7、真实取消130/130、冻结 Kotlin Text 关闭/重启/输入审计35/35。
 [完整记录](../../close-lifecycle-verification.md)区分 pipe flush、应用处理、Result 与回收；Strict2s/Off200ms 和原资源预算保持。
 本计划上面的最终复选项仍未勾选：真实 kernel 恢复复验尚缺原冻结探针与可用工具镜像，不能用 offscreen 结果替代。
+
+## 2026-10-31 宿主回归兼容性修复
+
+Boot 资源采样本身仍以 Linux guest 的 `os.sysconf("SC_CLK_TCK")` 为准；宿主侧合成测试在 Windows 没有该 POSIX API，导致 `process_table(resources=True)` 的两个测试错误。新增 `process_table(..., clock_ticks=...)` 注入，仅测试夹具传入明确的 `100` ticks/s，生产 guest 调用路径和收据单位不变。
+
+修复后固定 Python 运行时的 Boot unittest 为 `80/80`，仓库 Node 测试为 `21 passed, 3 skipped, 0 failed`。证据保存在 `artifacts/kernel-close-diagnostics-local-20261031/`。这只修复宿主回归兼容性，不改变父侧 Close 时间线、资源限制或 kernel 资格；最后一项真实 kernel/QMP 复验仍未完成。
+
+2026-10-31 目标恢复后的本地复跑：使用当前工作树和 Codex bundled Python/Node，完整 Boot unittest 为 `81/81`，Node 为 `21 passed, 3 skipped, 0 failed`，`git diff --check` 通过。新增的 isolation profile 文件哈希回归包含在 81 项中；结果见 `artifacts/local-regression-20261031-resumed.json`。这些是宿主脚本和用户态回归证据，不替代 Linux-only purge、当前 Host/bundle 重建、QEMU 或真实 kernel recovery。

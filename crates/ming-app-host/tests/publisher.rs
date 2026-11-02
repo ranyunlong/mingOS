@@ -15,6 +15,7 @@ fn unsigned_package() -> Package {
             entry: "main.wasm".into(),
             private_storage: false,
             public_storage: false,
+            data_migration: None,
             publisher_key_id: None,
             publisher_signature: None,
         },

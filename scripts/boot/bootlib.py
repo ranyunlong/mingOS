@@ -5,6 +5,11 @@ import socket
 import time
 from pathlib import Path, PurePosixPath
 
+PERSISTENT_UPDATE_INSTALL_ROOT = "/data/mingos/install-root"
+INSTALL_LIFECYCLE_INSTALL_ROOT = "/opt/mingos/install-root"
+INSTALL_LIFECYCLE_EVENTS = "/opt/mingos/install-events.json"
+INSTALL_LIFECYCLE_SOURCE = "/opt/mingos/install-source/app.json"
+
 def sha256(path):
     with Path(path).open("rb") as source:
         return hashlib.file_digest(source, "sha256").hexdigest()
@@ -29,6 +34,20 @@ def checked_session(review, payload):
     mode, extra = review.get("sessionMode"), review.get("extraArgs")
     if mode not in ("bounded", "long-lived") or not isinstance(extra, list):
         raise ValueError("explicit sessionMode and extraArgs required")
+    install_root = review.get("installRoot")
+    if install_root is not None:
+        if (not isinstance(install_root, str) or not install_root.startswith("/")
+                or "\0" in install_root or install_root.endswith("/")
+                or any(part in ("", ".", "..") for part in install_root.split("/")[1:])):
+            raise ValueError("invalid reviewed install root")
+    if review.get("profile") == "data-text-update" and install_root != PERSISTENT_UPDATE_INSTALL_ROOT:
+        raise ValueError("update profile requires persistent install root")
+    if review.get("profile") == "install-lifecycle" and install_root != INSTALL_LIFECYCLE_INSTALL_ROOT:
+        raise ValueError("install profile requires reviewed private install root")
+    if review.get("profile") == "install-lifecycle" and review.get("installEvents") != INSTALL_LIFECYCLE_EVENTS:
+        raise ValueError("install profile requires reviewed event path")
+    if review.get("profile") == "install-lifecycle" and review.get("installSource") != INSTALL_LIFECYCLE_SOURCE:
+        raise ValueError("install profile requires reviewed install source")
     if any(not isinstance(arg, str) or "\0" in arg for arg in extra):
         raise ValueError("invalid session argument")
     if any(arg.split("=", 1)[0] in ("--backend", "--renderer", "--snapshot", "--events") for arg in extra):
@@ -48,7 +67,7 @@ def checked_session(review, payload):
 def validate_reviewed_input(review, path):
     expected = review.get("inputScriptSha256")
     if expected is None:
-        if review.get("profile") in ("data-text", "data-text-private-probe", "data-text-public-probe"):
+        if review.get("profile") in ("data-text", "data-text-update", "install-lifecycle", "data-text-private-probe", "data-text-public-probe"):
             raise ValueError("data-text input script review hash required")
         return
     if path is None or sha256(path) != expected:

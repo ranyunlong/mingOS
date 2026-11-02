@@ -7,6 +7,7 @@
 use crate::{app_data::{PackageStorageAuthority, valid_package_id}, package::{Package, load_package}};
 use crate::publisher::PublisherTrustStore;
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -21,6 +22,8 @@ const HEADER: &str = "ming-installed-packages-v1\n";
 const RECORD_NAME: &str = "installed-packages-v1";
 const LOCK_NAME: &str = ".ming-installed-packages.lock";
 const CONTENT_DIR_NAME: &str = "packages";
+const JOURNAL_NAME: &str = "update-journal-v1";
+const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -30,6 +33,16 @@ pub enum InstallState {
     Unchanged,
     Updated,
     Reinstalled,
+}
+
+/// Identity of an update whose new package is active but whose data backup is
+/// still retained until the desktop reports a successful startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpdate {
+    pub package_id: String,
+    pub old_version: String,
+    pub new_version: String,
+    pub new_fingerprint: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -57,8 +70,39 @@ struct Record {
     state: RecordState,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InstallRollback {
+    package_id: String,
+    previous: Option<Record>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateJournal {
+    package_id: String,
+    old_version: String,
+    old_fingerprint: String,
+    new_version: String,
+    new_fingerprint: String,
+    backup_name: String,
+    migration_declared: bool,
+    phase: UpdatePhase,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum UpdatePhase {
+    Planned,
+    DataSwapped,
+    RecordPublished,
+    StartupAttempted,
+    StartupConfirmed,
+    RollingBack,
+}
+
 pub struct PackageInstallRegistry {
     root: PathBuf,
+    operation: Mutex<()>,
     records: Mutex<BTreeMap<String, Record>>,
     lock: File,
     publisher_trust: Option<PublisherTrustStore>,
@@ -112,10 +156,13 @@ impl PackageInstallRegistry {
             }
         }
         let records = load_records(root.join(RECORD_NAME))?;
-        Ok(Self { root: root.to_path_buf(), records: Mutex::new(records), lock, publisher_trust })
+        Ok(Self { root: root.to_path_buf(), operation: Mutex::new(()), records: Mutex::new(records), lock, publisher_trust })
     }
 
     pub fn install_package(&self, package: &Package) -> Result<InstallState> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
+        if package.manifest.data_migration.is_some() { bail!("INSTALL_MIGRATION_REQUIRES_UPDATE"); }
         self.verify_publisher(package)?;
         let id = &package.manifest.id;
         validate_package_record(id, &package.manifest.version)?;
@@ -140,7 +187,10 @@ impl PackageInstallRegistry {
     /// Loads a package through the trusted parent, stores its content under an immutable
     /// versioned directory, and then publishes the matching active record atomically.
     pub fn install_from_manifest(&self, manifest_path: &Path) -> Result<InstallState> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         let package = load_package(manifest_path).context("INSTALL_PACKAGE_LOAD")?;
+        if package.manifest.data_migration.is_some() { bail!("INSTALL_MIGRATION_REQUIRES_UPDATE"); }
         self.verify_publisher(&package)?;
         validate_package_record(&package.manifest.id, &package.manifest.version)?;
         let candidate = Record {
@@ -173,6 +223,232 @@ impl PackageInstallRegistry {
         Ok(state)
     }
 
+    /// Captures the registry state immediately before a desktop install so a
+    /// later catalog write failure can restore the exact prior record.
+    pub(crate) fn prepare_install_rollback(&self, package_id: &str) -> Result<InstallRollback> {
+        if !valid_package_id(package_id) {
+            bail!("INSTALL_PACKAGE_ID");
+        }
+        let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        Ok(InstallRollback { package_id: package_id.to_owned(), previous: records.get(package_id).cloned() })
+    }
+
+    /// Restores the record captured by `prepare_install_rollback` after a
+    /// desktop catalog transaction fails. Versioned package content is kept as
+    /// an auditable immutable artifact; only the active registry record is
+    /// restored.
+    pub(crate) fn rollback_install(
+        &self,
+        rollback: InstallRollback,
+        version: &str,
+        fingerprint: [u8; 32],
+    ) -> Result<()> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let mut records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let current = records.get(&rollback.package_id).cloned().context("INSTALL_ROLLBACK_RECORD_MISSING")?;
+        if current.state != RecordState::Active || current.version != version || current.fingerprint != fingerprint {
+            bail!("INSTALL_ROLLBACK_RECORD_MISMATCH");
+        }
+        let previous_records = records.clone();
+        match rollback.previous {
+            Some(previous) => { records.insert(rollback.package_id, previous); }
+            None => { records.remove(&rollback.package_id); }
+        }
+        if let Err(error) = self.persist_locked(&records) {
+            *records = previous_records;
+            return Err(error).context("INSTALL_ROLLBACK_RECORD");
+        }
+        Ok(())
+    }
+
+    /// Publishes an update with a retained snapshot of the old private files.
+    /// The backup survives until a matching desktop startup is confirmed.
+    pub fn update_from_manifest(&self, manifest_path: &Path, authority: &PackageStorageAuthority) -> Result<InstallState> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.recover_pending_update_locked(authority)?;
+        if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
+        let package = load_package(manifest_path).context("INSTALL_PACKAGE_LOAD")?;
+        self.verify_publisher(&package)?;
+        validate_package_record(&package.manifest.id, &package.manifest.version)?;
+        let mut records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let old = records.get(&package.manifest.id).context("INSTALL_NOT_FOUND")?.clone();
+        if old.state != RecordState::Active { bail!("INSTALL_PACKAGE_REMOVED"); }
+        let candidate = Record { version: package.manifest.version.clone(), fingerprint: package.storage_fingerprint(), state: RecordState::Active };
+        let state = next_state(Some(&old), &candidate)?;
+        if state == InstallState::Unchanged { return Ok(state); }
+        if state != InstallState::Updated { bail!("INSTALL_UPDATE_REQUIRED"); }
+        if let Some(migration) = &package.manifest.data_migration {
+            if migration.from_version != old.version { bail!("INSTALL_MIGRATION_SOURCE"); }
+        }
+        // A usable old package is required for rollback, including updates
+        // without a declared layout migration.
+        let old_path = self.content_path(&package.manifest.id, &old).join("app.json");
+        let old_package = load_package(&old_path).context("INSTALL_UPDATE_OLD_CONTENT")?;
+        if old_package.manifest.id != package.manifest.id || old_package.manifest.version != old.version
+            || old_package.storage_fingerprint() != old.fingerprint {
+            bail!("INSTALL_UPDATE_OLD_CONTENT_MISMATCH");
+        }
+        self.verify_publisher(&old_package)?;
+        let content_path = self.content_path(&package.manifest.id, &candidate);
+        match fs::symlink_metadata(&content_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() { bail!("INSTALL_CONTENT_DIRECTORY"); }
+                self.verify_stored_package(&content_path, &package)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.stage_package(&content_path, &package)?,
+            Err(error) => return Err(error).context("INSTALL_CONTENT_METADATA"),
+        }
+        let mut journal = UpdateJournal {
+            package_id: package.manifest.id.clone(),
+            old_version: old.version.clone(),
+            old_fingerprint: hex(&old.fingerprint),
+            new_version: candidate.version.clone(),
+            new_fingerprint: hex(&candidate.fingerprint),
+            backup_name: format!(".ming-update-backup-{}-{}", std::process::id(), TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
+            migration_declared: package.manifest.data_migration.is_some(),
+            phase: UpdatePhase::Planned,
+        };
+        self.persist_journal(&journal)?;
+        let unchanged_layout = crate::package::DataMigration { from_version: old.version, steps: Vec::new() };
+        let plan = package.manifest.data_migration.as_ref().unwrap_or(&unchanged_layout);
+        let result = (|| -> Result<()> {
+            authority.begin_private_data_migration_with_backup(&package.manifest.id, plan, &journal.backup_name)
+                .map_err(|error| anyhow::anyhow!("INSTALL_MIGRATION: {error}"))?;
+            journal.phase = UpdatePhase::DataSwapped;
+            self.persist_journal(&journal)?;
+            records.insert(package.manifest.id.clone(), candidate);
+            self.persist_locked(&records)?;
+            journal.phase = UpdatePhase::RecordPublished;
+            self.persist_journal(&journal)?;
+            Ok(())
+        })();
+        drop(records);
+        if let Err(error) = result {
+            return match self.rollback_pending_update_locked(authority) {
+                Ok(_) => Err(error),
+                Err(recovery) => Err(error.context(format!("INSTALL_UPDATE_ROLLBACK_PENDING: {recovery:#}"))),
+            };
+        }
+        Ok(state)
+    }
+
+    /// Recovers interrupted writes. A published, never-attempted update can be
+    /// tried once; interrupted startup or rollback restores the old version.
+    pub fn recover_pending_update(&self, authority: &PackageStorageAuthority) -> Result<bool> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.recover_pending_update_locked(authority)
+    }
+
+    fn recover_pending_update_locked(&self, authority: &PackageStorageAuthority) -> Result<bool> {
+        let Some(journal) = self.load_journal()? else { return Ok(false); };
+        let current = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?
+            .get(&journal.package_id).cloned().context("INSTALL_UPDATE_RECORD_MISSING")?;
+        let new_matches = current.state == RecordState::Active
+            && current.version == journal.new_version && hex(&current.fingerprint) == journal.new_fingerprint;
+        if new_matches && journal.phase == UpdatePhase::RecordPublished { return Ok(false); }
+        if new_matches && journal.phase == UpdatePhase::StartupConfirmed {
+            let transaction = crate::app_data::PrivateMigrationTransaction {
+                package_id: journal.package_id, backup_name: journal.backup_name,
+            };
+            authority.commit_private_data_migration(&transaction)
+                .map_err(|error| anyhow::anyhow!("INSTALL_UPDATE_RECOVERY_COMMIT: {error}"))?;
+            self.clear_journal()?;
+            return Ok(true);
+        }
+        self.rollback_pending_update_locked(authority)
+    }
+
+    pub fn has_pending_update(&self) -> Result<bool> {
+        Ok(self.load_journal()?.is_some())
+    }
+
+    pub fn pending_update(&self) -> Result<Option<PendingUpdate>> {
+        let Some(journal) = self.load_journal()? else { return Ok(None); };
+        if !matches!(journal.phase, UpdatePhase::RecordPublished | UpdatePhase::StartupAttempted) { return Ok(None); }
+        Ok(Some(PendingUpdate {
+            package_id: journal.package_id,
+            old_version: journal.old_version,
+            new_version: journal.new_version,
+            new_fingerprint: decode_hex(&journal.new_fingerprint)?,
+        }))
+    }
+
+    pub(crate) fn begin_update_startup(&self, package_id: &str, fingerprint: [u8; 32]) -> Result<bool> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let Some(mut journal) = self.load_journal()? else { return Ok(false); };
+        if journal.package_id != package_id { return Ok(false); }
+        if journal.phase != UpdatePhase::RecordPublished || decode_hex(&journal.new_fingerprint)? != fingerprint {
+            bail!("INSTALL_UPDATE_STARTUP_STATE");
+        }
+        journal.phase = UpdatePhase::StartupAttempted;
+        self.persist_journal(&journal)?;
+        Ok(true)
+    }
+
+    /// Called only by the trusted desktop after validating the complete receipt.
+    pub(crate) fn confirm_pending_update(
+        &self, authority: &PackageStorageAuthority, package_id: &str, version: &str, fingerprint: [u8; 32],
+    ) -> Result<bool> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let Some(mut journal) = self.load_journal()? else { return Ok(false); };
+        if journal.phase != UpdatePhase::StartupAttempted || journal.package_id != package_id
+            || journal.new_version != version || decode_hex(&journal.new_fingerprint)? != fingerprint {
+            bail!("INSTALL_UPDATE_CONFIRMATION_MISMATCH");
+        }
+        let current = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?
+            .get(package_id).cloned().context("INSTALL_UPDATE_RECORD_MISSING")?;
+        if current.state != RecordState::Active || current.version != journal.new_version
+            || hex(&current.fingerprint) != journal.new_fingerprint {
+            bail!("INSTALL_UPDATE_CONFIRMATION_RECORD");
+        }
+        // Persist the commit decision before deleting any backup bytes.
+        journal.phase = UpdatePhase::StartupConfirmed;
+        self.persist_journal(&journal)?;
+        let transaction = crate::app_data::PrivateMigrationTransaction {
+            package_id: journal.package_id, backup_name: journal.backup_name,
+        };
+        authority.commit_private_data_migration(&transaction)
+            .map_err(|error| anyhow::anyhow!("INSTALL_UPDATE_CONFIRMATION_COMMIT: {error}"))?;
+        self.clear_journal()?;
+        Ok(true)
+    }
+
+    /// Restores both the old record and the old tree. A durable RollingBack
+    /// decision makes all rename/record crash windows retryable on reopening.
+    pub fn rollback_pending_update(&self, authority: &PackageStorageAuthority) -> Result<bool> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.rollback_pending_update_locked(authority)
+    }
+
+    fn rollback_pending_update_locked(&self, authority: &PackageStorageAuthority) -> Result<bool> {
+        let Some(mut journal) = self.load_journal()? else { return Ok(false); };
+        if journal.phase == UpdatePhase::StartupConfirmed { bail!("INSTALL_UPDATE_ALREADY_CONFIRMED"); }
+        let mut records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let current = records.get(&journal.package_id).context("INSTALL_UPDATE_RECORD_MISSING")?;
+        let old_matches = current.state == RecordState::Active && current.version == journal.old_version
+            && hex(&current.fingerprint) == journal.old_fingerprint;
+        let new_matches = current.state == RecordState::Active && current.version == journal.new_version
+            && hex(&current.fingerprint) == journal.new_fingerprint;
+        if !old_matches && !new_matches { bail!("INSTALL_UPDATE_ROLLBACK_RECORD"); }
+        journal.phase = UpdatePhase::RollingBack;
+        self.persist_journal(&journal)?;
+        let previous = records.clone();
+        records.insert(journal.package_id.clone(), Record {
+            version: journal.old_version, fingerprint: decode_hex(&journal.old_fingerprint)?, state: RecordState::Active,
+        });
+        if let Err(error) = self.persist_locked(&records) {
+            *records = previous;
+            return Err(error);
+        }
+        let transaction = crate::app_data::PrivateMigrationTransaction {
+            package_id: journal.package_id, backup_name: journal.backup_name,
+        };
+        authority.rollback_private_data_migration(&transaction)
+            .map_err(|error| anyhow::anyhow!("INSTALL_UPDATE_ROLLBACK_DATA: {error}"))?;
+        self.clear_journal()?;
+        Ok(true)
+    }
+
     pub fn active_manifest_path(&self, package_id: &str) -> Result<PathBuf> {
         if !valid_package_id(package_id) { bail!("INSTALL_PACKAGE_ID"); }
         let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
@@ -190,7 +466,17 @@ impl PackageInstallRegistry {
         Ok(path)
     }
 
+    /// Reports the persisted lifecycle state without reloading package content.
+    /// A missing record is not considered removed.
+    pub fn is_removed(&self, package_id: &str) -> Result<bool> {
+        if !valid_package_id(package_id) { bail!("INSTALL_PACKAGE_ID"); }
+        let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        Ok(records.get(package_id).is_some_and(|record| record.state == RecordState::Removed))
+    }
+
     pub fn uninstall(&self, package_id: &str) -> Result<bool> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         if !valid_package_id(package_id) {
             bail!("INSTALL_PACKAGE_ID");
         }
@@ -222,12 +508,29 @@ impl PackageInstallRegistry {
     }
 
     pub fn verify_package(&self, package: &Package) -> Result<()> {
-        self.verify_publisher(package)?;
+        self.verify_package_identity(package)?;
         let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
         let record = records.get(&package.manifest.id).context("INSTALL_NOT_REGISTERED")?;
         if record.state != RecordState::Active {
             bail!("INSTALL_PACKAGE_REMOVED");
         }
+        Ok(())
+    }
+
+    /// Verifies a package that has not been registered yet. This is the
+    /// parent-side check used by the desktop install confirmation flow; it
+    /// never grants an active install record by itself.
+    pub fn verify_package_source(&self, package: &Package) -> Result<()> {
+        self.verify_publisher(package)
+    }
+
+    /// Verifies the stored package identity and publisher without requiring an
+    /// active lifecycle state. Purge retry uses this after the registry entry
+    /// has already been marked removed.
+    pub fn verify_package_identity(&self, package: &Package) -> Result<()> {
+        self.verify_publisher(package)?;
+        let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let record = records.get(&package.manifest.id).context("INSTALL_NOT_REGISTERED")?;
         if record.version != package.manifest.version
             || record.fingerprint != package.storage_fingerprint()
         {
@@ -241,6 +544,58 @@ impl PackageInstallRegistry {
             trust.verify_package(package).context("INSTALL_PUBLISHER")?;
         }
         Ok(())
+    }
+
+    fn journal_path(&self) -> PathBuf { self.root.join(JOURNAL_NAME) }
+
+    fn load_journal(&self) -> Result<Option<UpdateJournal>> {
+        let path = self.journal_path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("INSTALL_UPDATE_JOURNAL_METADATA"),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_JOURNAL_BYTES {
+            bail!("INSTALL_UPDATE_JOURNAL_FILE");
+        }
+        verify_private_owner(&metadata, "INSTALL_UPDATE_JOURNAL_PERMISSIONS")?;
+        let bytes = crate::package::read_bounded(&path, MAX_JOURNAL_BYTES as usize, "INSTALL_UPDATE_JOURNAL")?;
+        let journal: UpdateJournal = serde_json::from_slice(&bytes).context("INSTALL_UPDATE_JOURNAL_JSON")?;
+        validate_package_record(&journal.package_id, &journal.old_version)?;
+        validate_package_record(&journal.package_id, &journal.new_version)?;
+        let _ = decode_hex(&journal.old_fingerprint)?;
+        let _ = decode_hex(&journal.new_fingerprint)?;
+        if !crate::package::version_is_newer(&journal.new_version, &journal.old_version) {
+            bail!("INSTALL_UPDATE_JOURNAL_VERSION");
+        }
+        if !crate::app_data::valid_migration_backup_name(&journal.backup_name) {
+            bail!("INSTALL_UPDATE_JOURNAL_BACKUP");
+        }
+        Ok(Some(journal))
+    }
+
+    fn persist_journal(&self, journal: &UpdateJournal) -> Result<()> {
+        let bytes = serde_json::to_vec(journal).context("INSTALL_UPDATE_JOURNAL_SERIALIZE")?;
+        if bytes.len() > MAX_JOURNAL_BYTES as usize { bail!("INSTALL_UPDATE_JOURNAL_TOO_LARGE"); }
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = self.root.join(format!(".ming-update-journal.tmp-{}-{sequence}", std::process::id()));
+        let result = (|| -> Result<()> {
+            write_private_file(&temporary, &bytes).context("INSTALL_UPDATE_JOURNAL_TEMP")?;
+            fs::rename(&temporary, self.journal_path()).context("INSTALL_UPDATE_JOURNAL_RENAME")?;
+            File::open(&self.root).context("INSTALL_UPDATE_ROOT_OPEN")?.sync_all().context("INSTALL_UPDATE_ROOT_SYNC")?;
+            Ok(())
+        })();
+        if result.is_err() { let _ = fs::remove_file(&temporary); }
+        result
+    }
+
+    fn clear_journal(&self) -> Result<()> {
+        match fs::remove_file(self.journal_path()) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error).context("INSTALL_UPDATE_JOURNAL_REMOVE"),
+        }
+        File::open(&self.root)?.sync_all().context("INSTALL_UPDATE_JOURNAL_REMOVE_SYNC")
     }
 
     fn persist_locked(&self, records: &BTreeMap<String, Record>) -> Result<()> {
@@ -382,7 +737,7 @@ fn next_state(existing: Option<&Record>, candidate: &Record) -> Result<InstallSt
         Some(existing) if existing.state == RecordState::Removed
             && existing.version == candidate.version
             && existing.fingerprint == candidate.fingerprint => Ok(InstallState::Reinstalled),
-        Some(existing) if !version_is_newer(&candidate.version, &existing.version) => {
+        Some(existing) if !crate::package::version_is_newer(&candidate.version, &existing.version) => {
             bail!("INSTALL_VERSION_NOT_NEWER");
         }
         Some(existing) if existing.state == RecordState::Removed => Ok(InstallState::Reinstalled),
@@ -399,22 +754,6 @@ fn validate_package_record(id: &str, version: &str) -> Result<()> {
 fn valid_version(version: &str) -> bool {
     let parts: Vec<_> = version.split('.').collect();
     parts.len() == 3 && parts.iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-}
-
-fn version_is_newer(candidate: &str, previous: &str) -> bool {
-    for (candidate_part, previous_part) in candidate.split('.').zip(previous.split('.')) {
-        let candidate_part = candidate_part.trim_start_matches('0');
-        let previous_part = previous_part.trim_start_matches('0');
-        let candidate_part = if candidate_part.is_empty() { "0" } else { candidate_part };
-        let previous_part = if previous_part.is_empty() { "0" } else { previous_part };
-        if candidate_part.len() != previous_part.len() {
-            return candidate_part.len() > previous_part.len();
-        }
-        if candidate_part != previous_part {
-            return candidate_part > previous_part;
-        }
-    }
-    false
 }
 
 fn decode_hex(value: &str) -> Result<[u8; 32]> {
@@ -479,3 +818,134 @@ fn verify_private_owner(metadata: &std::fs::Metadata, error: &str) -> Result<()>
 
 #[cfg(not(target_os = "linux"))]
 fn verify_private_owner(_metadata: &std::fs::Metadata, _error: &str) -> Result<()> { Ok(()) }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::app_data::{AppDataRoot, AppDataError};
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+    fn pending_update_fixture() -> (tempfile::TempDir, PathBuf, Arc<PackageStorageAuthority>, [u8; 32]) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let source = temp.path().join("source");
+        let install_root = temp.path().join("install");
+        let data_root = temp.path().join("data");
+        for path in [&source, &install_root, &data_root] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        let manifest = source.join("app.json");
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.installed","version":"1.0.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true}"#).unwrap();
+        {
+            let registry = PackageInstallRegistry::open(&install_root).unwrap();
+            assert_eq!(registry.install_from_manifest(&manifest).unwrap(), InstallState::Installed);
+        }
+        let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&data_root).unwrap()));
+        authority.authorize("dev.example.installed").unwrap();
+        authority.file_session("dev.example.installed").unwrap().write_file("counter", b"42").unwrap();
+        authority.revoke("dev.example.installed").unwrap();
+
+        fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0\x00").unwrap();
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.installed","version":"1.1.0","sdkVersion":6,"entry":"main.wasm","privateStorage":true,"dataMigration":{"fromVersion":"1.0.0","steps":[{"op":"ensureDir","path":"state"},{"op":"renameFile","from":"counter","to":"state/counter"}]}}"#).unwrap();
+        {
+            let registry = PackageInstallRegistry::open(&install_root).unwrap();
+            assert_eq!(registry.update_from_manifest(&manifest, &authority).unwrap(), InstallState::Updated);
+        }
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        let active = registry.active_manifest_path("dev.example.installed").unwrap();
+        let fingerprint = load_package(&active).unwrap().storage_fingerprint();
+        drop(registry);
+        (temp, install_root, authority, fingerprint)
+    }
+
+    #[test]
+    fn pending_update_reopens_and_preserves_startup_retry_after_record_publish() {
+        let (_temp, install_root, authority, new_fingerprint) = pending_update_fixture();
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        assert!(registry.has_pending_update().unwrap());
+        drop(registry);
+
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        assert!(!registry.recover_pending_update(&authority).unwrap());
+        assert!(registry.has_pending_update().unwrap());
+        let active = registry.active_manifest_path("dev.example.installed").unwrap();
+        assert_eq!(load_package(&active).unwrap().manifest.version, "1.1.0");
+        assert!(registry.begin_update_startup("dev.example.installed", new_fingerprint).unwrap());
+        drop(registry);
+
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        assert!(registry.recover_pending_update(&authority).unwrap());
+        assert!(!registry.has_pending_update().unwrap());
+        let active = registry.active_manifest_path("dev.example.installed").unwrap();
+        assert_eq!(load_package(&active).unwrap().manifest.version, "1.0.0");
+        authority.authorize("dev.example.installed").unwrap();
+        let session = authority.file_session("dev.example.installed").unwrap();
+        assert_eq!(session.read_file("counter").unwrap(), b"42");
+        assert_eq!(session.read_file("state/counter"), Err(AppDataError::NotFound));
+    }
+
+    #[test]
+    fn startup_attempted_update_reopens_and_rolls_back_after_process_restart() {
+        let (_temp, install_root, authority, new_fingerprint) = pending_update_fixture();
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        assert!(registry.begin_update_startup("dev.example.installed", new_fingerprint).unwrap());
+        drop(registry);
+
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        assert!(registry.recover_pending_update(&authority).unwrap());
+        assert!(!registry.has_pending_update().unwrap());
+        let active = registry.active_manifest_path("dev.example.installed").unwrap();
+        assert_eq!(load_package(&active).unwrap().manifest.version, "1.0.0");
+        authority.authorize("dev.example.installed").unwrap();
+        assert_eq!(authority.file_session("dev.example.installed").unwrap().read_file("counter").unwrap(), b"42");
+    }
+
+    #[test]
+    fn startup_confirmation_commits_migration_and_clears_journal() {
+        let (_temp, install_root, authority, new_fingerprint) = pending_update_fixture();
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        assert!(registry.begin_update_startup("dev.example.installed", new_fingerprint).unwrap());
+        assert!(registry.confirm_pending_update(&authority, "dev.example.installed", "1.1.0", new_fingerprint).unwrap());
+        assert!(!registry.has_pending_update().unwrap());
+        assert!(!registry.recover_pending_update(&authority).unwrap());
+        let active = registry.active_manifest_path("dev.example.installed").unwrap();
+        assert_eq!(load_package(&active).unwrap().manifest.version, "1.1.0");
+        authority.authorize("dev.example.installed").unwrap();
+        let session = authority.file_session("dev.example.installed").unwrap();
+        assert_eq!(session.read_file("state/counter").unwrap(), b"42");
+        assert_eq!(session.read_file("counter"), Err(AppDataError::NotFound));
+    }
+
+    #[test]
+    fn catalog_failure_rollback_restores_an_absent_install_record() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let source = temp.path().join("source");
+        let install_root = temp.path().join("install");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&install_root).unwrap();
+        for path in [&source, &install_root] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        let manifest = source.join("app.json");
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.rollback","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        let rollback = registry.prepare_install_rollback("dev.example.rollback").unwrap();
+        let package = load_package(&manifest).unwrap();
+        assert_eq!(registry.install_from_manifest(&manifest).unwrap(), InstallState::Installed);
+        registry.rollback_install(rollback, &package.manifest.version, package.storage_fingerprint()).unwrap();
+        assert!(registry.active_manifest_path("dev.example.rollback").is_err());
+        let records = fs::read_to_string(install_root.join(RECORD_NAME)).unwrap();
+        assert!(!records.contains("dev.example.rollback"));
+
+        registry.install_from_manifest(&manifest).unwrap();
+        registry.uninstall("dev.example.rollback").unwrap();
+        let rollback = registry.prepare_install_rollback("dev.example.rollback").unwrap();
+        registry.install_from_manifest(&manifest).unwrap();
+        registry.rollback_install(rollback, &package.manifest.version, package.storage_fingerprint()).unwrap();
+        assert!(registry.is_removed("dev.example.rollback").unwrap());
+    }
+}

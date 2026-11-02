@@ -119,7 +119,7 @@ class WorkerResourceTests(unittest.TestCase):
         (self.proc / "cmdline").write_bytes(b"/opt/mingos/ming-app-host\0__worker\0")
         (self.proc / "status").write_text("Name:\tming-app-host\nUid:\t20001\n")
         (self.group / "cpu.stat").unlink()
-        records = process_table(self.proc.parent, self.cgroups, resources=True)
+        records = process_table(self.proc.parent, self.cgroups, resources=True, clock_ticks=100)
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["pid"], 213)
         self.assertIn("__worker", records[0]["argv"])
@@ -134,7 +134,7 @@ class WorkerResourceTests(unittest.TestCase):
         expected = [{"pid": 213, "argv": "/opt/mingos/ming-app-host __worker ",
                      "status": "Name:\tming-app-host\nUid:\t20001\n"}]
         self.assertEqual(process_table(self.proc.parent, self.cgroups), expected)
-        diagnostic = process_table(self.proc.parent, self.cgroups, resources=True)
+        diagnostic = process_table(self.proc.parent, self.cgroups, resources=True, clock_ticks=100)
         self.assertEqual(len(diagnostic), 1)
         self.assertEqual({key: diagnostic[0][key] for key in expected[0]}, expected[0])
         self.assertEqual(diagnostic[0]["resources"]["status"], "sampled")
