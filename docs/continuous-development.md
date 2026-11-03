@@ -223,3 +223,5 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 该资格限定 TCG、虚拟显示和输入、资格收据及 pointer-ready 仪表化，证明正常重启持久安装与两轮 Dock 启动，不证明断电恢复、物理输入/显示或完整系统验收；`finalSystemAccepted=false`。
 
 2026-11-04 持久普通卸载 Task 1：新增非 bootstrap 应用的 registry/catalog 卸载事务、精确 removed 身份及历史包重新加载验签、空闲 UI ID 分配，以及不补建缺失锁的严格重开。Linux 定向回归为 persistent lib `26/26`、persistent integration `14/14`、package install `9/9`、desktop catalog `10/10`；publisher no-create 专项 `5/5`，独立复核未发现阻断。证据见 `artifacts/persistent-uninstall-task1-20261104/`（publisher 专项输出保留在工具记录）。本阶段事务尚未接入桌面，卸载专属故障矩阵、数据保留及真实双启动尚未完成；`finalSystemAccepted=false`。
+
+2026-11-04 持久普通卸载 Task 2：新增测试专用故障注入，覆盖 pending 创建、registry/catalog 写入与同步、精确回滚、清理及单次补偿。固定 Linux 下 63 个卸载故障场景均符合预期分类，其中 `14 rolled-back`、`21 persistent-blocked`、`28 commit-uncertain`；包含 rename 已发生后磁盘与内存分歧的实际检查。真实事务保留目标和兄弟私有文件、公共文件及授权，独立进程重开再次验证。persistent lib `40/40`、registry lib `6/6`、四组集成 `37/37` 通过；独立复核了原始日志、矩阵和源码 hash。证据见 `artifacts/persistent-uninstall-task2-20261104/`。事务尚未接入桌面或完成真实双启动；`finalSystemAccepted=false`。

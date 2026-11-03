@@ -729,7 +729,7 @@ mod uninstall_transaction_tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use ed25519_dalek::{Signer, SigningKey};
 
-    fn package(id: &str) -> Package {
+    pub(super) fn package(id: &str) -> Package {
         let mut package = Package {
             manifest: crate::package::Manifest { schema_version: 1, id: id.into(), version: "1.0.0".into(), sdk_version: 6,
                 entry: "main.wasm".into(), private_storage: false, public_storage: false, data_migration: None,
@@ -741,7 +741,7 @@ mod uninstall_transaction_tests {
         package
     }
 
-    fn assert_reopens(root: &Path, content: &ContentSnapshot, removed: Option<&Package>) {
+    pub(super) fn assert_reopens(root: &Path, content: &ContentSnapshot, removed: Option<&Package>) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "persistent_install::uninstall_transaction_tests::reopen_child", "--nocapture"])
             .env("MING_UNINSTALL_CHILD_ROOT", root)
@@ -750,6 +750,7 @@ mod uninstall_transaction_tests {
             .output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         assert!(String::from_utf8_lossy(&output.stdout).contains("UNINSTALL_REOPEN_OK"));
+        print!("{}", String::from_utf8_lossy(&output.stdout));
     }
 
     #[test]
@@ -882,6 +883,487 @@ mod uninstall_transaction_tests {
         let failure = install_new(&opened.registry, &package("dev.ming.fifth")).unwrap_err();
         assert!(!failure.fatal());
         assert_eq!(snapshot(&opened.registry).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod uninstall_fault_tests {
+    use super::*;
+    use super::uninstall_transaction_tests::{assert_reopens, package};
+    use std::os::unix::fs::PermissionsExt;
+
+    // Share one transaction instantiation across fault closures in the test suite.
+    #[inline(never)]
+    fn uninstall_with_hook(registry: &PackageInstallRegistry, package: &Package,
+        hook: &mut dyn FnMut(&'static str) -> Result<()>) -> std::result::Result<CommittedUninstall, InstallFailure> {
+        uninstall_existing_with_hook(registry, package, &mut |stage| hook(stage))
+    }
+
+    fn installed() -> (tempfile::TempDir, OpenedInstall, Package) {
+        let (parent, opened, package) = transaction_tests::fixture();
+        install_new(&opened.registry, &package).unwrap();
+        (parent, opened, package)
+    }
+
+    fn assert_blocked_child(root: &Path) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "persistent_install::transaction_tests::pending_reopen_child", "--nocapture"])
+            .env("MING_TEST_PENDING_ROOT", root).output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PENDING_REOPEN_REJECTED"));
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[test]
+    fn incomplete_pending_never_reaches_business_writes_or_claims_durability() {
+        for fault in ["pending-create", "pending-identity", "pending-write", "pending-file-sync", "pending-directory-sync", "pending-readback"] {
+            let (_parent, opened, package) = installed();
+            let root = opened.registry.root_path().to_path_buf();
+            let before = snapshot(&opened.registry).unwrap();
+            let mut seen = Vec::new();
+            let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                seen.push(stage);
+                if stage == fault { bail!("injected {stage}"); } Ok(())
+            }).unwrap_err();
+            assert_eq!(failure.stage, fault);
+            assert!(!seen.contains(&"registry-uninstall") && !seen.contains(&"registry-restore") && !seen.contains(&"catalog-create"));
+            assert_eq!(sha256(&fs::read(root.join(REGISTRY_NAME)).unwrap()), before.registry_sha256);
+            assert_eq!(sha256(&fs::read(root.join(CATALOG_NAME)).unwrap()), before.catalog_sha256);
+            assert!(!opened.registry.is_removed(&package.manifest.id).unwrap());
+            assert!(!failure.persistent_block_confirmed);
+            if fault == "pending-create" {
+                assert_eq!(failure.status, "rolled-back");
+                assert!(!failure.fatal() && !failure.compensation_attempted);
+                assert_eq!(snapshot(&opened.registry).unwrap(), before);
+                drop(opened);
+                assert_reopens(&root, &before, None);
+            } else {
+                assert_eq!(failure.status, "commit-uncertain");
+                assert!(failure.fatal() && failure.compensation_attempted);
+                assert_eq!(failure.compensation_stage, Some("compensation-create"));
+                assert_eq!(seen.iter().filter(|stage| **stage == "compensation-create").count(), 1);
+                let bytes = fs::read(root.join(PENDING_NAME)).unwrap();
+                assert_eq!(bytes.is_empty(), matches!(fault, "pending-identity" | "pending-write"));
+                if !bytes.is_empty() {
+                    let pending: UninstallPending = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(pending.package_id, package.manifest.id);
+                    assert!(matches!(pending.operation, UninstallOperation::Uninstall));
+                }
+            }
+            println!("UNINSTALL_FAULT {fault} {} {}", failure.status, failure.persistent_block_confirmed);
+        }
+    }
+
+    #[test]
+    fn racing_existing_partial_and_replaced_pending_objects_are_never_overwritten() {
+        for mutation in ["existing", "partial", "replacement"] {
+            let (parent, opened, package) = installed();
+            let root = opened.registry.root_path().to_path_buf();
+            let before = snapshot(&opened.registry).unwrap();
+            let marker = root.join(PENDING_NAME);
+            let mut seen = Vec::new();
+            let mut expected = Vec::new();
+            let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                seen.push(stage);
+                if mutation == "existing" && stage == "pending-create" {
+                    expected = b"foreign pending".to_vec();
+                    write_file(&marker, &expected)?;
+                } else if mutation == "partial" && stage == "pending-write" {
+                    expected = b"{\"schemaVersion\":".to_vec();
+                    fs::write(&marker, &expected)?;
+                    bail!("injected partial write");
+                } else if mutation == "replacement" && stage == "pending-readback" {
+                    expected = fs::read(&marker)?;
+                    fs::rename(&marker, parent.path().join("old-pending"))?;
+                    write_file(&marker, &expected)?;
+                }
+                Ok(())
+            }).unwrap_err();
+            assert_eq!(failure.status, "commit-uncertain");
+            assert!(failure.fatal() && !failure.persistent_block_confirmed && failure.compensation_attempted);
+            assert_eq!(failure.compensation_stage, Some("compensation-create"));
+            assert_eq!(seen.iter().filter(|stage| **stage == "compensation-create").count(), 1);
+            assert!(!seen.contains(&"registry-uninstall") && !seen.contains(&"catalog-create"));
+            assert_eq!(fs::read(&marker).unwrap(), expected);
+            assert_eq!(sha256(&fs::read(root.join(REGISTRY_NAME)).unwrap()), before.registry_sha256);
+            assert_eq!(sha256(&fs::read(root.join(CATALOG_NAME)).unwrap()), before.catalog_sha256);
+            println!("UNINSTALL_FAULT pending-{mutation} {} false", failure.status);
+        }
+    }
+
+    #[test]
+    fn business_failures_restore_the_complete_old_snapshot_before_retry() {
+        for fault in ["registry-uninstall", "catalog-create", "catalog-write", "catalog-file-sync", "catalog-rename", "catalog-directory-sync", "commit-readback"] {
+            let (_parent, opened, package) = installed();
+            let root = opened.registry.root_path().to_path_buf();
+            let before = snapshot(&opened.registry).unwrap();
+            let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                if stage == fault { bail!("injected {stage}"); } Ok(())
+            }).unwrap_err();
+            assert_eq!(failure.status, "rolled-back", "{fault}: {failure:?}");
+            assert_eq!(failure.stage, fault);
+            assert!(!failure.fatal() && !failure.compensation_attempted && !failure.persistent_block_confirmed);
+            assert_eq!(snapshot(&opened.registry).unwrap(), before);
+            drop(opened);
+            assert_reopens(&root, &before, None);
+            println!("UNINSTALL_FAULT {fault} rolled-back false");
+        }
+    }
+
+    #[test]
+    fn real_registry_write_failures_restore_disk_even_when_the_cache_has_rolled_back() {
+        for fault in ["registry-record-create", "registry-record-write", "registry-record-file-sync", "registry-record-rename", "registry-record-directory-sync"] {
+            let (_parent, opened, package) = installed();
+            let root = opened.registry.root_path().to_path_buf();
+            let before = snapshot(&opened.registry).unwrap();
+            opened.registry.fail_next_record_persist_at(fault);
+            let mut saw_divergence = false;
+            let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                if stage == "registry-restore" && fault == "registry-record-directory-sync" {
+                    let disk = fs::read_to_string(root.join(REGISTRY_NAME))?;
+                    assert!(disk.contains("dev.ming.install-demo\tremoved\t1.0.0\t"));
+                    assert!(!opened.registry.is_removed(&package.manifest.id)?);
+                    saw_divergence = true;
+                }
+                Ok(())
+            }).unwrap_err();
+            assert_eq!(failure.status, "rolled-back", "{fault}: {failure:?}");
+            assert_eq!(failure.stage, "registry-uninstall");
+            assert!(failure.error.contains(fault));
+            assert_eq!(saw_divergence, fault == "registry-record-directory-sync");
+            assert_eq!(snapshot(&opened.registry).unwrap(), before);
+            drop(opened);
+            assert_reopens(&root, &before, None);
+            println!("UNINSTALL_FAULT {fault} rolled-back false divergence={saw_divergence}");
+        }
+    }
+
+    #[test]
+    fn incomplete_restoration_keeps_the_original_confirmed_marker_and_attempts_both_files() {
+        for fault in ["registry-restore", "catalog-restore-create", "catalog-restore-write", "catalog-restore-file-sync", "catalog-restore-rename", "catalog-restore-directory-sync", "rollback-readback"] {
+            let (_parent, opened, package) = installed();
+            let root = opened.registry.root_path().to_path_buf();
+            let mut seen = Vec::new();
+            let mut original = None;
+            let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                seen.push(stage);
+                if stage == "registry-uninstall" {
+                    original = Some((MarkerIdentity::of(&File::open(root.join(PENDING_NAME))?)?, fs::read(root.join(PENDING_NAME))?));
+                }
+                if stage == "catalog-directory-sync" || stage == fault { bail!("injected {stage}"); } Ok(())
+            }).unwrap_err();
+            assert_eq!(failure.stage, fault);
+            assert_eq!(failure.status, "persistent-blocked");
+            assert!(failure.fatal() && failure.persistent_block_confirmed && !failure.compensation_attempted);
+            assert!(seen.contains(&"registry-restore") && seen.contains(&"catalog-restore-create"));
+            assert!(!seen.contains(&"pending-unlink"));
+            let (identity, bytes) = original.unwrap();
+            identity.verify(&root, &bytes).unwrap();
+            drop(opened);
+            assert_blocked_child(&root);
+            println!("UNINSTALL_FAULT {fault} persistent-blocked true");
+        }
+    }
+
+    #[test]
+    fn every_real_registry_restore_failure_remains_fatal_and_preserves_both_error_paths() {
+        for fault in ["registry-record-create", "registry-record-write", "registry-record-file-sync", "registry-record-rename", "registry-record-directory-sync"] {
+            let (_parent, opened, package) = installed();
+            let root = opened.registry.root_path().to_path_buf();
+            let mut catalog_restore = false;
+            let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                if stage == "catalog-write" { bail!("trigger rollback"); }
+                if stage == "registry-restore" { opened.registry.fail_next_record_persist_at(fault); }
+                if stage == "catalog-restore-create" { catalog_restore = true; }
+                Ok(())
+            }).unwrap_err();
+            assert_eq!(failure.stage, "registry-restore");
+            assert!(failure.error.contains(fault));
+            assert_eq!(failure.status, "persistent-blocked");
+            assert!(failure.persistent_block_confirmed && catalog_restore);
+            drop(opened);
+            assert_blocked_child(&root);
+            println!("UNINSTALL_FAULT registry-restore/{fault} persistent-blocked true");
+        }
+        let (_parent, opened, package) = installed();
+        let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+            if ["catalog-write", "registry-restore", "catalog-restore-create"].contains(&stage) { bail!("injected {stage}"); }
+            Ok(())
+        }).unwrap_err();
+        assert!(failure.error.contains("registry-restore") && failure.error.contains("catalog-restore-create"));
+        assert!(failure.persistent_block_confirmed && failure.fatal());
+        println!("UNINSTALL_FAULT restore-both persistent-blocked true");
+    }
+
+    #[test]
+    fn commit_readback_rejects_changes_to_other_removed_records() {
+        let (_parent, opened, target) = installed();
+        let inactive = package("dev.ming.inactive");
+        install_new(&opened.registry, &inactive).unwrap();
+        uninstall_existing(&opened.registry, &inactive).unwrap();
+        let before = snapshot(&opened.registry).unwrap();
+        let failure = uninstall_with_hook(&opened.registry, &target, &mut |stage| {
+            if stage == "commit-readback" {
+                let records = fs::read_to_string(opened.registry.root_path().join(REGISTRY_NAME))?;
+                let changed = records.replace("dev.ming.inactive\tremoved\t1.0.0\t", "dev.ming.inactive\tremoved\t2.0.0\t");
+                assert_ne!(changed, records);
+                opened.registry.restore_records_snapshot(changed.as_bytes())?;
+            }
+            Ok(())
+        }).unwrap_err();
+        assert_eq!(failure.stage, "commit-readback");
+        assert!(failure.error.contains("INSTALL_REMOVE_TRANSITION"));
+        assert_eq!(failure.status, "rolled-back");
+        assert_eq!(snapshot(&opened.registry).unwrap(), before);
+        println!("UNINSTALL_FAULT changed-removed-record rolled-back false");
+    }
+
+    #[test]
+    fn changed_inactive_history_cannot_be_hidden_by_restoring_only_registry_and_catalog() {
+        let (_parent, opened, target) = installed();
+        let inactive = package("dev.ming.inactive");
+        install_new(&opened.registry, &inactive).unwrap();
+        let manifest = opened.registry.active_manifest_path(&inactive.manifest.id).unwrap();
+        uninstall_existing(&opened.registry, &inactive).unwrap();
+        let root = opened.registry.root_path().to_path_buf();
+        let before = snapshot(&opened.registry).unwrap();
+        let failure = uninstall_with_hook(&opened.registry, &target, &mut |stage| {
+            if stage == "commit-readback" { fs::write(manifest.with_file_name("main.wasm"), b"changed inactive history")?; }
+            Ok(())
+        }).unwrap_err();
+        assert_eq!(failure.stage, "rollback-readback");
+        assert_eq!(failure.status, "persistent-blocked");
+        assert!(failure.persistent_block_confirmed);
+        assert_eq!(sha256(&fs::read(root.join(REGISTRY_NAME)).unwrap()), before.registry_sha256);
+        assert_eq!(sha256(&fs::read(root.join(CATALOG_NAME)).unwrap()), before.catalog_sha256);
+        drop(opened);
+        assert_blocked_child(&root);
+        println!("UNINSTALL_FAULT changed-inactive-history persistent-blocked true");
+    }
+
+    #[test]
+    fn pending_cleanup_checks_actual_identity_and_namespace_before_reporting_a_block() {
+        for fault in ["remove-readback", "unlink-retained", "unlink-absent", "unlink-replaced", "unlink-directory-sync"] {
+            let (parent, opened, package) = installed();
+            let root = opened.registry.root_path().to_path_buf();
+            let marker = root.join(PENDING_NAME);
+            let mut seen = Vec::new();
+            let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                seen.push(stage);
+                if fault == "remove-readback" && stage == "pending-remove-readback" { bail!("injected verification"); }
+                if stage == "pending-unlink" && fault.starts_with("unlink-") && fault != "unlink-directory-sync" {
+                    if fault == "unlink-absent" { fs::remove_file(&marker)?; }
+                    if fault == "unlink-replaced" {
+                        let bytes = fs::read(&marker)?;
+                        fs::rename(&marker, parent.path().join("old-marker"))?;
+                        write_file(&marker, &bytes)?;
+                    }
+                    bail!("injected unlink");
+                }
+                if fault == "unlink-directory-sync" && stage == "pending-remove-directory-sync" {
+                    assert!(!marker.exists()); bail!("injected sync after unlink");
+                }
+                Ok(())
+            }).unwrap_err();
+            let confirmed = !["remove-readback", "unlink-replaced"].contains(&fault);
+            assert!(failure.fatal());
+            assert_eq!(failure.persistent_block_confirmed, confirmed, "{fault}");
+            assert_eq!(failure.status, if confirmed { "persistent-blocked" } else { "commit-uncertain" });
+            assert_eq!(failure.compensation_attempted, fault != "unlink-retained");
+            assert_eq!(seen.iter().filter(|stage| **stage == "compensation-create").count(), usize::from(fault != "unlink-retained"));
+            assert!(!seen.contains(&"registry-restore"));
+            drop(opened);
+            if confirmed { assert_blocked_child(&root); }
+            println!("UNINSTALL_FAULT {fault} {} {confirmed}", failure.status);
+        }
+    }
+
+    #[test]
+    fn each_unconfirmed_compensation_is_attempted_once_and_never_claimed_durable() {
+        for fault in ["compensation-create", "compensation-identity", "compensation-write", "compensation-file-sync", "compensation-directory-sync", "compensation-readback"] {
+            let (_parent, opened, package) = installed();
+            let root = opened.registry.root_path().to_path_buf();
+            let mut seen = Vec::new();
+            let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                seen.push(stage);
+                if stage == "pending-remove-directory-sync" || stage == fault { bail!("injected {stage}"); }
+                Ok(())
+            }).unwrap_err();
+            assert_eq!(failure.stage, "pending-remove-directory-sync");
+            assert_eq!(failure.status, "commit-uncertain");
+            assert!(failure.fatal() && failure.compensation_attempted && !failure.persistent_block_confirmed);
+            assert_eq!(failure.compensation_stage, Some(fault));
+            assert_eq!(seen.iter().filter(|stage| **stage == "compensation-create").count(), 1);
+            assert_eq!(seen.last(), Some(&fault));
+            assert!(!seen.contains(&"registry-restore"));
+            if fault == "compensation-create" { assert!(!root.join(PENDING_NAME).exists()); }
+            println!("UNINSTALL_FAULT {fault} commit-uncertain false");
+        }
+    }
+
+    #[test]
+    fn final_readbacks_after_pending_cleanup_never_restart_rollback_even_if_disk_looks_old() {
+        for fault in ["catalog-final-load", "final-readback", "rollback-final-readback", "final-old-state"] {
+            let (_parent, opened, package) = installed();
+            let root = opened.registry.root_path().to_path_buf();
+            let old_registry = fs::read(root.join(REGISTRY_NAME)).unwrap();
+            let old_catalog = fs::read(root.join(CATALOG_NAME)).unwrap();
+            let mut seen = Vec::new();
+            let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                seen.push(stage);
+                if fault == "rollback-final-readback" && stage == "catalog-write" { bail!("trigger rollback"); }
+                if stage == fault || (fault == "final-old-state" && stage == "final-readback") {
+                    assert!(!root.join(PENDING_NAME).exists());
+                    if fault == "final-old-state" {
+                        opened.registry.restore_records_snapshot(&old_registry)?;
+                        fs::write(root.join(CATALOG_NAME), &old_catalog)?;
+                        return Ok(());
+                    }
+                    bail!("injected {stage}");
+                }
+                Ok(())
+            }).unwrap_err();
+            assert_eq!(failure.stage, if fault == "final-old-state" { "final-readback" } else { fault });
+            assert_eq!(failure.status, "persistent-blocked");
+            assert!(failure.fatal() && failure.persistent_block_confirmed && failure.compensation_attempted);
+            assert_eq!(seen.iter().filter(|stage| **stage == "compensation-create").count(), 1);
+            assert_eq!(seen.iter().filter(|stage| **stage == "registry-restore").count(), usize::from(fault == "rollback-final-readback"));
+            assert_eq!(seen.iter().filter(|stage| **stage == "catalog-restore-create").count(), usize::from(fault == "rollback-final-readback"));
+            drop(opened);
+            assert_blocked_child(&root);
+            println!("UNINSTALL_FAULT {fault} persistent-blocked true");
+        }
+    }
+
+    #[test]
+    fn final_readback_compensation_failures_remain_uncertain_without_automatic_recovery() {
+        for final_fault in ["catalog-final-load", "final-readback"] {
+            for compensation in ["compensation-create", "compensation-identity", "compensation-write", "compensation-file-sync", "compensation-directory-sync", "compensation-readback"] {
+                let (_parent, opened, package) = installed();
+                let mut seen = Vec::new();
+                let failure = uninstall_with_hook(&opened.registry, &package, &mut |stage| {
+                    seen.push(stage);
+                    if stage == final_fault || stage == compensation { bail!("injected {stage}"); } Ok(())
+                }).unwrap_err();
+                assert_eq!(failure.stage, final_fault);
+                assert_eq!(failure.status, "commit-uncertain");
+                assert!(failure.fatal() && !failure.persistent_block_confirmed && failure.compensation_attempted);
+                assert_eq!(failure.compensation_stage, Some(compensation));
+                assert_eq!(seen.iter().filter(|stage| **stage == "compensation-create").count(), 1);
+                assert!(!seen.contains(&"registry-restore") && !seen.contains(&"catalog-restore-create"));
+                println!("UNINSTALL_FAULT {final_fault}/{compensation} commit-uncertain false");
+            }
+        }
+    }
+
+    fn storage_package(id: &str) -> Package {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use ed25519_dalek::{Signer, SigningKey};
+        let mut package = package(id);
+        package.manifest.private_storage = true;
+        package.manifest.public_storage = true;
+        package.manifest.publisher_signature = Some(STANDARD.encode(SigningKey::from_bytes(&[7; 32])
+            .sign(&package.signature_message("mingos-dev-2026").unwrap()).to_bytes()));
+        package
+    }
+
+    fn data_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, result: &mut BTreeMap<String, Vec<u8>>) {
+            for child in fs::read_dir(dir).unwrap() {
+                let path = child.unwrap().path();
+                let info = fs::symlink_metadata(&path).unwrap();
+                assert!(!info.file_type().is_symlink());
+                if info.is_dir() { walk(root, &path, result); }
+                else {
+                    assert!(info.is_file());
+                    result.insert(path.strip_prefix(root).unwrap().to_str().unwrap().into(), fs::read(path).unwrap());
+                }
+            }
+        }
+        let mut result = BTreeMap::new();
+        walk(root, root, &mut result);
+        result
+    }
+
+    #[test]
+    fn uninstall_transaction_preserves_target_sibling_public_files_and_persisted_bindings() {
+        use crate::app_data::{AppDataRoot, PackageBinding, PackageStorageAuthority};
+        use std::sync::Arc;
+        let (parent, opened, _) = transaction_tests::fixture();
+        let target = storage_package("dev.ming.install-demo");
+        let sibling = storage_package("dev.ming.sibling");
+        install_new(&opened.registry, &target).unwrap();
+        install_new(&opened.registry, &sibling).unwrap();
+        let data_root = parent.path().join("data");
+        fs::create_dir(&data_root).unwrap();
+        fs::set_permissions(&data_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let authority = Arc::new(PackageStorageAuthority::open_persistent(AppDataRoot::open(&data_root).unwrap()).unwrap());
+        for package in [&target, &sibling] {
+            let private = authority.authorize_package(package).unwrap();
+            let public = authority.authorize_public_package(package).unwrap();
+            assert!(private.persisted && private.directory_synced && public.persisted && public.directory_synced);
+        }
+        let target_private = authority.default_private_session_for_package(&target).unwrap();
+        assert!(target_private.write_file("keep.txt", b"target private sentinel").unwrap().directory_synced);
+        let sibling_private = authority.file_session_for_package(&sibling).unwrap();
+        assert!(sibling_private.write_file("keep.txt", b"sibling private sentinel").unwrap().directory_synced);
+        let public = authority.public_session_for_package(&sibling).unwrap();
+        assert!(public.write_file("shared.txt", b"shared public sentinel").unwrap().directory_synced);
+        drop(target_private);
+        let before = data_files(&data_root);
+        let committed = uninstall_existing(&opened.registry, &target).unwrap();
+        assert_eq!(data_files(&data_root), before);
+        assert_eq!(authority.default_private_session_for_package(&target).unwrap().read_file("keep.txt").unwrap(), b"target private sentinel");
+        assert_eq!(sibling_private.read_file("keep.txt").unwrap(), b"sibling private sentinel");
+        assert_eq!(public.read_file("shared.txt").unwrap(), b"shared public sentinel");
+        for package in [&target, &sibling] {
+            assert_eq!(authority.binding_status(&package.manifest.id, package.storage_fingerprint()).unwrap(), PackageBinding::Matched);
+            assert_eq!(authority.public_binding_status(&package.manifest.id, package.storage_fingerprint()).unwrap(), PackageBinding::Matched);
+        }
+        drop(public);
+        drop(sibling_private);
+        drop(authority);
+        let root = opened.registry.root_path().to_path_buf();
+        drop(opened);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "persistent_install::uninstall_fault_tests::preserved_data_reopen_child", "--nocapture"])
+            .env("MING_UNINSTALL_DATA_INSTALL_ROOT", &root)
+            .env("MING_UNINSTALL_DATA_ROOT", &data_root)
+            .env("MING_UNINSTALL_DATA_EXPECTED", serde_json::to_string(&before).unwrap())
+            .env("MING_UNINSTALL_DATA_CONTENT", serde_json::to_string(&committed.receipt.content).unwrap())
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PRESERVED_DATA_REOPEN_OK"));
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        assert_eq!(data_files(&data_root), before);
+        let hashes: BTreeMap<_, _> = before.iter().map(|(path, bytes)| (path, sha256(bytes))).collect();
+        println!("UNINSTALL_DATA_PRESERVED {}", serde_json::to_string(&hashes).unwrap());
+    }
+
+    #[test]
+    fn preserved_data_reopen_child() {
+        use crate::app_data::{AppDataRoot, PackageBinding, PackageStorageAuthority};
+        use std::sync::Arc;
+        let Some(root) = std::env::var_os("MING_UNINSTALL_DATA_INSTALL_ROOT") else { return; };
+        let data_root = PathBuf::from(std::env::var_os("MING_UNINSTALL_DATA_ROOT").unwrap());
+        let before: BTreeMap<String, Vec<u8>> = serde_json::from_str(&std::env::var("MING_UNINSTALL_DATA_EXPECTED").unwrap()).unwrap();
+        let content: ContentSnapshot = serde_json::from_str(&std::env::var("MING_UNINSTALL_DATA_CONTENT").unwrap()).unwrap();
+        let opened = open_existing(Path::new(&root)).unwrap();
+        assert_eq!(opened.content, content);
+        assert_eq!(data_files(&data_root), before);
+        let target = storage_package("dev.ming.install-demo");
+        let sibling = storage_package("dev.ming.sibling");
+        assert_eq!(snapshot_removed_package(&opened.registry, &target).unwrap().package_id, target.manifest.id);
+        let authority = Arc::new(PackageStorageAuthority::open_persistent(AppDataRoot::open(&data_root).unwrap()).unwrap());
+        for package in [&target, &sibling] {
+            assert_eq!(authority.binding_status(&package.manifest.id, package.storage_fingerprint()).unwrap(), PackageBinding::Matched);
+            assert_eq!(authority.public_binding_status(&package.manifest.id, package.storage_fingerprint()).unwrap(), PackageBinding::Matched);
+        }
+        assert_eq!(authority.default_private_session_for_package(&target).unwrap().read_file("keep.txt").unwrap(), b"target private sentinel");
+        assert_eq!(authority.file_session_for_package(&sibling).unwrap().read_file("keep.txt").unwrap(), b"sibling private sentinel");
+        assert_eq!(authority.public_session_for_package(&sibling).unwrap().read_file("shared.txt").unwrap(), b"shared public sentinel");
+        assert_eq!(data_files(&data_root), before);
+        println!("PRESERVED_DATA_REOPEN_OK");
     }
 }
 

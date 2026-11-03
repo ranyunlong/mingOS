@@ -106,6 +106,8 @@ pub struct PackageInstallRegistry {
     records: Mutex<BTreeMap<String, Record>>,
     lock: File,
     publisher_trust: Option<PublisherTrustStore>,
+    #[cfg(test)]
+    record_persist_fault: Mutex<Option<&'static str>>,
 }
 
 impl std::fmt::Debug for PackageInstallRegistry {
@@ -222,7 +224,10 @@ impl PackageInstallRegistry {
             }
         }
         let records = load_records(root.join(RECORD_NAME))?;
-        Ok(Self { root: root.to_path_buf(), operation: Mutex::new(()), records: Mutex::new(records), lock, publisher_trust })
+        Ok(Self { root: root.to_path_buf(), operation: Mutex::new(()), records: Mutex::new(records), lock, publisher_trust,
+            #[cfg(test)]
+            record_persist_fault: Mutex::new(None),
+        })
     }
 
     pub fn install_package(&self, package: &Package) -> Result<InstallState> {
@@ -726,10 +731,20 @@ impl PackageInstallRegistry {
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let result = (|| -> Result<()> {
+            #[cfg(test)]
+            self.record_persist_checkpoint("registry-record-create")?;
             let mut temp = options.open(&temp_path).context("INSTALL_RECORD_TEMP")?;
+            #[cfg(test)]
+            self.record_persist_checkpoint("registry-record-write")?;
             temp.write_all(&bytes).context("INSTALL_RECORD_WRITE")?;
+            #[cfg(test)]
+            self.record_persist_checkpoint("registry-record-file-sync")?;
             temp.sync_all().context("INSTALL_RECORD_SYNC")?;
+            #[cfg(test)]
+            self.record_persist_checkpoint("registry-record-rename")?;
             fs::rename(&temp_path, self.root.join(RECORD_NAME)).context("INSTALL_RECORD_RENAME")?;
+            #[cfg(test)]
+            self.record_persist_checkpoint("registry-record-directory-sync")?;
             File::open(&self.root).context("INSTALL_ROOT_OPEN")?.sync_all().context("INSTALL_ROOT_SYNC")?;
             Ok(())
         })();
@@ -737,6 +752,21 @@ impl PackageInstallRegistry {
             let _ = fs::remove_file(&temp_path);
         }
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_record_persist_at(&self, stage: &'static str) {
+        *self.record_persist_fault.lock().unwrap() = Some(stage);
+    }
+
+    #[cfg(test)]
+    fn record_persist_checkpoint(&self, stage: &'static str) -> Result<()> {
+        let mut fault = self.record_persist_fault.lock().unwrap();
+        if *fault == Some(stage) {
+            *fault = None;
+            bail!("injected {stage}");
+        }
+        Ok(())
     }
 
     fn content_path(&self, package_id: &str, record: &Record) -> PathBuf {
