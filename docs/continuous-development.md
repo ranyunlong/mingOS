@@ -199,3 +199,5 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 后续必须运行独立被动输入诊断，根据证据修复后重新构建 bundle 并完成两次冷启动与独立审计。诊断专用 Docker 卷的自动审批曾超时，进程未启动，记录见 `artifacts/install-entry-passive-diagnostic-20261103-174309/`。物理输入、硬件显示及完整系统验收仍未完成，`finalSystemAccepted=false`。
 
 输入证据审计准备：为安装 profile 限定专用 pointer-ready qualification，保留原有 policy、诊断开关和资源限制的严格校验；Python boot 相关回归 `76/76` 通过。新增的原始握手证据审计以合成正反例验证 `17/17`，并拒绝历史失败记录；独立复核指出的慢 QMP 回复导致超时窗口误判已修正。审计器尚无真实成功 cold-pair 可验证，其通过不等于 QEMU 验收通过。
+
+2026-11-03 首次 INSTALL 输入被动诊断：在独立 bundle 和新数据盘上运行一次 15 秒诊断，不启用 pointer 握手。QMP 与 QEMU trace 记录 ABS、按下、释放，guest evdev 同样记录双沿；完整 Wayland 客户端日志显示首次 pointer 建立后仅收到释放，没有按下，所有状态均无安装提示。独立复核确认日志 offset 连续、客户端日志完整。证据支持首次 pointer 建立时序存在竞态，但不能定位 evdev 观察点之后的具体丢失位置。观察器在诊断窗口结束时被终止，此次不是安装验收。原始记录与摘要见 `artifacts/install-entry-passive-diagnostic-20261103-181513/`；下一步以现有 pointer-ready 握手执行完整双冷启动，`finalSystemAccepted=false`。
