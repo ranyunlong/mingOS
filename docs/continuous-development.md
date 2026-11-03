@@ -205,3 +205,5 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 2026-11-03 桌面安装入口 pointer-ready 双冷启动：使用新签名 fixture、新 bundle `c3d2b7191868c0f2eacb124f4091d57542d98d7f0368e65c886c6f630e89255e` 和新数据盘，连续运行两次 fresh QEMU。两轮均证明 mode 16 安装提示已呈现、确认输入经过 pointer-ready 握手、安装 catalog 提交后新应用启动和 ready、worker 回收、数据同步卸载及 kernel PowerDown；同盘 marker `1 -> 2`，boot/session 不同。冻结原始证据审计通过，并经独立复核重放；35 个源码文件运行前后哈希一致。完整证据见 `artifacts/install-entry-pointer-ready-20261103-qual1/`。
 
 该资格使用 TCG、虚拟图形/输入、Wayland 诊断和 pointer-ready 握手；新应用由预审脚本的 30 秒 ready 计时动作启动，实际 trace 显示安装提交先于启动，但该计时不是安装完成依赖。每轮 install-root 在 RAM 重新建立，不证明安装登记跨启动持久化。无仪表输入、物理显示/输入、Linux 硬件 GPU、多用户及完整日常系统验收仍待独立证明，`finalSystemAccepted=false`。
+
+2026-11-03 持久安装下一阶段设计：确认既有安装资格的登记与 catalog 均位于每轮重建的 RAM 根，不能证明跨重启保留。新增 [正常重启后的持久安装设计](superpowers/specs/2026-11-03-persistent-install-design.md) 和 [实施计划](superpowers/plans/2026-11-03-persistent-install.md)，规定同盘持久状态、严格首次初始化与重开、跨文件提交失败边界、两轮不同预审输入及真实 Dock 启动证据。设计经独立复核并修正同步失败的不确定性、Dock 自动启动伪通过和跨时钟域因果证明；尚未实施或验证，`finalSystemAccepted=false`。
