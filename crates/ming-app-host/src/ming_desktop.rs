@@ -258,16 +258,15 @@ impl Session {
         let strict_session = if options.isolation == crate::desktop_catalog::IsolationMode::Strict {
             Some(StrictSessionLock::acquire()?)
         } else { None };
-        // A reviewed install script may launch the newly assigned app after the
-        // install action has committed the catalog entry.  The entry cannot be
-        // present in the initial catalog, so defer that one identity check to
-        // the normal runtime lookup instead of rejecting the reviewed script at
-        // session construction time.
-        let reviewed_install_script = options.actions.iter().any(|step| matches!(step.action, DesktopAction::Install { .. }));
+        // A trusted native install source or reviewed install action can add an
+        // app after the initial catalog is loaded. Defer only Launch targets
+        // to the runtime catalog lookup, which still requires a committed entry.
+        let install_can_extend_catalog = (cfg!(target_os = "linux") && options.install_source.is_some())
+            || options.actions.iter().any(|step| matches!(step.action, DesktopAction::Install { .. }));
         for step in &options.actions {
             if !matches!(step.action, DesktopAction::Shutdown | DesktopAction::Install { .. })
                 && !catalog.apps.iter().any(|a| a.id == step.action.app())
-                && !(reviewed_install_script && matches!(step.action, DesktopAction::Launch { .. }) && (1..=4).contains(&step.action.app()))
+                && !(install_can_extend_catalog && matches!(step.action, DesktopAction::Launch { .. }) && (1..=4).contains(&step.action.app()))
             {
                 bail!("DESKTOP_EVENT_UNKNOWN_APP");
             }
@@ -508,7 +507,16 @@ impl Session {
                     return Ok(());
                 }
                 let registry = self.options.install_registry.as_ref().context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?;
-                let package = crate::package::load_package(&manifest_path).context("DESKTOP_INSTALL_PACKAGE")?;
+                let package = match crate::package::load_package(&manifest_path).context("DESKTOP_INSTALL_PACKAGE") {
+                    Ok(package) => package,
+                    Err(error) => {
+                        self.log(0, 0, 0, "install_not_saved", format!("{error:#}"));
+                        let prompt = crate::graphics::desktop_shell::StoragePrompt::install(&package_id, &version, &fingerprint, update, true, false)?;
+                        self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update, retry: true }, prompt, composed: None, presented: false, presented_sequence: None });
+                        self.changed();
+                        return Ok(());
+                    }
+                };
                 let actual_fingerprint = package_fingerprint_hex(&package);
                 if package.manifest.id != package_id || package.manifest.version != version || actual_fingerprint != fingerprint {
                     self.log(0, 0, 0, "install_not_saved", "package identity changed".into());
@@ -538,9 +546,9 @@ impl Session {
                     Some(registry.prepare_install_rollback(&package_id)?)
                 };
                 let install_result = if update {
-                    registry.update_from_manifest(&manifest_path, authority.as_deref().context("DESKTOP_STORAGE_AUTHORITY")?)
+                    registry.update_loaded_package(&package, authority.as_deref().context("DESKTOP_STORAGE_AUTHORITY")?)
                 } else {
-                    registry.install_from_manifest(&manifest_path)
+                    registry.install_loaded_package(&package)
                 };
                 let install_state = match install_result {
                     Ok(state) => state,
@@ -836,6 +844,31 @@ impl Session {
         self.changed();
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn note_install_rejection(&mut self, error: &anyhow::Error) -> Result<()> {
+        let rejected_before_prompt = error.chain().any(|cause| matches!(cause.to_string().as_str(),
+            "DESKTOP_INSTALL_SOURCE_REQUIRED" | "DESKTOP_INSTALL_SOURCE" | "DESKTOP_INSTALL_REGISTRY_REQUIRED"
+            | "DESKTOP_INSTALL_PACKAGE" | "DESKTOP_INSTALL_PUBLISHER" | "DESKTOP_INSTALL_CURRENT"
+            | "DESKTOP_INSTALL_VERSION" | "DESKTOP_CATALOG_LIMIT"
+        ));
+        if !rejected_before_prompt || self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen {
+            bail!("{error:#}");
+        }
+        self.log(0, 0, 0, "install_rejected", format!("{error:#}"));
+        let prompt = crate::graphics::desktop_shell::StoragePrompt::install_rejected();
+        self.pending_storage = Some(PendingDesktopStorage {
+            app: 0,
+            pending: DesktopStorageDecision::Information,
+            prompt,
+            composed: None,
+            presented: false,
+            presented_sequence: None,
+        });
+        self.reset_input()?;
+        self.changed();
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn begin_install_from_dock(&mut self) -> Result<()> {
         let source = self
@@ -1889,6 +1922,14 @@ impl Session {
             #[cfg(not(target_os = "linux"))]
             let storage_prompt = serde_json::Value::Null;
             value["storagePrompt"] = storage_prompt;
+            #[cfg(target_os = "linux")]
+            let prompt_presented_sequence = self.pending_storage.as_ref()
+                .filter(|pending| self.sink_ready && pending.presented)
+                .and_then(|pending| pending.presented_sequence)
+                .filter(|presented| *presented == sequence);
+            #[cfg(not(target_os = "linux"))]
+            let prompt_presented_sequence: Option<u64> = None;
+            value["storagePromptPresentedSequence"] = serde_json::json!(prompt_presented_sequence);
             value
         });
         let state = serde_json::json!({"schemaVersion":1,"bootId":self.state_boot,"sessionId":self.state_session,"revision":revision,"phase":phase,"root":root,"apps":apps,"error":self.state_error});
@@ -2084,6 +2125,59 @@ mod input_backpressure_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn install_event_validation_only_defers_bounded_launch_targets() {
+        for (source, action, allowed) in [
+            (false, DesktopAction::Launch { app: 2 }, false),
+            (true, DesktopAction::Launch { app: 2 }, true),
+            (true, DesktopAction::Launch { app: 5 }, false),
+            (true, DesktopAction::Focus { app: 2 }, false),
+            (true, DesktopAction::Close { app: 2 }, false),
+        ] {
+            let mut options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into()]).unwrap();
+            if source { options.install_source = Some("/trusted/install-source/app.json".into()); }
+            options.actions = vec![crate::desktop_catalog::TimedAction { after_ms: 0, action }];
+            let result = Session::new(options, Catalog { apps: vec![], autostart: vec![] }, #[cfg(feature = "gpu")] None);
+            if allowed {
+                assert!(result.is_ok(), "trusted native install must allow a future launch");
+            } else {
+                let error = result.err().expect("unknown action target must remain invalid");
+                assert!(format!("{error:#}").contains("DESKTOP_EVENT_UNKNOWN_APP"), "{error:#}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_event_validation_keeps_scripted_install_launch_compatible() {
+        let mut options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into()]).unwrap();
+        options.actions = vec![
+            crate::desktop_catalog::TimedAction { after_ms: 0, action: DesktopAction::Install { source: "/trusted/install-source/app.json".into() } },
+            crate::desktop_catalog::TimedAction { after_ms: 1, action: DesktopAction::Launch { app: 2 } },
+        ];
+        assert!(Session::new(options, Catalog { apps: vec![], autostart: vec![] }, #[cfg(feature = "gpu")] None).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_event_validation_does_not_authorize_an_uninstalled_app() {
+        let mut options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into()]).unwrap();
+        options.install_source = Some("/trusted/install-source/app.json".into());
+        options.actions = vec![crate::desktop_catalog::TimedAction { after_ms: 0, action: DesktopAction::Launch { app: 2 } }];
+        let mut session = Session::new(options, Catalog { apps: vec![], autostart: vec![] }, #[cfg(feature = "gpu")] None).unwrap();
+
+        let error = session.perform(&DesktopAction::Launch { app: 2 }).unwrap_err();
+        assert!(format!("{error:#}").contains("DESKTOP_UNKNOWN_APP"), "{error:#}");
+        assert!(session.instances.is_empty());
+        assert!(session.catalog.apps.is_empty());
+        let error = session.begin_install_from_dock().unwrap_err();
+        session.note_install_rejection(&error).unwrap();
+        let error = session.perform(&DesktopAction::Launch { app: 2 }).unwrap_err();
+        assert!(format!("{error:#}").contains("DESKTOP_STORAGE_PROMPT_ACTIVE"), "{error:#}");
+        assert!(session.instances.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn install_root_requires_the_publisher_trust_root() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
@@ -2108,6 +2202,183 @@ mod input_backpressure_tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("PUBLISHER_KEYRING_FILE"), "{error:#}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_rejection_opens_information_without_closing_the_session() {
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into()]).unwrap();
+        let mut session = Session::new(options, Catalog { apps: vec![], autostart: vec![] }, #[cfg(feature = "gpu")] None).unwrap();
+        let error = session.begin_install_from_dock().unwrap_err();
+
+        session.note_install_rejection(&error).unwrap();
+
+        let pending = session.pending_storage.as_ref().unwrap();
+        assert!(matches!(&pending.pending, DesktopStorageDecision::Information));
+        assert!(!pending.prompt.has_allow());
+        assert!(session.closing.is_none());
+        assert!(!session.pointer_sink_ready());
+        assert!(session.trace.iter().any(|record| record.kind == "install_rejected"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_rejection_preserves_internal_errors_and_existing_prompt() {
+        let options = DesktopOptions::parse(["unused".into(), "--renderer".into(), "cpu".into()]).unwrap();
+        let mut session = Session::new(options, Catalog { apps: vec![], autostart: vec![] }, #[cfg(feature = "gpu")] None).unwrap();
+        assert!(session.note_install_rejection(&anyhow!("INTERNAL_INPUT_FAILURE")).is_err());
+        assert!(session.storage_prompt().is_none());
+        let error = session.begin_install_from_dock().unwrap_err();
+        session.note_install_rejection(&error).unwrap();
+        let existing = session.storage_prompt().unwrap().state_value();
+
+        assert!(session.note_install_rejection(&error).is_err());
+
+        assert_eq!(session.storage_prompt().unwrap().state_value(), existing);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn storage_prompt_state_only_marks_the_accepted_native_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.json");
+        let options = DesktopOptions::parse([
+            "unused".into(), "--renderer".into(), "cpu".into(),
+            "--state-file".into(), state_path.clone().into_os_string(),
+        ]).unwrap();
+        let mut session = Session::new(options, Catalog { apps: vec![], autostart: vec![] }, #[cfg(feature = "gpu")] None).unwrap();
+        let read_state = || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&state_path).unwrap()).unwrap();
+        let frame = session.compose().unwrap();
+        session.accepted(frame.sequence, false).unwrap();
+        let error = session.begin_install_from_dock().unwrap_err();
+        session.note_install_rejection(&error).unwrap();
+        session.write_state(true).unwrap();
+        let pending = read_state();
+        assert_eq!(pending["root"]["storagePrompt"], serde_json::json!({"mode":22,"packageId":"","version":"","hasAllow":false}));
+        assert_eq!(pending["root"].get("storagePromptPresentedSequence"), Some(&serde_json::Value::Null));
+
+        let frame = session.compose().unwrap();
+        session.accepted(frame.sequence, false).unwrap();
+        session.write_state(true).unwrap();
+        assert_eq!(read_state()["root"]["storagePromptPresentedSequence"], serde_json::Value::Null, "an unrelated accepted frame must not mark the prompt presented");
+
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+        session.write_state(true).unwrap();
+        let presented = read_state();
+        assert_eq!(presented["root"]["storagePrompt"], pending["root"]["storagePrompt"]);
+        assert_eq!(presented["root"]["storagePromptPresentedSequence"].as_u64(), Some(frame.sequence));
+        assert_eq!(presented["root"]["storagePromptPresentedSequence"], presented["root"]["presentedSequence"]);
+
+        session.sink_ready = false;
+        session.write_state(true).unwrap();
+        assert_eq!(read_state()["root"]["storagePromptPresentedSequence"], serde_json::Value::Null);
+        session.sink_ready = true;
+        session.pending_storage.as_mut().unwrap().presented_sequence = Some(frame.sequence + 1);
+        session.write_state(true).unwrap();
+        assert_eq!(read_state()["root"]["storagePromptPresentedSequence"], serde_json::Value::Null, "a prompt from another frame must not inherit the root presentation");
+        session.changed();
+        session.write_state(true).unwrap();
+        assert_eq!(read_state()["root"]["storagePromptPresentedSequence"], serde_json::Value::Null);
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, true).unwrap();
+        session.write_state(true).unwrap();
+        assert_eq!(read_state()["root"]["storagePromptPresentedSequence"], serde_json::Value::Null, "offscreen composition is not native presentation");
+        session.pending_storage = None;
+        session.write_state(true).unwrap();
+        assert_eq!(read_state()["root"]["storagePromptPresentedSequence"], serde_json::Value::Null);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn storage_prompt_state_is_published_after_throttled_acceptance() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.json");
+        let options = DesktopOptions::parse([
+            "unused".into(), "--renderer".into(), "cpu".into(),
+            "--state-file".into(), state_path.clone().into_os_string(),
+        ]).unwrap();
+        let mut session = Session::new(options, Catalog { apps: vec![], autostart: vec![] }, #[cfg(feature = "gpu")] None).unwrap();
+        let read_state = || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&state_path).unwrap()).unwrap();
+        let frame = session.compose().unwrap();
+        session.accepted(frame.sequence, false).unwrap();
+        let error = session.begin_install_from_dock().unwrap_err();
+        session.note_install_rejection(&error).unwrap();
+        session.write_state(true).unwrap();
+        let pending = read_state();
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.state_last_write = Some(Instant::now());
+        session.accepted(frame.sequence, false).unwrap();
+        assert_eq!(read_state(), pending, "acceptance inside the write interval must remain throttled");
+
+        session.state_last_write = Some(Instant::now() - Duration::from_millis(101));
+        session.tick().unwrap();
+
+        let presented = read_state();
+        assert!(presented["revision"].as_u64().unwrap() > pending["revision"].as_u64().unwrap());
+        assert_eq!(presented["root"]["storagePromptPresentedSequence"].as_u64(), Some(frame.sequence));
+        assert_eq!(presented["root"]["storagePromptPresentedSequence"], presented["root"]["presentedSequence"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_source_load_failure_preserves_confirmation_and_can_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        for missing_name in ["app.json", "main.wasm"] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let source = temp.path().join("source");
+            let install = temp.path().join("install");
+            for path in [&source, &install] {
+                std::fs::create_dir(path).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            std::fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+            let manifest = source.join("app.json");
+            std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.install.retry","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+            let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+            let mut options = DesktopOptions::parse([
+                temp.path().join("catalog.json").into_os_string(),
+                "--renderer".into(), "cpu".into(),
+            ]).unwrap();
+            options.install_registry = Some(registry);
+            let mut session = Session::new(options, Catalog { apps: vec![], autostart: vec![] }, #[cfg(feature = "gpu")] None).unwrap();
+            session.begin_install(&manifest).unwrap();
+            let expected_fingerprint = match &session.pending_storage.as_ref().unwrap().pending {
+                DesktopStorageDecision::Install { fingerprint, .. } => fingerprint.clone(),
+                _ => panic!("expected install confirmation"),
+            };
+            let frame = session.compose().unwrap();
+            session.storage_prompt_composed(frame.sequence);
+            session.accepted(frame.sequence, false).unwrap();
+            let missing_path = source.join(missing_name);
+            let contents = std::fs::read(&missing_path).unwrap();
+            std::fs::remove_file(&missing_path).unwrap();
+
+            session.respond_storage_prompt(true).unwrap();
+
+            let pending = session.pending_storage.as_ref().unwrap();
+            assert_eq!(pending.prompt.state_value()["mode"], 18);
+            assert!(matches!(&pending.pending, DesktopStorageDecision::Install {
+                package_id, version, fingerprint, retry: true, ..
+            } if package_id == "dev.example.install.retry" && version == "1.0.0" && fingerprint == &expected_fingerprint));
+            assert!(session.catalog.apps.is_empty());
+            assert!(session.options.install_registry.as_ref().unwrap().active_manifest_path("dev.example.install.retry").is_err());
+
+            std::fs::write(&missing_path, contents).unwrap();
+            let frame = session.compose().unwrap();
+            session.storage_prompt_composed(frame.sequence);
+            session.accepted(frame.sequence, false).unwrap();
+            session.respond_storage_prompt(true).unwrap();
+            assert!(session.storage_prompt().is_none());
+            assert_eq!(session.catalog.apps.len(), 1);
+            assert_eq!(session.catalog.apps[0].package_id, "dev.example.install.retry");
+            let active = session.options.install_registry.as_ref().unwrap().active_manifest_path("dev.example.install.retry").unwrap();
+            assert_eq!(crate::package::load_package(&active).unwrap().manifest.version, "1.0.0");
+        }
     }
 
     #[cfg(target_os = "linux")]

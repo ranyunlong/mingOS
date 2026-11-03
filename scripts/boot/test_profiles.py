@@ -1,10 +1,15 @@
 """Closed data-text package/review boundary tests; synthetic Wasm is not build evidence."""
+import copy
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+import bundle
 from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_UPDATE_INSTALL_ROOT, checked_session, sha256
 from bundle import verify_payload
+from wayland_receipt import POINTER_SYNC_POLICY
 
 class ProfileTests(unittest.TestCase):
     def put(self, path, data): path.write_text(json.dumps(data))
@@ -190,6 +195,41 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(verify_payload(root, review), json.loads((root / 'catalog.json').read_text()))
             self.assertIs(checked_session(review, root), review)
 
+            # The event file is part of the reviewed input boundary; changing it
+            # after review must fail before any bundle is assembled.
+            events['steps'][0]['afterMs'] += 1
+            self.put(root / 'install-events.json', events)
+            with self.assertRaisesRegex(ValueError, '^data-text: reviewed install event file required$'):
+                verify_payload(root, review)
+
+    def test_install_lifecycle_review_rejects_path_contract_drift(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            (root / 'ming-app-host').write_bytes(b'host')
+            (root / 'catalog.json').write_text('{}')
+            review = {
+                'reviewed': True,
+                'reviewer': 'main test fixture',
+                'profile': 'install-lifecycle',
+                'sessionMode': 'long-lived',
+                'extraArgs': ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
+                              '--state-file', '/run/evidence/desktop-state.json'],
+                'budgetEvidence': 'synthetic unit test',
+                'installRoot': INSTALL_LIFECYCLE_INSTALL_ROOT,
+                'installEvents': INSTALL_LIFECYCLE_EVENTS,
+                'installSource': INSTALL_LIFECYCLE_SOURCE,
+                'hostSha256': sha256(root / 'ming-app-host'),
+                'catalogSha256': sha256(root / 'catalog.json'),
+            }
+            for field, value in (
+                    ('installRoot', '/opt/mingos/other-install-root'),
+                    ('installEvents', '/opt/mingos/other-install-events.json'),
+                    ('installSource', '/opt/mingos/other-source/app.json')):
+                with self.subTest(field=field):
+                    changed = dict(review, **{field: value})
+                    with self.assertRaises(ValueError):
+                        checked_session(changed, root)
+
     def test_data_grant_and_identity_are_exact(self):
         changes = [lambda c: c['apps'][0].update(dataKey='other'), lambda c: c['apps'][0].update(slots=[1,2]),
                    lambda c: c['apps'][1].update(dataKey='counter-main',slots=[1]),
@@ -292,5 +332,101 @@ class ProfileTests(unittest.TestCase):
                       'publicPreauthorization':{'packageId':'dev.ming.public-kernel-probe', 'policy':'guest-seeded-public-grant-v1'}}
             review.update(hostSha256=sha256(root/'ming-app-host'), catalogSha256=sha256(root/'catalog.json'))
             self.assertEqual(verify_payload(root, review), catalog)
+
+class InputQualificationTests(unittest.TestCase):
+    class ValidationComplete(Exception):
+        pass
+
+    def review(self, profile, instrumented_profile):
+        return {
+            'profile': profile,
+            'instrumentedQualification': True,
+            'instrumentedProfile': instrumented_profile,
+            'inputSynchronization': copy.deepcopy(POINTER_SYNC_POLICY),
+            'instrumentation': {
+                'desktopEnv': {'WAYLAND_DEBUG': 'client'},
+                'stderrLimitBytes': 8388608,
+                'observerSha256': sha256(Path(__file__).with_name('evdev_observer.py')),
+                'observerMaxEvents': 4096,
+                'observerMaxSeconds': 900,
+                'exclusiveGrab': False,
+                'readyCaptureSeconds': None,
+            },
+        }
+
+    def validate(self, root, review, flags=None):
+        review_path = root / 'review.json'
+        review_path.write_text(json.dumps(review))
+        output = root / 'bundle'
+        if flags is None:
+            flags = ['--input-diagnostics', '--wayland-client-diagnostics', '--pointer-handshake-diagnostics']
+        argv = ['bundle.py', '--payload', str(root / 'payload'), '--review', str(review_path),
+                '--output', str(output), '--isolation-profile', 'source-v2',
+                '--isolation-probes', str(root / 'probes')] + flags
+        # Payload validation has separate real fixtures above. Stop at the probe
+        # boundary so the actual CLI checks run without assembling a Linux rootfs.
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(bundle, 'verify_payload', return_value={'apps': [], 'autostart': []}), \
+                mock.patch.object(bundle, 'verify_review_and_files', side_effect=self.ValidationComplete):
+            try:
+                bundle.main()
+            except self.ValidationComplete:
+                return True
+            finally:
+                self.assertFalse(output.exists(), 'qualification must be checked before rootfs writes')
+        self.fail('test must stop at the probe boundary')
+
+    def test_install_qualification_accepts_its_own_tag_and_preserves_data_text_tag(self):
+        with tempfile.TemporaryDirectory() as work:
+            for profile, tag in (
+                    ('install-lifecycle', 'install-lifecycle-pointer-ready-v1'),
+                    ('data-text', 'data-text-pointer-ready-v1')):
+                with self.subTest(profile=profile):
+                    self.assertTrue(self.validate(Path(work), self.review(profile, tag)))
+
+    def test_qualification_rejects_tags_from_another_payload_profile(self):
+        with tempfile.TemporaryDirectory() as work:
+            for profile, tag in (
+                    ('install-lifecycle', 'data-text-pointer-ready-v1'),
+                    ('data-text', 'install-lifecycle-pointer-ready-v1'),
+                    ('install-lifecycle', None),
+                    ('install-lifecycle', 'unknown')):
+                with self.subTest(profile=profile, tag=tag), self.assertRaises(ValueError):
+                    self.validate(Path(work), self.review(profile, tag))
+
+    def test_install_qualification_still_requires_every_diagnostic_flag(self):
+        flags = ['--input-diagnostics', '--wayland-client-diagnostics', '--pointer-handshake-diagnostics']
+        with tempfile.TemporaryDirectory() as work:
+            for missing in flags:
+                with self.subTest(missing=missing), self.assertRaises(ValueError):
+                    self.validate(Path(work), self.review('install-lifecycle', 'install-lifecycle-pointer-ready-v1'),
+                                  [flag for flag in flags if flag != missing])
+
+    def test_install_qualification_rejects_changed_sync_policy(self):
+        with tempfile.TemporaryDirectory() as work:
+            review = self.review('install-lifecycle', 'install-lifecycle-pointer-ready-v1')
+            for key in review['inputSynchronization']:
+                changed = copy.deepcopy(review)
+                del changed['inputSynchronization'][key]
+                with self.subTest(missing=key), self.assertRaises(ValueError):
+                    self.validate(Path(work), changed)
+            changed = copy.deepcopy(review)
+            changed['inputSynchronization']['pointerWaitMs'] = 5001
+            with self.assertRaises(ValueError):
+                self.validate(Path(work), changed)
+
+    def test_install_qualification_rejects_changed_instrumentation_bounds(self):
+        changes = {
+            'desktopEnv': {}, 'stderrLimitBytes': 8388609, 'observerSha256': '0' * 64,
+            'observerMaxEvents': 4097, 'observerMaxSeconds': 901,
+            'exclusiveGrab': True, 'readyCaptureSeconds': 15, 'extra': True,
+        }
+        with tempfile.TemporaryDirectory() as work:
+            for key, value in changes.items():
+                changed = self.review('install-lifecycle', 'install-lifecycle-pointer-ready-v1')
+                changed['instrumentation'][key] = value
+                with self.subTest(field=key), self.assertRaisesRegex(ValueError, 'instrumentation'):
+                    self.validate(Path(work), changed)
+
 
 if __name__ == '__main__': unittest.main()

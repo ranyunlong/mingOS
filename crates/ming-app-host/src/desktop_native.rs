@@ -495,7 +495,9 @@ impl NativeDesktop {
             && let Some((x, y)) = self.mouse
             && install_cell(session.options.width, session.options.height).contains(x, y)
         {
-            session.begin_install_from_dock()?;
+            if let Err(error) = session.begin_install_from_dock() {
+                session.note_install_rejection(&error)?;
+            }
         }
         Ok(true)
     }
@@ -969,7 +971,84 @@ mod input_tests {
         app.mouse = Some((control.x + 1, control.y + 1));
         app.down().unwrap();
         assert!(app.install_release().unwrap());
-        assert_eq!(app.session.as_ref().unwrap().storage_prompt().unwrap().mode, 16);
+        assert_eq!(
+            app.session
+                .as_ref()
+                .unwrap()
+                .storage_prompt()
+                .unwrap()
+                .state_value()
+                .get("mode")
+                .and_then(|value| value.as_u64()),
+            Some(16)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_install_can_be_closed_and_retried_without_stopping_the_desktop() {
+        use std::os::unix::fs::PermissionsExt;
+        for invalid_manifest in [None, Some(b"invalid package".as_slice())] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("data");
+            let install = temp.path().join("install");
+            for directory in [&data, &install] {
+                std::fs::create_dir(directory).unwrap();
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let manifest = temp.path().join("source.json");
+            if let Some(bytes) = invalid_manifest {
+                std::fs::write(&manifest, bytes).unwrap();
+            }
+            let registry = crate::package_install::PackageInstallRegistry::open(&install).unwrap();
+            let mut options = DesktopOptions::parse([
+                "unused".into(), "--renderer".into(), "cpu".into(),
+                "--data-root".into(), data.into_os_string(),
+                "--install-source".into(), manifest.clone().into_os_string(),
+            ]).unwrap();
+            options.install_root = Some(install);
+            options.install_registry = Some(registry);
+            let mut app = NativeDesktop::new(options, Catalog { apps: vec![], autostart: vec![] });
+            let (options, catalog) = app.pending.take().unwrap();
+            let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+            session.start().unwrap();
+            app.session = Some(session);
+            let mut shell = DesktopShell::cpu();
+            let frame = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+            app.session.as_mut().unwrap().accepted(frame.sequence, false).unwrap();
+            let install_button = install_cell(1280, 800);
+            app.mouse = Some((install_button.x + 1, install_button.y + 1));
+            app.down().unwrap();
+            assert!(app.install_release().unwrap());
+            assert!(app.error.is_none());
+            assert!(app.session.as_ref().unwrap().closing.is_none());
+            assert!(!app.session.as_ref().unwrap().storage_prompt().unwrap().has_allow());
+            assert!(app.session.as_ref().unwrap().catalog.apps.is_empty());
+
+            let close = crate::graphics::desktop_shell::storage_prompt_geometry(1280, 800, true).unwrap().deny;
+            app.mouse = Some((close.x + 1, close.y + 1));
+            app.down().unwrap();
+            assert!(app.storage_release().unwrap());
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_some(), "unpresented error must not accept a click");
+
+            let frame = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+            app.session.as_mut().unwrap().accepted(frame.sequence, false).unwrap();
+            app.down().unwrap();
+            assert!(app.storage_release().unwrap());
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+            assert!(app.session.as_ref().unwrap().closing.is_none());
+
+            std::fs::write(temp.path().join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+            std::fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.retry-install","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+            let frame = render(app.session.as_mut().unwrap(), &mut shell).unwrap();
+            app.session.as_mut().unwrap().accepted(frame.sequence, false).unwrap();
+            app.mouse = Some((install_button.x + 1, install_button.y + 1));
+            app.down().unwrap();
+            assert!(app.install_release().unwrap());
+            assert!(app.session.as_ref().unwrap().storage_prompt().unwrap().has_allow());
+            assert!(app.session.as_ref().unwrap().closing.is_none());
+            assert!(app.session.as_ref().unwrap().catalog.apps.is_empty(), "retry must still require install confirmation");
+        }
     }
 
     #[cfg(target_os = "linux")]

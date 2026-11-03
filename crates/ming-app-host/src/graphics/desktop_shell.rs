@@ -96,6 +96,10 @@ impl StoragePrompt {
         Ok(Self { id: id.into(), version: String::new(), fingerprint: String::new(), replacement: true, mode: 15 })
     }
     #[cfg(target_os = "linux")]
+    pub fn install_rejected() -> Self {
+        Self { id: String::new(), version: String::new(), fingerprint: String::new(), replacement: true, mode: 22 }
+    }
+    #[cfg(target_os = "linux")]
     pub fn install(id: &str, version: &str, fingerprint: &str, update: bool, retry: bool, blocked: bool) -> Result<Self> {
         if !crate::app_data::valid_package_id(id) || version.is_empty() || version.len() > 16_384
             || !version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
@@ -107,7 +111,7 @@ impl StoragePrompt {
     }
     pub(super) fn buttons(&self) -> (&'static [u8], Option<&'static [u8]>) {
         match self.mode {
-            1 | 4 | 5 | 12 | 15 | 21 => (b"CLOSE", None),
+            1 | 4 | 5 | 12 | 15 | 21 | 22 => (b"CLOSE", None),
             2 | 8 => (b"CANCEL", Some(b"REVOKE")),
             3 | 7 | 9 | 11 | 14 | 18 | 19 => (b"CANCEL", Some(b"RETRY")),
             10 => (b"CANCEL", Some(b"UNINSTALL")),
@@ -128,6 +132,13 @@ impl StoragePrompt {
     }
     pub(crate) fn lines(&self, width: i32) -> Vec<Vec<u8>> {
         let capacity = ((width - 24) / 6) as usize;
+        if self.mode == 22 {
+            return vec![
+                b"INSTALL NOT STARTED".to_vec(),
+                b"CHECK PACKAGE, VERSION AND TRUST".to_vec(),
+                b"THEN TRY INSTALL AGAIN".to_vec(),
+            ];
+        }
         if self.mode == 8 || self.mode == 9 {
             let mut lines = vec![b"PUBLIC STORAGE ACCESS".to_vec()];
             lines.extend(format!("APP ID: {}", self.id).as_bytes().chunks(capacity).map(|part| part.to_vec()));
@@ -618,6 +629,21 @@ mod storage_prompt_tests {
         let blocked = StoragePrompt::uninstall_blocked(id).unwrap();
         assert!(blocked.lines(304).iter().any(|line| line == b"CLOSE APP FIRST"));
         assert_eq!(blocked.buttons(), (b"CLOSE".as_slice(), None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_install_prompt_exposes_no_package_identity_or_allow_action() {
+        let prompt = StoragePrompt::install_rejected();
+        assert_eq!(prompt.buttons(), (b"CLOSE".as_slice(), None));
+        assert!(!prompt.has_allow());
+        let state = prompt.state_value();
+        assert_eq!(state["packageId"], "");
+        assert_eq!(state["version"], "");
+        let lines = prompt.lines(304);
+        assert!(lines.iter().any(|line| line == b"INSTALL NOT STARTED"));
+        assert!(lines.iter().any(|line| line == b"CHECK PACKAGE, VERSION AND TRUST"));
+        assert!(lines.iter().all(|line| line.len() <= 46));
     }
 
     #[cfg(target_os = "linux")]

@@ -190,8 +190,20 @@ impl PackageInstallRegistry {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
         if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         let package = load_package(manifest_path).context("INSTALL_PACKAGE_LOAD")?;
+        self.install_loaded_package_locked(&package)
+    }
+
+    /// Commits the exact package bytes approved by the desktop confirmation.
+    /// The source path is not reopened after that identity check.
+    pub(crate) fn install_loaded_package(&self, package: &Package) -> Result<InstallState> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
+        self.install_loaded_package_locked(package)
+    }
+
+    fn install_loaded_package_locked(&self, package: &Package) -> Result<InstallState> {
         if package.manifest.data_migration.is_some() { bail!("INSTALL_MIGRATION_REQUIRES_UPDATE"); }
-        self.verify_publisher(&package)?;
+        self.verify_publisher(package)?;
         validate_package_record(&package.manifest.id, &package.manifest.version)?;
         let candidate = Record {
             version: package.manifest.version.clone(),
@@ -206,10 +218,10 @@ impl PackageInstallRegistry {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 bail!("INSTALL_CONTENT_DIRECTORY");
             }
-            self.verify_stored_package(&content_path, &package)?;
+            self.verify_stored_package(&content_path, package)?;
             false
         } else {
-            self.stage_package(&content_path, &package)?;
+            self.stage_package(&content_path, package)?;
             true
         };
         if state != InstallState::Unchanged {
@@ -268,7 +280,19 @@ impl PackageInstallRegistry {
         self.recover_pending_update_locked(authority)?;
         if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         let package = load_package(manifest_path).context("INSTALL_PACKAGE_LOAD")?;
-        self.verify_publisher(&package)?;
+        self.update_loaded_package_locked(&package, authority)
+    }
+
+    /// Updates from the exact package checked against the presented prompt.
+    pub(crate) fn update_loaded_package(&self, package: &Package, authority: &PackageStorageAuthority) -> Result<InstallState> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.recover_pending_update_locked(authority)?;
+        if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
+        self.update_loaded_package_locked(package, authority)
+    }
+
+    fn update_loaded_package_locked(&self, package: &Package, authority: &PackageStorageAuthority) -> Result<InstallState> {
+        self.verify_publisher(package)?;
         validate_package_record(&package.manifest.id, &package.manifest.version)?;
         let mut records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
         let old = records.get(&package.manifest.id).context("INSTALL_NOT_FOUND")?.clone();
@@ -293,9 +317,9 @@ impl PackageInstallRegistry {
         match fs::symlink_metadata(&content_path) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() || !metadata.is_dir() { bail!("INSTALL_CONTENT_DIRECTORY"); }
-                self.verify_stored_package(&content_path, &package)?;
+                self.verify_stored_package(&content_path, package)?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.stage_package(&content_path, &package)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.stage_package(&content_path, package)?,
             Err(error) => return Err(error).context("INSTALL_CONTENT_METADATA"),
         }
         let mut journal = UpdateJournal {
@@ -916,6 +940,62 @@ mod tests {
         let session = authority.file_session("dev.example.installed").unwrap();
         assert_eq!(session.read_file("state/counter").unwrap(), b"42");
         assert_eq!(session.read_file("counter"), Err(AppDataError::NotFound));
+    }
+
+    #[test]
+    fn loaded_install_commits_confirmed_bytes_after_source_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let source = temp.path().join("source");
+        let install_root = temp.path().join("install");
+        for path in [&source, &install_root] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let manifest = source.join("app.json");
+        fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.confirmed","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let confirmed = load_package(&manifest).unwrap();
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        registry.verify_package_source(&confirmed).unwrap();
+
+        fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0\x00").unwrap();
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.replacement","version":"2.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        assert_eq!(registry.install_loaded_package(&confirmed).unwrap(), InstallState::Installed);
+
+        let active = registry.active_manifest_path("dev.example.confirmed").unwrap();
+        assert_eq!(load_package(&active).unwrap(), confirmed);
+        assert!(registry.active_manifest_path("dev.example.replacement").is_err());
+    }
+
+    #[test]
+    fn loaded_update_commits_confirmed_bytes_after_source_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let source = temp.path().join("source");
+        let install_root = temp.path().join("install");
+        let data_root = temp.path().join("data");
+        for path in [&source, &install_root, &data_root] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let manifest = source.join("app.json");
+        fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.confirmed","version":"1.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let registry = PackageInstallRegistry::open(&install_root).unwrap();
+        registry.install_from_manifest(&manifest).unwrap();
+        let authority = PackageStorageAuthority::new(AppDataRoot::open(&data_root).unwrap());
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.confirmed","version":"1.1.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        let confirmed = load_package(&manifest).unwrap();
+        registry.verify_package_source(&confirmed).unwrap();
+
+        fs::write(source.join("main.wasm"), b"\0asm\x01\0\0\0\x00").unwrap();
+        fs::write(&manifest, r#"{"schemaVersion":1,"id":"dev.example.confirmed","version":"2.0.0","sdkVersion":6,"entry":"main.wasm"}"#).unwrap();
+        assert_eq!(registry.update_loaded_package(&confirmed, &authority).unwrap(), InstallState::Updated);
+
+        let active = registry.active_manifest_path("dev.example.confirmed").unwrap();
+        assert_eq!(load_package(&active).unwrap(), confirmed);
+        assert_eq!(registry.pending_update().unwrap().unwrap().new_version, "1.1.0");
     }
 
     #[test]

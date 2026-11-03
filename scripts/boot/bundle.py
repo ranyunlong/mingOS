@@ -169,7 +169,9 @@ def main():
     if args.pointer_handshake_diagnostics and not args.wayland_client_diagnostics:
         raise ValueError("pointer handshake requires instrumented Wayland client receipts")
     qualification = review.get("instrumentedQualification") is True
-    if qualification and (not args.pointer_handshake_diagnostics or review.get("instrumentedProfile") != "data-text-pointer-ready-v1" or review.get("inputSynchronization") != POINTER_SYNC_POLICY):
+    qualification_profile = ("install-lifecycle-pointer-ready-v1"
+                             if review.get("profile") == "install-lifecycle" else "data-text-pointer-ready-v1")
+    if qualification and (not args.pointer_handshake_diagnostics or review.get("instrumentedProfile") != qualification_profile or review.get("inputSynchronization") != POINTER_SYNC_POLICY):
         raise ValueError("explicit reviewed instrumented pointer qualification policy required")
     if qualification:
         expected_instrumentation = {"desktopEnv":{"WAYLAND_DEBUG":"client"}, "stderrLimitBytes":8388608,

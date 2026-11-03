@@ -187,3 +187,15 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 本轮在用户授权的 Docker Desktop/Linux 环境中完成当前工作树复核。Docker 镜像 `mingos-linux-task3:71b5bfa149d4` 与独立缓存卷可用；release Linux all-targets 共 `476 passed, 0 failed, 16 ignored`，13 个 headless/Wayland CPU runtime path 全部通过。trusted system-image 当前源码使用 UID65534、禁网、Rust `1.99.1` 完成 release build、`ldd` 和 Linux boundary tests；构建产物 Host SHA-256 为 `d815350c303721002b72bf426f876d2d04d4162ab47e7d27b04729769db4adb1`。本轮新增的安装 catalog 失败精确回滚测试在 Linux system-image lib 运行中通过：`package_install::tests::catalog_failure_rollback_restores_an_absent_install_record`、`ming_desktop::input_backpressure_tests::install_catalog_failure_restores_the_registry_record`。
 
 更新迁移的同 bundle、同数据盘两次 fresh QEMU cold boot 独立审计已通过：`0.1.0 -> 0.2.0`、journal 清理、第二次启动 `already-updated`、兄弟应用保留、marker `1 -> 2`、worker 停止、sync/unmount 和 kernel PowerDown 均通过。当前 Host 原始七步 kernel recovery 仍只在其 exact scope 内通过；Windows RTX 4070 硬件 GPU 仍只代表 Windows 硬件 GPU。完整安装 UI/可信发布者安装生命周期、多用户身份隔离、跨平台安装服务、物理输入、Linux 硬件 GPU/display 和完整 daily-system acceptance 仍未完成，`finalSystemAccepted=false`。详细证据见 `artifacts/overall-gate-audit-20261102.json`。
+
+## 2026-11-03 桌面安装入口实现与验收准备
+
+本阶段完善可信父侧安装入口的失败提示和重试处理，安装登记使用确认时已验证的同一个包对象提交，避免再次读取源包造成身份竞态；补充应用私有数据迁移与回滚覆盖。安装提示状态增加已呈现帧序号，输入计划只在当前提示确已呈现后发送确认。可信安装源允许有界脚本延迟检查待安装应用，实际启动时仍检查登记。
+
+固定 Linux 环境下，冻结源码的 `ming-app-host` release all-targets 测试为 `505 passed, 0 failed, 16 ignored`；release all-features/all-targets check 与 Host、fixture helper 构建通过。真实 fixture 的初始包和源包均通过独立 Ed25519 验签，篡改消息被拒绝。证据分别位于 `artifacts/linux-final-release-20261103-171235/summary.json` 和 `artifacts/install-entry-actual-20261103-171939/fixture-verification.json`。
+
+首次新 bundle 冷启动未通过：QMP 接受 INSTALL 点击，但没有观察到提示；随后脚本启动尚未安装的应用而报 `DESKTOP_UNKNOWN_APP`，第二次启动未执行。原始日志、bundle 和数据盘已保存于 `artifacts/install-entry-actual-20261103-171939/`。首次 pointer 创建竞态是待验证假设，现有记录不足以证明事件在哪一层丢失。本阶段另为安装 profile 增加独立 pointer-ready qualification 标识与提示呈现/握手时序测试；这不代表真实输入问题已解决。
+
+后续必须运行独立被动输入诊断，根据证据修复后重新构建 bundle 并完成两次冷启动与独立审计。诊断专用 Docker 卷的自动审批曾超时，进程未启动，记录见 `artifacts/install-entry-passive-diagnostic-20261103-174309/`。物理输入、硬件显示及完整系统验收仍未完成，`finalSystemAccepted=false`。
+
+输入证据审计准备：为安装 profile 限定专用 pointer-ready qualification，保留原有 policy、诊断开关和资源限制的严格校验；Python boot 相关回归 `76/76` 通过。新增的原始握手证据审计以合成正反例验证 `17/17`，并拒绝历史失败记录；独立复核指出的慢 QMP 回复导致超时窗口误判已修正。审计器尚无真实成功 cold-pair 可验证，其通过不等于 QEMU 验收通过。

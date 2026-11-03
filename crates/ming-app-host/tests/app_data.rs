@@ -1046,3 +1046,179 @@ fn case_distinct_catalog_keys_do_not_alias() {
     reserved.write(1, b"ordinary data").unwrap();
     assert_eq!(reserved.size(1), Ok(13));
 }
+
+#[cfg(target_os = "linux")]
+mod migration_tests {
+    use super::*;
+    use crate::package::{DataMigration, MigrationStep};
+    use std::sync::Arc;
+
+    const APP: &str = "dev.example.migration";
+
+    struct MigrationFixture {
+        root: Fixture,
+        authority: Arc<PackageStorageAuthority>,
+        package: PathBuf,
+    }
+
+    impl MigrationFixture {
+        fn new() -> Self {
+            let root = Fixture::new();
+            let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&root.0).unwrap()));
+            let session = authority.default_private_session(APP, [1; 32]).unwrap();
+            session.write_file("counter", b"42").unwrap();
+            session.write_file("obsolete", b"remove me").unwrap();
+            drop(session);
+            let package = fs::read_dir(&root.0).unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.file_name().unwrap().to_string_lossy().starts_with("app-"))
+                .unwrap();
+            Self { root, authority, package }
+        }
+
+        fn assert_original_files(&self) {
+            let session = self.authority.default_private_session(APP, [2; 32]).unwrap();
+            assert_eq!(session.read_file("counter").unwrap(), b"42");
+            assert_eq!(session.read_file("obsolete").unwrap(), b"remove me");
+            assert_eq!(session.read_file("state/counter"), Err(AppDataError::NotFound));
+        }
+
+        fn assert_no_transaction_directories(&self) {
+            assert!(fs::read_dir(&self.package).unwrap().all(|entry| {
+                !entry.unwrap().file_name().to_string_lossy().starts_with(".ming-update-")
+            }));
+        }
+    }
+
+    fn plan(steps: Vec<MigrationStep>) -> DataMigration {
+        DataMigration { from_version: "1.0.0".into(), steps }
+    }
+
+    fn move_counter() -> DataMigration {
+        plan(vec![
+            MigrationStep::EnsureDir { path: "state".into() },
+            MigrationStep::RenameFile { from: "counter".into(), to: "state/counter".into() },
+        ])
+    }
+
+    #[test]
+    fn private_migration_commit_applies_all_steps_and_removes_backup() {
+        let f = MigrationFixture::new();
+        let migration = plan(vec![
+            MigrationStep::EnsureDir { path: "state".into() },
+            MigrationStep::RenameFile { from: "counter".into(), to: "state/counter".into() },
+            MigrationStep::CopyFile { from: "state/counter".into(), to: "state/counter.bak".into() },
+            MigrationStep::DeleteFile { path: "obsolete".into() },
+        ]);
+        let transaction = f.authority.begin_private_data_migration(APP, &migration).unwrap();
+        let session = f.authority.default_private_session(APP, [2; 32]).unwrap();
+        assert_eq!(session.read_file("state/counter").unwrap(), b"42");
+        assert_eq!(session.read_file("state/counter.bak").unwrap(), b"42");
+        assert_eq!(session.read_file("counter"), Err(AppDataError::NotFound));
+        assert_eq!(session.read_file("obsolete"), Err(AppDataError::NotFound));
+        let backup = f.package.join(&transaction.backup_name);
+        assert_eq!(fs::read(backup.join("counter")).unwrap(), b"42");
+        assert_eq!(fs::read(backup.join("obsolete")).unwrap(), b"remove me");
+
+        assert!(f.authority.commit_private_data_migration(&transaction).unwrap());
+        assert!(!f.authority.commit_private_data_migration(&transaction).unwrap());
+        assert_eq!(session.read_file("state/counter").unwrap(), b"42");
+        f.assert_no_transaction_directories();
+    }
+
+    #[test]
+    fn private_migration_rollback_is_repeatable_and_preserves_other_storage() {
+        let f = MigrationFixture::new();
+        let sibling = f.authority.default_private_session("dev.example.sibling", [3; 32]).unwrap();
+        sibling.write_file("counter", b"sibling").unwrap();
+        f.authority.authorize_public(APP).unwrap();
+        let public = f.authority.public_session(APP).unwrap();
+        public.write_file("counter", b"public").unwrap();
+
+        let transaction = f.authority.begin_private_data_migration(APP, &move_counter()).unwrap();
+        let updated = f.authority.default_private_session(APP, [2; 32]).unwrap();
+        assert_eq!(updated.read_file("state/counter").unwrap(), b"42");
+        drop(updated);
+        f.authority.rollback_private_data_migration(&transaction).unwrap();
+        f.authority.rollback_private_data_migration(&transaction).unwrap();
+
+        f.assert_original_files();
+        assert_eq!(sibling.read_file("counter").unwrap(), b"sibling");
+        assert_eq!(public.read_file("counter").unwrap(), b"public");
+        f.assert_no_transaction_directories();
+    }
+
+    #[test]
+    fn private_migration_rename_conflict_discards_prior_staged_changes() {
+        let f = MigrationFixture::new();
+        let migration = plan(vec![
+            MigrationStep::EnsureDir { path: "state".into() },
+            MigrationStep::RenameFile { from: "counter".into(), to: "state/counter".into() },
+            MigrationStep::RenameFile { from: "obsolete".into(), to: "state/counter".into() },
+        ]);
+        assert!(f.authority.begin_private_data_migration(APP, &migration).is_err());
+
+        f.assert_original_files();
+        assert!(!f.package.join("files/state").exists());
+        f.assert_no_transaction_directories();
+        // A failed attempt must not poison a subsequent valid migration.
+        let transaction = f.authority.begin_private_data_migration(APP, &move_counter()).unwrap();
+        f.authority.rollback_private_data_migration(&transaction).unwrap();
+        f.assert_original_files();
+        f.assert_no_transaction_directories();
+    }
+
+    #[test]
+    fn private_migration_requires_all_target_private_sessions_to_drop() {
+        let f = MigrationFixture::new();
+        let session = f.authority.default_private_session(APP, [1; 32]).unwrap();
+        let clone = session.clone();
+        assert!(matches!(f.authority.begin_private_data_migration(APP, &move_counter()), Err(AppDataError::Denied)));
+        drop(session);
+        assert!(matches!(f.authority.begin_private_data_migration(APP, &move_counter()), Err(AppDataError::Denied)));
+        assert_eq!(clone.read_file("counter").unwrap(), b"42");
+        f.assert_no_transaction_directories();
+        drop(clone);
+
+        let transaction = f.authority.begin_private_data_migration(APP, &move_counter()).unwrap();
+        f.authority.rollback_private_data_migration(&transaction).unwrap();
+        f.assert_original_files();
+        f.assert_no_transaction_directories();
+    }
+
+    #[test]
+    fn private_migration_refuses_symlinks_without_touching_their_target() {
+        use std::os::unix::fs::symlink;
+        let f = MigrationFixture::new();
+        let outside = f.root.0.join("outside");
+        fs::write(&outside, b"outside data").unwrap();
+        let link = f.package.join("files/link");
+        symlink(&outside, &link).unwrap();
+        let migration = plan(vec![MigrationStep::DeleteFile { path: "link".into() }]);
+        assert!(f.authority.begin_private_data_migration(APP, &migration).is_err());
+
+        assert_eq!(fs::read(&outside).unwrap(), b"outside data");
+        assert_eq!(fs::read_link(&link).unwrap(), outside);
+        f.assert_original_files();
+        f.assert_no_transaction_directories();
+    }
+
+    #[test]
+    fn private_migration_copy_over_quota_preserves_original_tree() {
+        let f = MigrationFixture::new();
+        let bytes = vec![7; MAX_PRIVATE_TOTAL_BYTES / 2 + 1];
+        let session = f.authority.default_private_session(APP, [1; 32]).unwrap();
+        session.write_file("large", &bytes).unwrap();
+        drop(session);
+        let migration = plan(vec![
+            MigrationStep::EnsureDir { path: "state".into() },
+            MigrationStep::CopyFile { from: "large".into(), to: "state/large".into() },
+        ]);
+        assert!(matches!(f.authority.begin_private_data_migration(APP, &migration), Err(AppDataError::Io)));
+
+        f.assert_original_files();
+        assert_eq!(fs::read(f.package.join("files/large")).unwrap(), bytes);
+        assert!(!f.package.join("files/state").exists());
+        f.assert_no_transaction_directories();
+    }
+}

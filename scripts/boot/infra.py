@@ -90,6 +90,12 @@ def validate_state(state, boot_id, session_id=None, revision=None):
                 or not isinstance(prompt.get("version"), str) or len(prompt["version"]) > 16384
                 or type(prompt.get("hasAllow")) is not bool):
                 raise ValueError("state storage prompt")
+        prompt_sequence = root.get("storagePromptPresentedSequence")
+        if prompt_sequence is not None and (
+            prompt is None or not integer(prompt_sequence, 1)
+            or prompt_sequence != root.get("presentedSequence")
+        ):
+            raise ValueError("state storage prompt presentation sequence")
     apps = state.get("apps")
     if not isinstance(apps, list) or len(apps) > 4:
         raise ValueError("state app count")
@@ -129,6 +135,10 @@ def state_input_ready(state, required):
         return False
     if root.get("width", 0) < 2 or root.get("height", 0) < 2:
         return False
+    if root.get("storagePrompt") is not None and "storagePromptPresentedSequence" in root:
+        prompt_sequence = root["storagePromptPresentedSequence"]
+        if not integer(prompt_sequence, 1) or prompt_sequence != root.get("presentedSequence"):
+            return False
     apps = {app["app"]: app for app in state["apps"]}
     if state["phase"] == "starting" and root.get("storagePrompt") is None and not any(
         app_id not in required and app.get("state") == "closed"
@@ -228,12 +238,14 @@ class InputPlan:
             if not isinstance(apps, list) or any(not integer(x, 1, 65535) for x in apps):
                 raise ValueError("step requireApps")
             expect = step.get("expect", {})
-            if not isinstance(expect, dict) or set(expect) - {"phase", "rootAdvance", "sourceAdvance", "apps", "storagePrompt"}:
+            if not isinstance(expect, dict) or set(expect) - {"phase", "rootAdvance", "sourceAdvance", "apps", "storagePrompt", "storagePromptPresented"}:
                 raise ValueError("input expectation")
             if "phase" in expect and expect["phase"] not in ("ready", "stopping", "stopped", "failed"):
                 raise ValueError("input expected phase")
             if "rootAdvance" in expect and type(expect["rootAdvance"]) is not bool:
                 raise ValueError("input rootAdvance")
+            if "storagePromptPresented" in expect and type(expect["storagePromptPresented"]) is not bool:
+                raise ValueError("input storage prompt presentation")
             if "sourceAdvance" in expect and (not isinstance(expect["sourceAdvance"], list) or any(not integer(x, 1, 65535) for x in expect["sourceAdvance"])):
                 raise ValueError("input sourceAdvance")
             if "storagePrompt" in expect:
@@ -303,6 +315,13 @@ class InputPlan:
                 return
             if "storagePrompt" in expected and now_root_prompt(state) != expected["storagePrompt"]:
                 return
+            if expected.get("storagePromptPresented"):
+                root = state.get("root") or {}
+                prompt_sequence = root.get("storagePromptPresentedSequence")
+                if (now_root_prompt(state) is None or not integer(prompt_sequence, 1)
+                    or prompt_sequence != root.get("presentedSequence")
+                    or prompt_sequence <= (self.base["root"].get("presentedSequence") or 0)):
+                    return
             if any(condition["app"] not in now
                    or now[condition["app"]]["generation"] != condition["generation"]
                    or now[condition["app"]]["state"] != condition["state"]

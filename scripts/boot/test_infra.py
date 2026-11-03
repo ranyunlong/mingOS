@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -85,6 +86,242 @@ class InfraTests(unittest.TestCase):
             "mode": 16, "packageId": "dev.ming.install-demo", "version": "1.0.0", "hasAllow": True,
         }
         self.assertTrue(state_input_ready(state, [1]))
+
+    def test_state_input_ready_gates_current_prompt_only_when_new_field_is_present(self):
+        for phase in ('starting', 'ready'):
+            with self.subTest(phase=phase):
+                state = self.state()
+                state['phase'] = phase
+                state['root']['storagePrompt'] = {
+                    'mode': 16, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'hasAllow': True,
+                }
+                self.assertTrue(state_input_ready(state, [1]), 'legacy prompt state remains compatible')
+                for sequence in (None, 0, -1, 8, 10, True, False, '9', 9.0):
+                    with self.subTest(sequence=sequence):
+                        state['root']['storagePromptPresentedSequence'] = sequence
+                        self.assertFalse(state_input_ready(state, [1]))
+                state['root']['storagePromptPresentedSequence'] = 9
+                self.assertTrue(state_input_ready(state, [1]))
+        state = self.state()
+        state['root'].update(storagePrompt=None, storagePromptPresentedSequence=None)
+        self.assertTrue(state_input_ready(state, [1]), 'no prompt must not block ordinary input')
+
+    def test_input_plan_defers_prompt_click_until_current_prompt_frame_is_presented(self):
+        class Transport:
+            def __init__(self): self.calls = []
+            def execute(self, command, args): self.calls.append((command, args)); return {}
+        with tempfile.TemporaryDirectory() as work:
+            plan = InputPlan({'schemaVersion': 1, 'requireApps': [1], 'steps': [{
+                'name': 'confirm-install', 'events': [
+                    {'kind': 'button', 'button': 'left', 'down': True},
+                    {'kind': 'button', 'button': 'left', 'down': False},
+                ], 'expect': {'storagePrompt': None},
+            }]}, Path(work) / 'inputs.jsonl', 10)
+            state = self.state()
+            state['root']['storagePrompt'] = {
+                'mode': 16, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'hasAllow': True,
+            }
+            state['root']['storagePromptPresentedSequence'] = None
+            qmp = Transport()
+            plan.advance(state, qmp)
+            self.assertEqual(qmp.calls, [], 'do not send confirm buttons before prompt presentation')
+            state['root']['storagePromptPresentedSequence'] = 9
+            plan.advance(state, qmp)
+            self.assertEqual([command for command, _ in qmp.calls], ['input-send-event', 'input-send-event'])
+
+    def test_state_prompt_presentation_sequence_is_optional_and_bound_to_current_root(self):
+        state = self.state()
+        state['root']['storagePrompt'] = {
+            'mode': 16, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'hasAllow': True,
+        }
+        # Legacy states remain valid; an unpresented current prompt uses null.
+        validate_state(state, 'boot-1')
+        state['root']['storagePromptPresentedSequence'] = None
+        validate_state(state, 'boot-1')
+        state['root']['storagePromptPresentedSequence'] = 9
+        validate_state(state, 'boot-1')
+        for value in (True, False, 0, -1, 8, 10, '9', 9.0):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                invalid = self.state()
+                invalid['root'].update(storagePrompt=state['root']['storagePrompt'],
+                                       storagePromptPresentedSequence=value)
+                validate_state(invalid, 'boot-1')
+        state['root']['storagePrompt'] = None
+        with self.assertRaises(ValueError):
+            validate_state(state, 'boot-1')
+        state['root']['storagePromptPresentedSequence'] = None
+        validate_state(state, 'boot-1')
+
+    def test_input_prompt_presentation_gate_waits_for_current_prompt_frame(self):
+        class Transport:
+            def execute(self, command, args): return {}
+        prompt = {'mode': 16, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'hasAllow': True}
+        spec = {'schemaVersion': 1, 'requireApps': [1], 'steps': [{
+            'name': 'native-install', 'events': [{'kind': 'key', 'qcode': 'a', 'down': False}],
+            'expect': {'storagePrompt': prompt, 'storagePromptPresented': True},
+        }]}
+        with tempfile.TemporaryDirectory() as work:
+            try:
+                plan = InputPlan(spec, Path(work) / 'inputs.jsonl', 10)
+            except ValueError as error:
+                self.fail('explicit storagePromptPresented expectation must be supported: ' + str(error))
+            plan.advance(self.state(), Transport())
+            for sequence in ('missing', None, 9, 11, True):
+                state = self.state()
+                state['revision'] = 4
+                state['phase'] = 'starting'
+                state['root'].update(presentedSequence=10, storagePrompt=prompt)
+                if sequence != 'missing':
+                    state['root']['storagePromptPresentedSequence'] = sequence
+                plan.advance(state, Transport())
+                self.assertFalse(plan.complete, 'must reject missing, stale, future, or noninteger evidence')
+            state['root']['storagePromptPresentedSequence'] = 10
+            plan.advance(state, Transport())
+            self.assertTrue(plan.complete)
+
+    def test_input_prompt_presentation_gate_requires_prompt_and_post_dispatch_frame(self):
+        class Transport:
+            def execute(self, command, args): return {}
+        prompt = {'mode': 16, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'hasAllow': True}
+        spec = {'schemaVersion': 1, 'requireApps': [1], 'steps': [{
+            'name': 'wait-presented', 'events': [{'kind': 'key', 'qcode': 'a', 'down': False}],
+            'expect': {'storagePromptPresented': True},
+        }]}
+        with tempfile.TemporaryDirectory() as work:
+            try:
+                plan = InputPlan(spec, Path(work) / 'inputs.jsonl', 10)
+            except ValueError as error:
+                self.fail('explicit storagePromptPresented expectation must be supported: ' + str(error))
+            before = self.state()
+            before['root'].update(storagePrompt=prompt, storagePromptPresentedSequence=9)
+            plan.advance(before, Transport())
+            same_frame = self.state()
+            same_frame['revision'] = 4
+            same_frame['root'].update(storagePrompt=prompt, storagePromptPresentedSequence=9)
+            plan.advance(same_frame, Transport())
+            self.assertFalse(plan.complete)
+            no_prompt = self.state()
+            no_prompt['revision'] = 4
+            no_prompt['root'].update(presentedSequence=10, storagePromptPresentedSequence=10)
+            plan.advance(no_prompt, Transport())
+            self.assertFalse(plan.complete)
+            no_prompt['root']['storagePrompt'] = prompt
+            plan.advance(no_prompt, Transport())
+            self.assertTrue(plan.complete)
+
+    def test_input_prompt_presentation_expectation_requires_boolean(self):
+        with tempfile.TemporaryDirectory() as work:
+            for value in (None, 1, 'true', {}, []):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    InputPlan({'schemaVersion': 1, 'requireApps': [1], 'steps': [{
+                        'name': 'invalid', 'events': [{'kind': 'key', 'qcode': 'a', 'down': False}],
+                        'expect': {'storagePromptPresented': value},
+                    }]}, Path(work) / 'inputs.jsonl', 10)
+
+    def test_install_pointer_receipt_does_not_replace_prompt_presentation(self):
+        class Transport:
+            def __init__(self): self.calls = []
+            def execute(self, command, args=None):
+                self.calls.append((command, args))
+                return [] if command == 'query-mice' else {}
+            def batches(self):
+                return [args['events'] for command, args in self.calls if command == 'input-send-event']
+        prompt = {'mode': 16, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'hasAllow': True}
+        spec = {'schemaVersion': 1, 'requireApps': [1], 'steps': [
+            {'name': 'native-install', 'events': [
+                {'kind': 'pointer', 'x': 1140, 'y': 12},
+                {'kind': 'button', 'button': 'left', 'down': True},
+                {'kind': 'button', 'button': 'left', 'down': False},
+            ], 'expect': {'storagePrompt': prompt, 'storagePromptPresented': True}},
+            {'name': 'allow-install', 'events': [
+                {'kind': 'pointer', 'x': 880, 'y': 478},
+                {'kind': 'button', 'button': 'left', 'down': True},
+                {'kind': 'button', 'button': 'left', 'down': False},
+            ], 'expect': {'storagePrompt': None}},
+        ]}
+        with tempfile.TemporaryDirectory() as work:
+            plan = InputPlan(spec, Path(work) / 'inputs.jsonl', 10,
+                             split_transactions=True, pointer_handshake=True)
+            qmp = Transport()
+            before = self.state()
+            context = {'desktopPid': 66, 'logOffset': 100}
+            plan.advance(before, qmp, context)
+            self.assertEqual([len(batch) for batch in qmp.batches()], [2])
+            plan.advance(before, qmp, context)
+            self.assertEqual(len(qmp.batches()), 1, 'buttons require a client receipt after ABS')
+            receipt = {'bootId': 'boot-1', 'sessionId': 'session-1', 'desktopPid': 66,
+                       'entered': True, 'x': 1140.1, 'y': 12.1, 'pointer': 36,
+                       'surface': 15, 'sequence': 1, 'logOffset': 101}
+            context['receipt'] = receipt
+            plan.advance(before, qmp, context)
+            self.assertEqual(qmp.batches()[1:], [
+                [{'type': 'btn', 'data': {'down': True, 'button': 'left'}}],
+                [{'type': 'btn', 'data': {'down': False, 'button': 'left'}}],
+            ])
+            pending = copy.deepcopy(before)
+            pending['revision'] += 1
+            pending['phase'] = 'starting'
+            pending['root'].update(presentedSequence=10, storagePrompt=prompt,
+                                   storagePromptPresentedSequence=None)
+            plan.advance(pending, qmp, context)
+            plan.advance(pending, qmp, context)
+            self.assertEqual(plan.index, 0, 'root advance and client input receipt cannot prove prompt presentation')
+            self.assertEqual(len(qmp.batches()), 3, 'ALLOW must not start while the prompt is unpresented')
+            presented = copy.deepcopy(pending)
+            presented['revision'] += 1
+            presented['root']['storagePromptPresentedSequence'] = 10
+            plan.advance(presented, qmp, context)
+            self.assertEqual(plan.index, 1)
+            plan.advance(presented, qmp, context)
+            self.assertEqual([len(batch) for batch in qmp.batches()], [2, 1, 1, 2])
+
+    def test_prompt_invalidated_during_pointer_handshake_defers_buttons(self):
+        class Transport:
+            def __init__(self): self.calls = []
+            def execute(self, command, args=None):
+                self.calls.append((command, args))
+                return [] if command == 'query-mice' else {}
+            def batches(self):
+                return [args['events'] for command, args in self.calls if command == 'input-send-event']
+        spec = {'schemaVersion': 1, 'requireApps': [1], 'steps': [{
+            'name': 'allow-install', 'events': [
+                {'kind': 'pointer', 'x': 880, 'y': 478},
+                {'kind': 'button', 'button': 'left', 'down': True},
+                {'kind': 'button', 'button': 'left', 'down': False},
+            ], 'expect': {'storagePrompt': None},
+        }]}
+        with tempfile.TemporaryDirectory() as work:
+            plan = InputPlan(spec, Path(work) / 'inputs.jsonl', 10,
+                             split_transactions=True, pointer_handshake=True)
+            qmp = Transport()
+            presented = self.state()
+            presented['phase'] = 'starting'
+            presented['root'].update(storagePrompt={
+                'mode': 16, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'hasAllow': True,
+            }, storagePromptPresentedSequence=9)
+            context = {'desktopPid': 66, 'logOffset': 100}
+            plan.advance(presented, qmp, context)
+            self.assertEqual([len(batch) for batch in qmp.batches()], [2])
+            invalidated = copy.deepcopy(presented)
+            invalidated['revision'] += 1
+            invalidated['root']['storagePromptPresentedSequence'] = None
+            context['receipt'] = {'bootId': 'boot-1', 'sessionId': 'session-1', 'desktopPid': 66,
+                                  'entered': True, 'x': 880.1, 'y': 478.1, 'pointer': 36,
+                                  'surface': 15, 'sequence': 1, 'logOffset': 101}
+            plan.advance(invalidated, qmp, context)
+            self.assertEqual(len(qmp.batches()), 1, 'a matching pointer receipt cannot bypass current prompt readiness')
+            refreshed = copy.deepcopy(invalidated)
+            refreshed['revision'] += 1
+            refreshed['root'].update(presentedSequence=10, storagePromptPresentedSequence=10)
+            plan.advance(refreshed, qmp, context)
+            self.assertEqual([len(batch) for batch in qmp.batches()], [2, 1, 1])
+            self.assertFalse(plan.complete, 'dispatch alone cannot prove installation completed')
+            dismissed = copy.deepcopy(refreshed)
+            dismissed['revision'] += 1
+            dismissed['phase'] = 'ready'
+            dismissed['root'].update(storagePrompt=None, storagePromptPresentedSequence=None)
+            plan.advance(dismissed, qmp, context)
+            self.assertTrue(plan.complete)
 
     def test_input_is_vm_protocol_only_and_checks_geometry(self):
         s = self.state()
