@@ -2,10 +2,12 @@
 """Task-owned regular ext4 images. No host mount, block device, or overwrite support."""
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import stat
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from bootlib import sha256
@@ -64,17 +66,42 @@ def load_disk(root, name):
         raise ValueError("on-disk filesystem identity mismatch")
     return dict(manifest, imagePath=str(image), manifestPath=str(manifest_path))
 
+def runtime_directory(root):
+    root = Path(root)
+    if (sys.platform != "linux" or os.geteuid() != 65534 or not root.is_absolute()
+            or root.resolve() != root or any(c in str(root) for c in "\\:,=\0")):
+        raise ValueError("runtime directory must be a canonical Linux uid65534 path")
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 65534 or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError("runtime directory owner/mode must be 65534/0700")
+    filesystem = subprocess.run(["/usr/bin/stat", "-f", "-c", "%T", str(root)],
+                                capture_output=True, text=True, timeout=5, check=True)
+    if filesystem.stdout.strip() != "tmpfs":
+        raise ValueError("runtime directory must be on Linux tmpfs")
+    return root
+
 @contextlib.contextmanager
-def lease(root, manifest):
+def lease(root, manifest, runtime_root=None):
     import fcntl
     image = contained(workspace(root), manifest["image"])
-    lock = image.with_suffix(image.suffix + ".lock")
+    if runtime_root is None:
+        lock = image.with_suffix(image.suffix + ".lock")
+    else:
+        runtime = runtime_directory(runtime_root)
+        info = regular_file(image)
+        if info.st_uid != 65534 or info.st_mode & 0o077:
+            raise ValueError("disk image owner/mode must be 65534/0600")
+        # The same canonical image must share a lease even if manifest metadata differs.
+        key = hashlib.sha256(os.fsencode(image)).hexdigest()
+        lock = runtime / ("disk-" + key + ".lock")
     flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
     fd = os.open(lock, flags, 0o600)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 65534:
             raise ValueError("disk lease must be owned regular file")
+        if runtime_root is not None and stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("runtime disk lease mode must be 0600")
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield
     finally:

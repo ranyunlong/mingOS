@@ -2,8 +2,10 @@
 """Task-owned QEMU runner. Kernel boot requires exact review; paused probes execute no CPU."""
 import argparse
 import contextlib
+import hashlib
 import json
 import base64
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -116,6 +118,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--work-root", type=Path)
+    parser.add_argument("--runtime-root", type=Path, help="owned Linux tmpfs for disk lease and QMP socket")
     parser.add_argument("--data-manifest", help="relative manifest inside owned work-root")
     parser.add_argument("--input-script", type=Path)
     parser.add_argument("--boot-number", type=int, choices=(1, 2))
@@ -159,11 +162,22 @@ def main():
         parser.error("pointer handshake requires explicit instrumented pointer-ready bundle and split input")
     if manifest and manifest.get("diagnosticProfile") == "input-pointer-ready-v1" and not args.diagnostic_pointer_handshake:
         parser.error("pointer-ready bundle cannot fall back to unacknowledged input")
+    runtime = None
+    qmp_path = args.output / "qmp.sock"
+    if args.runtime_root is not None:
+        from data_disk import runtime_directory
+        runtime = runtime_directory(args.runtime_root)
+        key = hashlib.sha256(os.fsencode(args.output.absolute())).hexdigest()[:16]
+        qmp_path = runtime / ("qmp-" + key + ".sock")
+        if len(os.fsencode(qmp_path)) > 107:
+            raise ValueError("runtime QMP socket path exceeds Linux limit")
+        if qmp_path.exists() or qmp_path.is_symlink():
+            raise FileExistsError(qmp_path)
     disk = None
     if args.data_manifest:
         from data_disk import load_disk, lease
         disk = load_disk(args.work_root, args.data_manifest)
-        lease_context = lease(args.work_root, disk)
+        lease_context = lease(args.work_root, disk, runtime_root=runtime) if runtime is not None else lease(args.work_root, disk)
     else:
         lease_context = contextlib.nullcontext()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -174,6 +188,12 @@ def main():
         command = qemu_command(args.bundle, args.output, paused=args.probe_paused, data_disk=disk,
                                input_diagnostics=bool(manifest and manifest.get("inputDiagnostics")), boot_number=args.boot_number,
                                persistent_profile=review["profile"] if review and review.get("profile") in PERSISTENT_PAYLOAD_PROFILES else None)
+        if runtime is not None:
+            expected = "unix:" + str(args.output / "qmp.sock") + ",server=on,wait=off"
+            indices = [index for index, value in enumerate(command) if value == "-qmp"]
+            if len(indices) != 1 or command[indices[0] + 1:indices[0] + 2] != [expected]:
+                raise ValueError("unexpected QMP command contract")
+            command[indices[0] + 1] = "unix:" + str(qmp_path) + ",server=on,wait=off"
         report = {"argv": command, "bootAttempted": False, "status": "planned", "finalSystemAccepted": False,
                   "physicalInput": False, "physicalGpu": False, "probePaused": args.probe_paused,
                   "diagnosticOnly": bool(manifest and manifest.get("diagnosticOnly", manifest.get("inputDiagnostics"))), "diagnosticSplitInput": args.diagnostic_split_input, "pointerHandshake": args.diagnostic_pointer_handshake,
@@ -190,7 +210,7 @@ def main():
             with (args.output / "qemu.stdout.log").open("wb") as out, (args.output / "qemu.stderr.log").open("wb") as err:
                 proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
             report["bootAttempted"] = not args.probe_paused
-            qmp = Qmp(args.output / "qmp.sock", transcript_path=args.output / "qmp.jsonl")
+            qmp = Qmp(qmp_path, transcript_path=args.output / "qmp.jsonl")
             report["qemuVersion"] = qmp.execute("query-version")
             report["initialStatus"] = qmp.execute("query-status")
             names = {x["name"] for x in qmp.execute("query-commands")}
