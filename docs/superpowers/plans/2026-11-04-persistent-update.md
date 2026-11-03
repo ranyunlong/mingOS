@@ -21,7 +21,7 @@
 - 原 files 不存在的更新也必须支持：试运行可写入新非空 files，回滚要受限恢复原缺失状态；原命名空间不存在时只删除认可目标树并 rmdir 已验证为空的新命名空间。
 - 完整启动确认要求精确 package/version/fingerprint、UI ID/generation/window、PID、inputReady、呈现帧、正常完成、Result 接受、native exit 成功、reap、私有 session 已释放。仅 Ready 不提交。
 - 原历史包路径集合与 bytes 保留；只有原本不存在的精确新候选目录可作为合法增量，原已存在的候选仍受旧内容摘要约束。
-- 更新器不改兄弟私有数据、公共文件或公共授权。运行中兄弟可自行写数据；不变性测试使用静止 sentinel。新 fingerprint 继续匹配原公共授权策略，不继承旧 UI ID 的权限。
+- 更新器不改兄弟私有数据、公共文件或公共授权。协调记录必须绑定公共 policy slot 更新前的存在性及原始字节 hash；原先存在的 slot 丢失或变更须拒绝，首次缺失仍为默认空授权。运行中兄弟可自行写数据；不变性测试使用静止 sentinel。新 fingerprint 继续匹配原公共授权策略，不继承旧 UI ID 的权限。
 - 物理鼠标专项暂停，旧 profile/checker/evidence/失败盘不改写；`finalSystemAccepted=false`。进程中断恢复、正常重启和断电保证分别记录，本阶段不声称断电恢复。
 - candidate2 的 1214 项冻结文件与其已有 bundle 保持原样。实现必须在独立开发 checkout 中进行，并新建源码冻结、Host/helper、fixture、review、bundle 和资格盘；新 checkout 的具体创建遵守当前工作区授权与工具规则。
 - 当前只授权计划准备。实施时核对已有授权的具体构建、盘/卷/VM 和预算；计划中的后续命令不自行扩大授权。授权已覆盖的常规本地检查与任务步骤不重复请示。
