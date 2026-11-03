@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 import signal
 import stat
@@ -24,6 +25,18 @@ import uuid
 
 REPO = Path(__file__).resolve().parents[2]
 RUNTIME = Path('/run/mingos-runtime')
+OPENSSL_SOURCE_IMAGE = 'sha256:3646133f4b4d2e007dd3eee28d9db6336c29f6ccb31b9f8a49b88bc0a70051be'
+OPENSSL_SHA256 = 'acc10176d038aeb7b2a77d9ec972ac2985857a7191f7aecb7c54ef0e2c7e9549'
+# Extracted from the frozen Rust image. Its required libraries were compared
+# byte-for-byte with the frozen tools image; no checker or image is replaced.
+OPENSSL_LIBRARIES = {
+    '/lib/x86_64-linux-gnu/libc.so.6': '9792e3cbb541c8f44c7acf5f14f4022ea62998ecc787d326bed4d8b6547dfd92',
+    '/lib/x86_64-linux-gnu/libcrypto.so.3': '8ae56f0a9481280a68c19f59809cd242a07a91ad7142944d21a878221992244b',
+    '/lib/x86_64-linux-gnu/libssl.so.3': '9592038e92d1f41affcbb625334d0b6e788714c889104fa6d5b107cf9fd657f2',
+    '/lib/x86_64-linux-gnu/libz.so.1': '85590dd58edf5445e18bc7193e5ebc01ac5841f1ae187e97705a662e90c6421e',
+    '/lib/x86_64-linux-gnu/libzstd.so.1': '27f07c9a49c2c956bcfb64cd4712976586a66facbf15fc7f09bc37413b5f2b21',
+    '/lib64/ld-linux-x86-64.so.2': 'c8438e4fde1934e61c88311633f00949ff645d5c04cdb8671fa3d78164d2f307',
+}
 HOST_CHANGES = {'scripts/boot/data_disk.py', 'scripts/boot/vm.py'}
 EXECUTION_SOURCES = {'scripts/boot/persistent_uninstall_apfs.py', 'scripts/boot/test_persistent_uninstall_apfs.py',
                      'scripts/boot/test_runtime_storage.py'}
@@ -248,7 +261,32 @@ def verify_original(prep, repo=REPO):
     return stage, original, checker, review
 
 
-def execution_contract(identifier, storage, original, host_uid):
+def openssl_contract(path):
+    return {'sourceImage': OPENSSL_SOURCE_IMAGE, 'hostPath': str(path), 'containerPath': '/usr/bin/openssl',
+            'sha256': OPENSSL_SHA256, 'linuxDependencies': dict(OPENSSL_LIBRARIES)}
+
+
+def verify_openssl_runtime(path, source_image, writable_roots=(), container=False, repo=REPO):
+    path = canonical(path)
+    if not path.is_relative_to(canonical(repo)):
+        raise ValueError('OpenSSL input must be inside the read-only repository bind')
+    if source_image != OPENSSL_SOURCE_IMAGE: raise ValueError('OpenSSL source image differs')
+    if any(character in str(path) for character in '\\:,=\0'): raise ValueError('unsafe OpenSSL bind path')
+    if any(overlaps(path, canonical(root)) for root in writable_roots):
+        raise ValueError('OpenSSL input overlaps a writable runtime tree')
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise ValueError('single-link regular OpenSSL input required')
+    if info.st_mode & 0o022 or not info.st_mode & 0o111: raise ValueError('OpenSSL input permissions differ')
+    if sha(path) != OPENSSL_SHA256: raise ValueError('OpenSSL input hash differs')
+    if container:
+        if shutil.which('openssl') != '/usr/bin/openssl' or sha('/usr/bin/openssl') != OPENSSL_SHA256:
+            raise ValueError('mounted OpenSSL executable differs')
+        for library, expected in OPENSSL_LIBRARIES.items():
+            if sha(library) != expected: raise ValueError('OpenSSL dependency hash differs: ' + library)
+    return openssl_contract(path)
+
+
+def execution_contract(identifier, storage, original, host_uid, openssl):
     return {'schemaVersion': 1, 'profile': 'persistent-uninstall-apfs-pair-v1',
             'containerName': identifier, 'toolsImage': original['environment']['toolsImage'],
             'hostUid': host_uid, 'hostCoordinator': '/private/tmp/mingos-persistent-uninstall-apfs-' + str(host_uid),
@@ -257,6 +295,7 @@ def execution_contract(identifier, storage, original, host_uid):
             'diskManifest': 'disks/' + identifier + '-128.json', 'diskSizeMiB': 128,
             'runtimeRoot': str(RUNTIME), 'runtimeFileSystem': 'tmpfs', 'runtimeBytes': 16777216,
             'runtimeMode': '0700', 'runtimeUid': 65534, 'runtimeGid': 65534,
+            'opensslRuntime': openssl_contract(openssl),
             'uid': 65534, 'gid': 65534, 'cpus': 2, 'memoryBytes': 4294967296,
             'pidsLimit': 256, 'network': 'none', 'readOnlyRoot': True,
             'pairPolicy': 'one-container-two-fresh-sequential-qemu-strict-gate-after-each',
@@ -266,10 +305,12 @@ def execution_contract(identifier, storage, original, host_uid):
             'minimumHostAvailableBytes': 2147483648, 'retainedWorkerBudgetsChanged': False}
 
 
-def prepare(prep, attempt, storage, repo=REPO):
+def prepare(prep, attempt, storage, openssl, repo=REPO):
     prep, attempt, storage = map(canonical, (prep, attempt, storage))
     if overlaps(prep, attempt) or overlaps(prep, storage) or overlaps(storage, attempt):
         raise ValueError('original preparation, attempt and backing roots must be disjoint')
+    openssl = canonical(openssl)
+    verify_openssl_runtime(openssl, read(prep / 'freeze.json')['environment']['rustImage'], (attempt, storage), repo=repo)
     stage, original, checker, review = verify_original(prep, repo)
     attempt.mkdir(mode=0o700); sync_directory(attempt.parent)
     identifier = 'persistent-uninstall-apfs-' + uuid.uuid4().hex
@@ -278,7 +319,7 @@ def prepare(prep, attempt, storage, repo=REPO):
     write(attempt / 'execution-freeze.json', execution)
     origin = {'schemaVersion': 1, 'preparedAt': now(), 'prep': str(prep), 'repo': str(repo),
               'attempt': str(attempt), 'storageRoot': str(storage), 'identifier': identifier,
-              'hostUid': os.geteuid(), 'executionEnvironment': execution_contract(identifier, storage, original, os.geteuid()),
+              'hostUid': os.geteuid(), 'executionEnvironment': execution_contract(identifier, storage, original, os.geteuid(), openssl),
               'originalFreezeSha256': sha(prep / 'freeze.json'), 'reviewSha256': sha(prep / 'review.json'),
               'bundleIdentity': sha(prep / 'bundle/bundle.json'), 'executionFreezeSha256': sha(attempt / 'execution-freeze.json'),
               'originalStageSeals': {name: sha(prep / 'stages' / name / 'result.json') for name in ('prepare', 'build', 'bundle')},
@@ -293,8 +334,11 @@ def verify_execution(attempt, repo=REPO):
     origin = read(attempt / 'execution-origin.json'); prep = canonical(origin['prep'])
     if not re.fullmatch(r'persistent-uninstall-apfs-[0-9a-f]{32}', origin['identifier']): raise ValueError('invalid unique attempt identifier')
     storage = canonical(origin['storageRoot'])
+    openssl = canonical(origin['executionEnvironment']['opensslRuntime']['hostPath'])
     if any(overlaps(first, second) for first, second in ((prep, attempt), (prep, storage), (attempt, storage))):
         raise ValueError('preparation, attempt and backing roots must be disjoint')
+    verify_openssl_runtime(openssl, read(prep / 'freeze.json')['environment']['rustImage'],
+                           (attempt, storage), container=sys.platform == 'linux', repo=repo)
     stage, original, checker, review = verify_original(prep, repo)
     if origin['repo'] != str(repo) or origin['attempt'] != str(attempt): raise ValueError('execution path binding differs')
     for path, expected in [(prep / 'freeze.json', origin['originalFreezeSha256']), (prep / 'review.json', origin['reviewSha256']),
@@ -303,7 +347,7 @@ def verify_execution(attempt, repo=REPO):
     if set(origin['originalStageSeals']) != {'prepare', 'build', 'bundle'}: raise ValueError('complete original stage seals required')
     if type(origin['hostUid']) is not int or origin['hostUid'] < 0: raise ValueError('host uid binding required')
     if sys.platform == 'darwin' and origin['hostUid'] != os.geteuid(): raise ValueError('host uid changed')
-    if origin['executionEnvironment'] != execution_contract(origin['identifier'], storage, original, origin['hostUid']):
+    if origin['executionEnvironment'] != execution_contract(origin['identifier'], storage, original, origin['hostUid'], openssl):
         raise ValueError('new execution environment differs from exact runtime contract')
     for name, expected in origin['originalStageSeals'].items():
         if sha(prep / 'stages' / name / 'result.json') != expected: raise ValueError('original stage seal changed')
@@ -321,7 +365,9 @@ def docker_command(origin, attempt):
     repo = Path(origin['repo']); prep = Path(origin['prep'])
     original = read(prep / 'freeze.json')
     environment = origin['executionEnvironment']
-    expected = execution_contract(origin['identifier'], Path(origin['storageRoot']), original, origin['hostUid'])
+    openssl = canonical(environment['opensslRuntime']['hostPath'])
+    verify_openssl_runtime(openssl, original['environment']['rustImage'], (attempt, Path(origin['storageRoot'])), repo=repo)
+    expected = execution_contract(origin['identifier'], Path(origin['storageRoot']), original, origin['hostUid'], openssl)
     if environment != expected: raise ValueError('Docker command runtime contract differs')
     backing = Path(environment['hostBackingRoot'])
     return ['docker', 'run', '--name', origin['identifier'], '--cidfile', str(attempt / 'container.cid'),
@@ -332,7 +378,8 @@ def docker_command(origin, attempt):
             '--tmpfs', str(RUNTIME) + ':rw,noexec,size=16m,uid=65534,gid=65534,mode=700',
             '--mount', 'type=bind,source=' + str(repo) + ',target=' + str(repo) + ',readonly',
             '--mount', 'type=bind,source=' + str(attempt) + ',target=' + str(attempt),
-            '--mount', 'type=bind,source=' + str(backing) + ',target=/var/tmp', '--workdir', str(repo),
+            '--mount', 'type=bind,source=' + str(backing) + ',target=/var/tmp',
+            '--mount', 'type=bind,source=' + str(openssl) + ',target=/usr/bin/openssl,readonly', '--workdir', str(repo),
             environment['toolsImage'], 'python3', '-B', str(repo / 'scripts/boot/persistent_uninstall_apfs.py'),
             'inside', '--attempt-root', str(attempt)]
 
@@ -394,7 +441,8 @@ def host_run(attempt, repo=REPO):
         active = lock_dir / 'active.json'
         check_previous_writer(active)
         stage.inspect_image(execution['environment']['toolsImage'])
-        reject_overlapping_writers(stage.running_containers(), (storage, attempt, lock_dir))
+        reject_overlapping_writers(stage.running_containers(),
+                                   (storage, attempt, lock_dir, Path(origin['executionEnvironment']['opensslRuntime']['hostPath'])))
         if inspect_container(origin['identifier']) is not None: raise FileExistsError('attempt container already exists')
         # O_EXCL plus fsync is permanent, even after SIGKILL or host failure.
         write(attempt / 'attempt.json', {'startedAt': now(), 'retryAllowed': False, 'identifier': origin['identifier']})
@@ -525,11 +573,13 @@ def main(argv=None):
     parser.add_argument('--attempt-root', required=True, type=canonical)
     parser.add_argument('--prep', type=canonical)
     parser.add_argument('--storage-root', type=canonical)
+    parser.add_argument('--openssl-runtime', type=canonical)
     args = parser.parse_args(argv)
     if sys.version_info < (3, 11): parser.error('Python 3.11+ required for original frozen boot tooling')
     if args.operation == 'prepare':
         if args.prep is None or args.storage_root is None: parser.error('prepare requires --prep and --storage-root')
-        prepare(args.prep, args.attempt_root, args.storage_root)
+        if args.openssl_runtime is None: parser.error('prepare requires --openssl-runtime from the frozen Rust image')
+        prepare(args.prep, args.attempt_root, args.storage_root, args.openssl_runtime)
     elif args.operation == 'run': host_run(args.attempt_root)
     else: inside_pair(args.attempt_root)
     return 0

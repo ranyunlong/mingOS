@@ -1,5 +1,6 @@
 """Real file/process controls for APFS pair supervision. Never Docker or QEMU."""
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -216,17 +217,72 @@ class HostWriterTests(unittest.TestCase):
     def test_docker_command_has_one_container_two_rw_binds_and_tmpfs_runtime(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name).resolve(); prep = root / 'prep'; prep.mkdir()
-            runner.write(prep / 'freeze.json', {'environment': {'toolsImage': 'sha256:fixed'}})
+            runner.write(prep / 'freeze.json', {'environment': {'toolsImage': 'sha256:fixed', 'rustImage': runner.OPENSSL_SOURCE_IMAGE}})
+            executable = root / 'openssl'; executable.write_bytes(b'fixed runtime executable'); executable.chmod(0o555)
             origin = {'repo': str(root), 'prep': str(prep), 'identifier': 'unique-attempt', 'storageRoot': str(root / 'storage'), 'hostUid': os.geteuid()}
-            origin['executionEnvironment'] = runner.execution_contract(origin['identifier'], root / 'storage', runner.read(prep / 'freeze.json'), os.geteuid())
-            command = runner.docker_command(origin, root / 'attempt')
+            with patch.object(runner, 'OPENSSL_SHA256', hashlib.sha256(executable.read_bytes()).hexdigest()):
+                origin['executionEnvironment'] = runner.execution_contract(origin['identifier'], root / 'storage', runner.read(prep / 'freeze.json'), os.geteuid(), executable)
+                command = runner.docker_command(origin, root / 'attempt')
             self.assertEqual(command[:2], ['docker', 'run'])
             self.assertIn('/run/mingos-runtime:rw,noexec,size=16m,uid=65534,gid=65534,mode=700', command)
             binds = [command[index + 1] for index, arg in enumerate(command[:-1]) if arg == '--mount']
-            self.assertEqual(len(binds), 3)
+            self.assertEqual(len(binds), 4)
             self.assertTrue(binds[0].endswith(',readonly'))
             self.assertIn('target=/var/tmp', binds[2])
+            self.assertEqual(binds[3], 'type=bind,source=' + str(executable) + ',target=/usr/bin/openssl,readonly')
             self.assertNotIn('--rm', command)
+
+
+class OpenSslRuntimeTests(unittest.TestCase):
+    def test_prepare_rejects_runtime_source_outside_readonly_repo_before_creating_attempt(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name).resolve(); repo = root / 'repo'; repo.mkdir()
+            prep = root / 'prep'; prep.mkdir(); attempt = root / 'attempt'; storage = root / 'storage'
+            runner.write(prep / 'freeze.json', {'environment': {'rustImage': runner.OPENSSL_SOURCE_IMAGE}})
+            executable = root / 'openssl'; executable.write_bytes(b'fixed runtime executable'); executable.chmod(0o555)
+            with patch.object(runner, 'OPENSSL_SHA256', hashlib.sha256(executable.read_bytes()).hexdigest()), \
+                 patch.object(runner, 'verify_original', side_effect=AssertionError('outside source reached original verification')):
+                with self.assertRaisesRegex(ValueError, 'read-only repository'):
+                    runner.prepare(prep, attempt, storage, executable, repo=repo)
+            self.assertFalse(attempt.exists())
+
+    def test_frozen_runtime_contract_rejects_changed_bytes_source_and_writable_alias(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name).resolve(); executable = root / 'openssl'
+            executable.write_bytes(b'fixed runtime executable'); executable.chmod(0o555)
+            expected = hashlib.sha256(executable.read_bytes()).hexdigest()
+            with patch.object(runner, 'OPENSSL_SHA256', expected):
+                contract = runner.verify_openssl_runtime(executable, runner.OPENSSL_SOURCE_IMAGE, repo=root)
+                self.assertEqual(contract['sha256'], expected)
+                self.assertEqual(contract['containerPath'], '/usr/bin/openssl')
+                self.assertEqual(contract['linuxDependencies'], runner.OPENSSL_LIBRARIES)
+                with self.assertRaisesRegex(ValueError, 'source image'):
+                    runner.verify_openssl_runtime(executable, 'sha256:other', repo=root)
+                with self.assertRaisesRegex(ValueError, 'writable'):
+                    runner.verify_openssl_runtime(executable, runner.OPENSSL_SOURCE_IMAGE, (root,), repo=root)
+                executable.chmod(0o755); executable.write_bytes(b'changed')
+                with self.assertRaisesRegex(ValueError, 'hash'):
+                    runner.verify_openssl_runtime(executable, runner.OPENSSL_SOURCE_IMAGE, repo=root)
+
+    def test_runtime_input_rejects_alias_hardlink_and_writable_permissions(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name).resolve(); executable = root / 'openssl'
+            executable.write_bytes(b'fixed runtime executable'); executable.chmod(0o555)
+            with patch.object(runner, 'OPENSSL_SHA256', hashlib.sha256(executable.read_bytes()).hexdigest()):
+                alias = root / 'alias'; alias.symlink_to(executable)
+                with self.assertRaises(ValueError): runner.verify_openssl_runtime(alias, runner.OPENSSL_SOURCE_IMAGE, repo=root)
+                os.link(executable, root / 'hard')
+                with self.assertRaisesRegex(ValueError, 'single-link'):
+                    runner.verify_openssl_runtime(executable, runner.OPENSSL_SOURCE_IMAGE, repo=root)
+                (root / 'hard').unlink(); executable.chmod(0o777)
+                with self.assertRaisesRegex(ValueError, 'permissions'):
+                    runner.verify_openssl_runtime(executable, runner.OPENSSL_SOURCE_IMAGE, repo=root)
+
+    def test_prepare_requires_explicit_runtime_input_before_any_external_process(self):
+        with patch.object(subprocess, 'run', side_effect=AssertionError('spawn')), patch.object(sys, 'stderr', io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                runner.main(['prepare', '--attempt-root', '/private/tmp/new-attempt', '--prep', '/private/tmp/prep', '--storage-root', '/private/tmp/storage'])
+        self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == '__main__': unittest.main()
