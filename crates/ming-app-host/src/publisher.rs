@@ -31,6 +31,24 @@ struct PublisherRecord {
     state: PublisherState,
 }
 
+#[derive(Debug)]
+struct PublisherLock { file: Option<File> }
+
+impl PublisherLock {
+    fn into_file(mut self) -> File { self.file.take().unwrap() }
+}
+
+impl Drop for PublisherLock {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(file) = &self.file {
+            use std::os::fd::AsRawFd;
+            // Closing alone leaves the flock alive in a forked child until exec.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN); }
+        }
+    }
+}
+
 /// A keyring loaded once for one trusted parent process lifetime.
 pub struct PublisherTrustStore {
     root: PathBuf,
@@ -53,7 +71,7 @@ impl PublisherTrustStore {
         verify_root(root)?;
         let lock = open_lock(root, true)?;
         let records = load_records(&root.join(KEYRING_NAME), false)?;
-        Ok(Self { root: root.to_path_buf(), records, lock })
+        Ok(Self { root: root.to_path_buf(), records, lock: lock.into_file() })
     }
 
     /// Strict reopen: acquire an existing lock without repairing missing files.
@@ -62,7 +80,7 @@ impl PublisherTrustStore {
         verify_root(root)?;
         let lock = open_lock(root, false)?;
         let records = load_records(&root.join(KEYRING_NAME), false)?;
-        Ok(Self { root: root.to_path_buf(), records, lock })
+        Ok(Self { root: root.to_path_buf(), records, lock: lock.into_file() })
     }
 
     pub fn provision(root: impl AsRef<Path>, key_id: &str, public_key: &[u8; 32]) -> Result<()> {
@@ -175,7 +193,7 @@ fn verify_root(root: &Path) -> Result<()> {
     verify_private_owner(&metadata, "PUBLISHER_ROOT_PERMISSIONS")
 }
 
-fn open_lock(root: &Path, create: bool) -> Result<File> {
+fn open_lock(root: &Path, create: bool) -> Result<PublisherLock> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(create);
     #[cfg(unix)]
@@ -196,7 +214,7 @@ fn open_lock(root: &Path, create: bool) -> Result<File> {
         let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 { bail!("PUBLISHER_KEYRING_BUSY"); }
     }
-    Ok(lock)
+    Ok(PublisherLock { file: Some(lock) })
 }
 
 fn load_records(path: &Path, allow_missing: bool) -> Result<BTreeMap<String, PublisherRecord>> {
@@ -291,7 +309,62 @@ fn verify_private_owner(_metadata: &std::fs::Metadata, _error: &str) -> Result<(
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::net::UnixStream;
+
+    struct InheritedDescriptors { pid: libc::pid_t, release: UnixStream }
+
+    impl Drop for InheritedDescriptors {
+        fn drop(&mut self) {
+            let _ = self.release.write_all(&[1]);
+            loop {
+                let result = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
+                if result >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) { break; }
+            }
+        }
+    }
+
+    fn retain_inherited_descriptors() -> InheritedDescriptors {
+        let (parent, child) = UnixStream::pair().unwrap();
+        let parent_fd = parent.as_raw_fd();
+        let child_fd = child.as_raw_fd();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // A multithreaded test process may only use async-signal-safe calls
+            // after fork. Hold every inherited descriptor until the parent says
+            // to leave this deliberately extended fork-to-exec window.
+            unsafe {
+                libc::close(parent_fd);
+                let mut byte = 1u8;
+                if libc::write(child_fd, (&byte as *const u8).cast(), 1) != 1 { libc::_exit(71); }
+                while libc::read(child_fd, (&mut byte as *mut u8).cast(), 1) < 0 {
+                    if *libc::__errno_location() != libc::EINTR { libc::_exit(72); }
+                }
+                libc::_exit(0);
+            }
+        }
+        drop(child);
+        let mut holder = InheritedDescriptors { pid, release: parent };
+        let mut ready = [0];
+        holder.release.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [1]);
+        holder
+    }
+
+    #[test]
+    fn dropping_publisher_lock_releases_it_before_inheriting_child_execs() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = open_lock(root.path(), true).unwrap();
+        let _child_before_exec = retain_inherited_descriptors();
+        let error = open_lock(root.path(), true).unwrap_err();
+        assert!(format!("{error:#}").contains("PUBLISHER_KEYRING_BUSY"));
+        drop(lock);
+        let _next = open_lock(root.path(), true)
+            .expect("publisher lock must end with its owner even while a forked child retains its descriptor");
+    }
 
     fn fixture() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
