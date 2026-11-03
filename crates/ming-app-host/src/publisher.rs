@@ -56,6 +56,15 @@ impl PublisherTrustStore {
         Ok(Self { root: root.to_path_buf(), records, lock })
     }
 
+    /// Strict reopen: acquire an existing lock without repairing missing files.
+    pub(crate) fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        verify_root(root)?;
+        let lock = open_lock(root, false)?;
+        let records = load_records(&root.join(KEYRING_NAME), false)?;
+        Ok(Self { root: root.to_path_buf(), records, lock })
+    }
+
     pub fn provision(root: impl AsRef<Path>, key_id: &str, public_key: &[u8; 32]) -> Result<()> {
         validate_key_id(key_id)?;
         let root = root.as_ref();
@@ -172,12 +181,18 @@ fn open_lock(root: &Path, create: bool) -> Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | if create { 0 } else { libc::O_NONBLOCK });
     }
     let lock = options.open(root.join(LOCK_NAME)).context("PUBLISHER_KEYRING_LOCK")?;
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        if !create {
+            let metadata = lock.metadata().context("PUBLISHER_KEYRING_LOCK_METADATA")?;
+            if !metadata.is_file() || metadata.nlink() != 1 { bail!("PUBLISHER_KEYRING_LOCK_FILE"); }
+            verify_private_owner(&metadata, "PUBLISHER_KEYRING_LOCK_PERMISSIONS")?;
+        }
         let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 { bail!("PUBLISHER_KEYRING_BUSY"); }
     }
@@ -271,3 +286,102 @@ fn verify_private_owner(metadata: &std::fs::Metadata, error: &str) -> Result<()>
 
 #[cfg(not(target_os = "linux"))]
 fn verify_private_owner(_metadata: &std::fs::Metadata, _error: &str) -> Result<()> { Ok(()) }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    fn fixture() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        PublisherTrustStore::provision(root.path(), "test-key", key.verifying_key().as_bytes()).unwrap();
+        root
+    }
+
+    fn tree(root: &Path) -> BTreeMap<String, (u32, u64, u64, u64, Option<Vec<u8>>)> {
+        fs::read_dir(root).unwrap().map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            let bytes = metadata.is_file().then(|| fs::read(entry.path()).unwrap());
+            (entry.file_name().into_string().unwrap(),
+                (metadata.mode(), metadata.nlink(), metadata.ino(), metadata.len(), bytes))
+        }).collect()
+    }
+
+    #[test]
+    fn open_existing_requires_lock_without_creating_it() {
+        let root = fixture();
+        fs::remove_file(root.path().join(LOCK_NAME)).unwrap();
+        let before = tree(root.path());
+        let error = PublisherTrustStore::open_existing(root.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("PUBLISHER_KEYRING_LOCK"), "{error:#}");
+        assert_eq!(tree(root.path()), before);
+        assert!(!root.path().join(LOCK_NAME).exists());
+    }
+
+    #[test]
+    fn open_existing_preserves_files_and_holds_exclusive_lock() {
+        let root = fixture();
+        let before = tree(root.path());
+        let store = PublisherTrustStore::open_existing(root.path()).unwrap();
+        assert_eq!(store.records["test-key"].state, PublisherState::Active);
+        assert_eq!(store.records["test-key"].public_key, SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes());
+        let error = PublisherTrustStore::open_existing(root.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("PUBLISHER_KEYRING_BUSY"), "{error:#}");
+        assert_eq!(tree(root.path()), before);
+        drop(store);
+        assert!(PublisherTrustStore::open_existing(root.path()).is_ok());
+        assert_eq!(tree(root.path()), before);
+    }
+
+    #[test]
+    fn open_existing_rejects_unsafe_locks_without_mutation() {
+        for case in ["symlink", "hardlink", "permissions", "directory", "fifo"] {
+            let root = fixture();
+            let lock = root.path().join(LOCK_NAME);
+            fs::remove_file(&lock).unwrap();
+            match case {
+                "symlink" => symlink(root.path().join(KEYRING_NAME), &lock).unwrap(),
+                "hardlink" => fs::hard_link(root.path().join(KEYRING_NAME), &lock).unwrap(),
+                "permissions" => {
+                    fs::write(&lock, b"").unwrap();
+                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+                }
+                "directory" => fs::create_dir(&lock).unwrap(),
+                "fifo" => {
+                    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+                    let name = CString::new(lock.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                _ => unreachable!(),
+            }
+            let before = tree(root.path());
+            assert!(PublisherTrustStore::open_existing(root.path()).is_err(), "{case}");
+            assert_eq!(tree(root.path()), before, "{case}");
+        }
+    }
+
+    #[test]
+    fn open_existing_missing_keyring_does_not_create_it() {
+        let root = fixture();
+        fs::remove_file(root.path().join(KEYRING_NAME)).unwrap();
+        let before = tree(root.path());
+        assert!(PublisherTrustStore::open_existing(root.path()).is_err());
+        assert_eq!(tree(root.path()), before);
+        assert!(!root.path().join(KEYRING_NAME).exists());
+    }
+
+    #[test]
+    fn ordinary_open_still_creates_missing_lock() {
+        let root = fixture();
+        fs::remove_file(root.path().join(LOCK_NAME)).unwrap();
+        let before = fs::read(root.path().join(KEYRING_NAME)).unwrap();
+        let store = PublisherTrustStore::open(root.path()).unwrap();
+        assert_eq!(store.records["test-key"].state, PublisherState::Active);
+        assert!(root.path().join(LOCK_NAME).is_file());
+        assert_eq!(fs::read(root.path().join(KEYRING_NAME)).unwrap(), before);
+    }
+}

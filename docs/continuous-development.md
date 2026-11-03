@@ -221,3 +221,5 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 使用新签名 fixture、新 review、新 bundle 和独立新数据盘，将 QEMU 输出放在 Docker 卷，保持 guest 资源与 300 秒看门狗不变，完成唯一一组正式双启动。第一轮通过真实 INSTALL、ALLOW 和 Dock 输入安装并启动应用；正常关机后第二轮不提供安装源或事件脚本，通过 Dock 启动持久安装的应用。两轮同盘同 bundle、不同 boot/session，marker `1 -> 2`，持久内容在第一轮结束及第二轮前后精确一致；两轮均 worker 回收、同步卸载、kernel PowerDown。冻结严格 checker 完整重放通过，独立复核逐项重算 1375 项证据、重验签名与原始输入因果并核对归档，均无差异。证据见 `artifacts/persistent-install-task5-20261103-volume-qual2-prep/pair-verified.json` 和 `evidence-manifest.json`。
 
 该资格限定 TCG、虚拟显示和输入、资格收据及 pointer-ready 仪表化，证明正常重启持久安装与两轮 Dock 启动，不证明断电恢复、物理输入/显示或完整系统验收；`finalSystemAccepted=false`。
+
+2026-11-04 持久普通卸载 Task 1：新增非 bootstrap 应用的 registry/catalog 卸载事务、精确 removed 身份及历史包重新加载验签、空闲 UI ID 分配，以及不补建缺失锁的严格重开。Linux 定向回归为 persistent lib `26/26`、persistent integration `14/14`、package install `9/9`、desktop catalog `10/10`；publisher no-create 专项 `5/5`，独立复核未发现阻断。证据见 `artifacts/persistent-uninstall-task1-20261104/`（publisher 专项输出保留在工具记录）。本阶段事务尚未接入桌面，卸载专属故障矩阵、数据保留及真实双启动尚未完成；`finalSystemAccepted=false`。

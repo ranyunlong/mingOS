@@ -74,6 +74,42 @@ fn independent_process_reader() {
     assert_eq!(persistent_install::open_existing(Path::new(&root)).unwrap().content,expected);
 }
 #[test]
+fn strict_reopen_never_creates_missing_locks() {
+    for name in [".ming-installed-packages.lock", ".ming-publisher-keyring.lock"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (root, _) = initialize(temp.path());
+        fs::remove_file(root.join(name)).unwrap();
+        rejects_unchanged(&root);
+        assert!(!root.join(name).exists());
+    }
+}
+
+#[test]
+fn strict_reopen_rejects_unsafe_existing_locks_without_writes() {
+    for name in [".ming-installed-packages.lock", ".ming-publisher-keyring.lock"] {
+        for case in ["symlink", "hardlink", "permissions", "directory"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (root, _) = initialize(temp.path());
+            let lock = root.join(name);
+            match case {
+                "symlink" => {
+                    fs::remove_file(&lock).unwrap();
+                    symlink(root.join(CATALOG_NAME), &lock).unwrap();
+                }
+                "hardlink" => fs::hard_link(&lock, temp.path().join("lock-alias")).unwrap(),
+                "permissions" => fs::set_permissions(&lock, fs::Permissions::from_mode(0o640)).unwrap(),
+                "directory" => {
+                    fs::remove_file(&lock).unwrap();
+                    fs::create_dir(&lock).unwrap();
+                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            rejects_unchanged(&root);
+        }
+    }
+}
+#[test]
 fn every_required_file_is_required_without_repair() {
     for name in [CATALOG_NAME,BOOTSTRAP_NAME,"installed-packages-v1","trusted-publishers-v1"] {
         let temp=tempfile::tempdir().unwrap(); let(root,_)=initialize(temp.path());

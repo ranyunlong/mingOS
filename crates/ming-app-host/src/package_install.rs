@@ -134,18 +134,58 @@ impl PackageInstallRegistry {
         Ok(())
     }
 
+    /// Checks the complete disk/cache transition, not merely the target's absence
+    /// from the active set. No other record or identity may change.
+    pub(crate) fn verify_removed_transition(&self, before: &[u8], package: &Package) -> Result<()> {
+        let mut expected = parse_records(before)?;
+        let previous = expected.get_mut(&package.manifest.id).context("INSTALL_NOT_REGISTERED")?;
+        if previous.state != RecordState::Active || previous.version != package.manifest.version
+            || previous.fingerprint != package.storage_fingerprint()
+        {
+            bail!("INSTALL_REMOVE_IDENTITY");
+        }
+        previous.state = RecordState::Removed;
+        let bytes = crate::package::read_bounded(&self.root.join(RECORD_NAME), MAX_RECORD_BYTES as usize, "INSTALL_RECORD")?;
+        self.verify_records_snapshot(&bytes)?;
+        if parse_records(&bytes)? != expected { bail!("INSTALL_REMOVE_TRANSITION"); }
+        Ok(())
+    }
+
+    /// Reloads removed content at the record-derived path and verifies the actual
+    /// stored signature. A trusted in-memory source cannot stand in for that file.
+    pub(crate) fn load_removed_package(&self, package_id: &str) -> Result<Package> {
+        if !valid_package_id(package_id) { bail!("INSTALL_PACKAGE_ID"); }
+        let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let record = records.get(package_id).context("INSTALL_NOT_FOUND")?;
+        if record.state != RecordState::Removed { bail!("INSTALL_PACKAGE_NOT_REMOVED"); }
+        let package = load_package(&self.content_path(package_id, record).join("app.json")).context("INSTALL_CONTENT_MISSING")?;
+        if package.manifest.id != package_id || package.manifest.version != record.version
+            || package.storage_fingerprint() != record.fingerprint
+        {
+            bail!("INSTALL_CONTENT_MISMATCH");
+        }
+        self.verify_publisher(&package)?;
+        Ok(package)
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        Self::open_with_publisher_trust(root, None)
+        Self::open_with_publisher_trust(root, None, true)
     }
 
     pub fn open_verified(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let publisher_trust = PublisherTrustStore::open(root)?;
-        Self::open_with_publisher_trust(root, Some(publisher_trust))
+        Self::open_with_publisher_trust(root, Some(publisher_trust), true)
     }
 
-    fn open_with_publisher_trust(root: &Path, publisher_trust: Option<PublisherTrustStore>) -> Result<Self> {
+    pub(crate) fn open_verified_existing(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        let publisher_trust = PublisherTrustStore::open_existing(root)?;
+        Self::open_with_publisher_trust(root, Some(publisher_trust), false)
+    }
+
+    fn open_with_publisher_trust(root: &Path, publisher_trust: Option<PublisherTrustStore>, create_lock: bool) -> Result<Self> {
         if !root.is_absolute() {
             bail!("INSTALL_ROOT_ABSOLUTE");
         }
@@ -157,13 +197,22 @@ impl PackageInstallRegistry {
 
         let lock_path = root.join(LOCK_NAME);
         let mut lock_options = OpenOptions::new();
-        lock_options.read(true).write(true).create(true);
+        lock_options.read(true).write(true).create(create_lock);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            lock_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            lock_options.mode(0o600).custom_flags(libc::O_NOFOLLOW | if create_lock { 0 } else { libc::O_NONBLOCK });
         }
         let lock = lock_options.open(&lock_path).context("INSTALL_ROOT_LOCK")?;
+        if !create_lock {
+            use std::os::unix::fs::MetadataExt;
+            let info = lock.metadata().context("INSTALL_ROOT_LOCK_METADATA")?;
+            if !info.is_file() || info.nlink() != 1 || info.uid() != unsafe { libc::geteuid() }
+                || info.mode() & 0o7777 != 0o600
+            {
+                bail!("INSTALL_ROOT_LOCK_PERMISSIONS");
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;

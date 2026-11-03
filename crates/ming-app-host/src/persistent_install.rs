@@ -231,13 +231,13 @@ pub fn open_existing(root: &Path) -> Result<OpenedInstall> {
     check_path(root)?;
     metadata(root, true)?;
     absent(&root.join(PENDING_NAME))?;
-    // Reject incomplete/unsafe content before the existing registry opener can create its locks.
+    // Opening an existing root must never create either lock or repair state.
     let mut files = BTreeMap::new();
     collect(root, root, &mut files, &mut 0, None)?;
     for name in [CATALOG_NAME, BOOTSTRAP_NAME, REGISTRY_NAME, TRUST_NAME] {
         ensure!(files.contains_key(name), "PERSISTENT_REQUIRED {name}");
     }
-    let registry = PackageInstallRegistry::open_verified(root)?;
+    let registry = PackageInstallRegistry::open_verified_existing(root)?;
     let content = snapshot(&registry)?;
     Ok(OpenedInstall { registry, content })
 }
@@ -380,6 +380,44 @@ struct Pending {
     old_catalog_sha256: String,
     new_catalog_sha256: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemovedPackageIdentity {
+    pub package_id: String,
+    pub version: String,
+    pub fingerprint: String,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UninstallCommit {
+    pub schema_version: u32,
+    pub status: &'static str,
+    pub removed: RemovedPackageIdentity,
+    pub registry_root: PathBuf,
+    pub catalog_path: PathBuf,
+    pub content: ContentSnapshot,
+}
+#[derive(Debug)]
+pub(crate) struct CommittedUninstall {
+    pub catalog: crate::desktop_catalog::Catalog,
+    pub receipt: UninstallCommit,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum UninstallOperation { Uninstall }
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UninstallPending {
+    schema_version: u32,
+    operation: UninstallOperation,
+    package_id: String,
+    version: String,
+    fingerprint: String,
+    old_registry_sha256: String,
+    old_catalog_sha256: String,
+    new_catalog_sha256: String,
+}
 #[derive(Debug)]
 struct PhaseError { stage: &'static str, error: anyhow::Error }
 fn at<T>(hook: &mut impl FnMut(&'static str) -> Result<()>, stage: &'static str, operation: impl FnOnce() -> Result<T>) -> std::result::Result<T, PhaseError> {
@@ -500,8 +538,7 @@ pub(crate) fn install_new_with_hook(registry: &PackageInstallRegistry, package: 
         ensure!(package.manifest.sdk_version == 6 && package.manifest.entry == "main.wasm" && package.manifest.data_migration.is_none(), "PERSISTENT_PACKAGE_SCHEMA");
         let (mut candidate, grants) = load_catalog_with_install_registry(&root.join(CATALOG_NAME), registry)?;
         ensure!(grants.is_empty() && candidate.apps.len() < 4 && !candidate.apps.iter().any(|app| app.package_id == package.manifest.id), "PERSISTENT_NEW_INSTALL_ONLY");
-        let id = candidate.apps.iter().map(|app| app.id).max().unwrap_or(0).checked_add(1).context("PERSISTENT_APP_ID")?;
-        ensure!(id <= 4, "PERSISTENT_APP_ID");
+        let id = (2u16..=4).find(|id| !candidate.apps.iter().any(|app| app.id == *id)).context("PERSISTENT_APP_ID")?;
         candidate.apps.push(crate::desktop_catalog::CatalogEntry { id, title: package.manifest.id.chars().take(20).collect(), manifest_path: PathBuf::new(),
             package_id: package.manifest.id.clone(), package_fingerprint: package.storage_fingerprint() });
         let catalog = crate::desktop_catalog::encode_installed_catalog(&candidate, &grants)?;
@@ -566,6 +603,286 @@ pub(crate) fn install_new_with_hook(registry: &PackageInstallRegistry, package: 
     }
     Ok(CommittedInstall { catalog, receipt: InstallCommit { schema_version: 1, status: "committed", package_id: package.manifest.id.clone(),
         version: package.manifest.version.clone(), fingerprint: fingerprint(package.storage_fingerprint()), registry_root: root.into(), catalog_path: root.join(CATALOG_NAME), content, persistent_block_confirmed: false } })
+}
+
+fn removed_identity(package: &Package) -> RemovedPackageIdentity {
+    RemovedPackageIdentity { package_id: package.manifest.id.clone(), version: package.manifest.version.clone(),
+        fingerprint: fingerprint(package.storage_fingerprint()) }
+}
+
+pub fn snapshot_removed_package(registry: &PackageInstallRegistry, expected: &Package) -> Result<RemovedPackageIdentity> {
+    snapshot(registry)?;
+    let stored = registry.load_removed_package(&expected.manifest.id)?;
+    let identity = removed_identity(&stored);
+    ensure!(identity == removed_identity(expected), "PERSISTENT_REMOVED_IDENTITY");
+    Ok(identity)
+}
+
+fn uninstall_snapshot_while_pending(registry: &PackageInstallRegistry, pending: &UninstallPending, bytes: &[u8]) -> Result<ContentSnapshot> {
+    ensure!(serde_json::to_vec(pending)? == bytes, "PERSISTENT_PENDING_TRANSACTION");
+    snapshot_inner(registry, Some(bytes))
+}
+
+fn verify_uninstall_content(before: &ContentSnapshot, after: &ContentSnapshot, package_id: &str) -> Result<()> {
+    let retained: Vec<_> = before.apps.iter().filter(|app| app.package_id != package_id).cloned().collect();
+    ensure!(after.apps == retained, "PERSISTENT_UNINSTALL_APPS_CHANGED");
+    let retained_files = |content: &ContentSnapshot| content.files.iter()
+        .filter(|file| file.path != REGISTRY_NAME && file.path != CATALOG_NAME).cloned().collect::<Vec<_>>();
+    ensure!(retained_files(before) == retained_files(after) && before.trust_sha256 == after.trust_sha256
+        && before.bootstrap_sha256 == after.bootstrap_sha256, "PERSISTENT_UNINSTALL_HISTORY_CHANGED");
+    Ok(())
+}
+
+pub(crate) fn uninstall_existing(registry: &PackageInstallRegistry, package: &Package) -> std::result::Result<CommittedUninstall, InstallFailure> {
+    uninstall_existing_with_hook(registry, package, &mut |_| Ok(()))
+}
+
+pub(crate) fn uninstall_existing_with_hook(registry: &PackageInstallRegistry, package: &Package,
+    hook: &mut impl FnMut(&'static str) -> Result<()>) -> std::result::Result<CommittedUninstall, InstallFailure> {
+    let root = registry.root_path();
+    let old = snapshot(registry).map_err(|error| failed("preflight-state", error, true))?;
+    let prepare = (|| -> Result<_> {
+        registry.verify_package(package)?;
+        let bootstrap: Bootstrap = serde_json::from_slice(&read_file(&root.join(BOOTSTRAP_NAME), 4096)?)?;
+        ensure!(package.manifest.id != bootstrap.initial_package_id, "PERSISTENT_BOOTSTRAP_PROTECTED");
+        let (mut candidate, grants) = load_catalog_with_install_registry(&root.join(CATALOG_NAME), registry)?;
+        let target = candidate.apps.iter().find(|app| app.package_id == package.manifest.id).context("PERSISTENT_UNINSTALL_NOT_ACTIVE")?;
+        ensure!(target.id != 1 && target.package_fingerprint == package.storage_fingerprint(), "PERSISTENT_UNINSTALL_IDENTITY");
+        candidate.apps.retain(|app| app.package_id != package.manifest.id);
+        let catalog_bytes = crate::desktop_catalog::encode_installed_catalog(&candidate, &grants)?;
+        let old_registry = read_file(&root.join(REGISTRY_NAME), 64 * 1024)?;
+        let old_catalog = read_file(&root.join(CATALOG_NAME), 16 * 1024)?;
+        ensure!(sha256(&old_registry) == old.registry_sha256 && sha256(&old_catalog) == old.catalog_sha256, "PERSISTENT_PREFLIGHT_DRIFT");
+        let pending = UninstallPending { schema_version: 1, operation: UninstallOperation::Uninstall,
+            package_id: package.manifest.id.clone(), version: package.manifest.version.clone(), fingerprint: fingerprint(package.storage_fingerprint()),
+            old_registry_sha256: old.registry_sha256.clone(), old_catalog_sha256: old.catalog_sha256.clone(), new_catalog_sha256: sha256(&catalog_bytes) };
+        let pending_bytes = serde_json::to_vec(&pending)?;
+        ensure!(pending_bytes.len() <= 4096, "PERSISTENT_PENDING_LIMIT");
+        Ok((catalog_bytes, old_registry, old_catalog, pending, pending_bytes))
+    })();
+    let (catalog_bytes, old_registry, old_catalog, pending, pending_bytes) = prepare.map_err(|error| failed("prepare", error, false))?;
+    let pending_identity = match create_pending(root, &pending_bytes, hook) {
+        Ok(identity) => identity,
+        Err(error) => {
+            if error.stage == "pending-create" && absent(&root.join(PENDING_NAME)).is_ok() {
+                return Err(failed(error.stage, error.error, false));
+            }
+            return Err(block_after_failure(root, &pending_bytes, error, None, hook));
+        }
+    };
+    let operation = (|| {
+        at(hook, "registry-uninstall", || {
+            ensure!(registry.uninstall_with_data_policy(&package.manifest.id, crate::package_install::UninstallDataPolicy::PreservePrivateData)?.registry_changed,
+                "PERSISTENT_UNINSTALL_NOT_ACTIVE");
+            Ok(())
+        })?;
+        replace_catalog(root, &catalog_bytes, false, hook)?;
+        at(hook, "commit-readback", || {
+            let content = uninstall_snapshot_while_pending(registry, &pending, &pending_bytes)?;
+            registry.verify_removed_transition(&old_registry, package)?;
+            ensure!(removed_identity(&registry.load_removed_package(&package.manifest.id)?) == removed_identity(package), "PERSISTENT_REMOVED_IDENTITY");
+            ensure!(content.catalog_sha256 == pending.new_catalog_sha256, "PERSISTENT_COMMIT_READBACK");
+            verify_uninstall_content(&old, &content, &package.manifest.id)
+        })
+    })();
+    if let Err(error) = operation {
+        let restored_registry = at(hook, "registry-restore", || registry.restore_records_snapshot(&old_registry));
+        let restored_catalog = replace_catalog(root, &old_catalog, true, hook);
+        let restorations = match (restored_registry, restored_catalog) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(registry), Err(catalog)) => Err(PhaseError { stage: registry.stage,
+                error: anyhow::anyhow!("{}: {:#}; {}: {:#}", registry.stage, registry.error, catalog.stage, catalog.error) }),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        let restored = restorations.and_then(|_| at(hook, "rollback-readback", || {
+            ensure!(uninstall_snapshot_while_pending(registry, &pending, &pending_bytes)? == old, "PERSISTENT_ROLLBACK_CHANGED");
+            Ok(())
+        }));
+        if let Err(rollback) = restored { return Err(block_after_failure(root, &pending_bytes, rollback, Some(pending_identity), hook)); }
+        remove_pending(root, &pending_bytes, pending_identity, hook)?;
+        at(hook, "rollback-final-readback", || {
+            ensure!(snapshot(registry)? == old, "PERSISTENT_ROLLBACK_CHANGED"); Ok(())
+        }).map_err(|error| block_after_failure(root, &pending_bytes, error, None, hook))?;
+        return Err(failed(error.stage, error.error, false));
+    }
+    remove_pending(root, &pending_bytes, pending_identity, hook)?;
+    let catalog = at(hook, "catalog-final-load", || {
+        let (catalog, grants) = load_catalog_with_install_registry(&root.join(CATALOG_NAME), registry)?;
+        ensure!(crate::desktop_catalog::encode_installed_catalog(&catalog, &grants)? == catalog_bytes, "PERSISTENT_COMMIT_CHANGED");
+        Ok(catalog)
+    }).map_err(|error| block_after_failure(root, &pending_bytes, error, None, hook))?;
+    let (content, removed) = at(hook, "final-readback", || {
+        let content = snapshot(registry)?;
+        registry.verify_removed_transition(&old_registry, package)?;
+        let removed = removed_identity(&registry.load_removed_package(&package.manifest.id)?);
+        ensure!(removed == removed_identity(package) && content.catalog_sha256 == pending.new_catalog_sha256, "PERSISTENT_COMMIT_CHANGED");
+        verify_uninstall_content(&old, &content, &package.manifest.id)?;
+        Ok((content, removed))
+    }).map_err(|error| block_after_failure(root, &pending_bytes, error, None, hook))?;
+    Ok(CommittedUninstall { catalog, receipt: UninstallCommit { schema_version: 1, status: "committed", removed,
+        registry_root: root.into(), catalog_path: root.join(CATALOG_NAME), content } })
+}
+
+#[cfg(test)]
+mod uninstall_transaction_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn package(id: &str) -> Package {
+        let mut package = Package {
+            manifest: crate::package::Manifest { schema_version: 1, id: id.into(), version: "1.0.0".into(), sdk_version: 6,
+                entry: "main.wasm".into(), private_storage: false, public_storage: false, data_migration: None,
+                publisher_key_id: Some("mingos-dev-2026".into()), publisher_signature: None },
+            bytes: b"\0asm\x01\0\0\0".to_vec(),
+        };
+        package.manifest.publisher_signature = Some(STANDARD.encode(SigningKey::from_bytes(&[7; 32])
+            .sign(&package.signature_message("mingos-dev-2026").unwrap()).to_bytes()));
+        package
+    }
+
+    fn assert_reopens(root: &Path, content: &ContentSnapshot, removed: Option<&Package>) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "persistent_install::uninstall_transaction_tests::reopen_child", "--nocapture"])
+            .env("MING_UNINSTALL_CHILD_ROOT", root)
+            .env("MING_UNINSTALL_CHILD_CONTENT", serde_json::to_string(content).unwrap())
+            .env("MING_UNINSTALL_CHILD_REMOVED", removed.map_or(String::new(), |package| package.manifest.id.clone()))
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("UNINSTALL_REOPEN_OK"));
+    }
+
+    #[test]
+    fn reopen_child() {
+        let Some(root) = std::env::var_os("MING_UNINSTALL_CHILD_ROOT") else { return; };
+        let opened = open_existing(Path::new(&root)).unwrap();
+        let expected: ContentSnapshot = serde_json::from_str(&std::env::var("MING_UNINSTALL_CHILD_CONTENT").unwrap()).unwrap();
+        assert_eq!(opened.content, expected);
+        let id = std::env::var("MING_UNINSTALL_CHILD_REMOVED").unwrap();
+        if !id.is_empty() {
+            let identity = snapshot_removed_package(&opened.registry, &package(&id)).unwrap();
+            assert_eq!(identity.package_id, id);
+            assert_eq!(identity.version, "1.0.0");
+        }
+        println!("UNINSTALL_REOPEN_OK");
+    }
+
+    #[test]
+    fn uninstall_commits_exact_removed_record_and_preserves_all_package_history() {
+        let (_temp, opened, package) = transaction_tests::fixture();
+        install_new(&opened.registry, &package).unwrap();
+        let before = snapshot(&opened.registry).unwrap();
+        let old_registry = fs::read_to_string(opened.registry.root_path().join(REGISTRY_NAME)).unwrap();
+        let committed = uninstall_existing(&opened.registry, &package).unwrap();
+        assert_eq!(committed.receipt.status, "committed");
+        assert_eq!(committed.catalog.autostart, [1]);
+        assert_eq!(committed.catalog.apps.iter().map(|entry| entry.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(committed.receipt.removed, RemovedPackageIdentity { package_id: package.manifest.id.clone(),
+            version: "1.0.0".into(), fingerprint: fingerprint(package.storage_fingerprint()) });
+        let new_registry = fs::read_to_string(opened.registry.root_path().join(REGISTRY_NAME)).unwrap();
+        assert_eq!(new_registry, old_registry.replace("dev.ming.install-demo\tactive\t", "dev.ming.install-demo\tremoved\t"));
+        let unchanged = |content: &ContentSnapshot| content.files.iter()
+            .filter(|file| file.path != CATALOG_NAME && file.path != REGISTRY_NAME).cloned().collect::<Vec<_>>();
+        assert_eq!(unchanged(&committed.receipt.content), unchanged(&before));
+        assert_eq!(committed.receipt.content.apps, before.apps.into_iter().filter(|app| app.app != 2).collect::<Vec<_>>());
+        assert_eq!(snapshot(&opened.registry).unwrap(), committed.receipt.content);
+        assert_eq!(snapshot_removed_package(&opened.registry, &package).unwrap(), committed.receipt.removed);
+        assert!(!opened.registry.root_path().join(PENDING_NAME).exists());
+        let root = opened.registry.root_path().to_path_buf();
+        drop(opened);
+        assert_reopens(&root, &committed.receipt.content, Some(&package));
+    }
+
+    #[test]
+    fn bootstrap_uninstall_never_creates_pending_or_changes_content() {
+        let (_temp, opened, _) = transaction_tests::fixture();
+        let initial = load_package(&opened.registry.active_manifest_path("dev.ming.text-entry-demo").unwrap()).unwrap();
+        let before = snapshot(&opened.registry).unwrap();
+        let failure = uninstall_existing(&opened.registry, &initial).unwrap_err();
+        assert!(!failure.fatal());
+        assert!(failure.error.contains("PERSISTENT_BOOTSTRAP_PROTECTED"));
+        assert_eq!(snapshot(&opened.registry).unwrap(), before);
+    }
+
+    #[test]
+    fn removed_snapshot_reloads_identity_wasm_and_publisher_signature_from_disk() {
+        for mutation in ["id", "version", "wasm", "signature"] {
+            let (_temp, opened, package) = transaction_tests::fixture();
+            install_new(&opened.registry, &package).unwrap();
+            let manifest = opened.registry.active_manifest_path(&package.manifest.id).unwrap();
+            uninstall_existing(&opened.registry, &package).unwrap();
+            if mutation == "wasm" {
+                fs::write(manifest.with_file_name("main.wasm"), b"\0asm\x01\0\0\0changed").unwrap();
+            } else {
+                let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+                match mutation {
+                    "id" => value["id"] = "dev.ming.another".into(),
+                    "version" => value["version"] = "2.0.0".into(),
+                    "signature" => value["publisherSignature"] = STANDARD.encode([0u8; 64]).into(),
+                    _ => unreachable!(),
+                }
+                fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+                if mutation == "signature" {
+                    assert_eq!(load_package(&manifest).unwrap().storage_fingerprint(), package.storage_fingerprint());
+                }
+            }
+            assert!(snapshot_removed_package(&opened.registry, &package).is_err(), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn removed_snapshot_rejects_active_missing_and_wrong_expected_identity() {
+        let (_temp, opened, expected) = transaction_tests::fixture();
+        assert!(snapshot_removed_package(&opened.registry, &expected).is_err());
+        install_new(&opened.registry, &expected).unwrap();
+        assert!(snapshot_removed_package(&opened.registry, &expected).is_err());
+        uninstall_existing(&opened.registry, &expected).unwrap();
+        let mut different = package(&expected.manifest.id);
+        different.bytes.push(0);
+        assert!(snapshot_removed_package(&opened.registry, &different).is_err());
+    }
+
+    #[test]
+    fn install_reuses_middle_and_highest_slots_without_renumbering_other_apps() {
+        for removed_id in [2, 4] {
+            let (_temp, opened, second) = transaction_tests::fixture();
+            install_new(&opened.registry, &second).unwrap();
+            let third = package("dev.ming.third");
+            let fourth = package("dev.ming.fourth");
+            install_new(&opened.registry, &third).unwrap();
+            install_new(&opened.registry, &fourth).unwrap();
+            let before = snapshot(&opened.registry).unwrap();
+            let target = if removed_id == 2 { &second } else { &fourth };
+            uninstall_existing(&opened.registry, target).unwrap();
+            let replacement = package("dev.ming.replacement");
+            let committed = install_new(&opened.registry, &replacement).unwrap();
+            let mut ids = committed.catalog.apps.iter().map(|entry| entry.id).collect::<Vec<_>>();
+            ids.sort();
+            assert_eq!(ids, [1, 2, 3, 4]);
+            assert_eq!(committed.catalog.apps.iter().find(|entry| entry.package_id == replacement.manifest.id).unwrap().id, removed_id);
+            for retained in before.apps.iter().filter(|app| app.app != removed_id) {
+                assert!(committed.receipt.content.apps.contains(retained));
+            }
+            let root = opened.registry.root_path().to_path_buf();
+            drop(opened);
+            assert_reopens(&root, &committed.receipt.content, Some(target));
+        }
+    }
+
+    #[test]
+    fn reinstall_same_version_preserves_history_and_full_capacity_rejects_before_writes() {
+        let (_temp, opened, second) = transaction_tests::fixture();
+        let installed = install_new(&opened.registry, &second).unwrap();
+        uninstall_existing(&opened.registry, &second).unwrap();
+        let reinstalled = install_new(&opened.registry, &second).unwrap();
+        assert_eq!(reinstalled.receipt.content, installed.receipt.content);
+        install_new(&opened.registry, &package("dev.ming.third")).unwrap();
+        install_new(&opened.registry, &package("dev.ming.fourth")).unwrap();
+        let before = snapshot(&opened.registry).unwrap();
+        let failure = install_new(&opened.registry, &package("dev.ming.fifth")).unwrap_err();
+        assert!(!failure.fatal());
+        assert_eq!(snapshot(&opened.registry).unwrap(), before);
+    }
 }
 
 #[cfg(test)]
