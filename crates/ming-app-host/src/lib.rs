@@ -5,6 +5,8 @@ pub mod private_file_rpc;
 pub mod private_file_wire;
 #[cfg(target_os = "linux")]
 pub mod package_install;
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+pub mod persistent_install;
 #[cfg(target_os = "linux")]
 pub mod publisher;
 #[cfg(target_os = "linux")]

@@ -117,6 +117,23 @@ impl std::fmt::Debug for PackageInstallRegistry {
 }
 
 impl PackageInstallRegistry {
+    pub(crate) fn root_path(&self) -> &Path { &self.root }
+
+    pub(crate) fn active_records(&self) -> Result<BTreeMap<String, (String, [u8; 32])>> {
+        let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        Ok(records.iter().filter(|(_, record)| record.state == RecordState::Active)
+            .map(|(id, record)| (id.clone(), (record.version.clone(), record.fingerprint))).collect())
+    }
+
+    /// Checks the exact bounded disk bytes used by a persistent snapshot against
+    /// every record protected by this registry's already-held process lock.
+    pub(crate) fn verify_records_snapshot(&self, bytes: &[u8]) -> Result<()> {
+        let disk = parse_records(bytes)?;
+        let records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        if disk != *records { bail!("INSTALL_RECORD_SNAPSHOT_DRIFT"); }
+        Ok(())
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         Self::open_with_publisher_trust(root, None)
@@ -731,7 +748,12 @@ fn load_records(path: PathBuf) -> Result<BTreeMap<String, Record>> {
     }
     let mut bytes = Vec::new();
     options.open(path).context("INSTALL_RECORD_OPEN")?.read_to_end(&mut bytes).context("INSTALL_RECORD_READ")?;
-    let text = std::str::from_utf8(&bytes).context("INSTALL_RECORD_UTF8")?;
+    parse_records(&bytes)
+}
+
+fn parse_records(bytes: &[u8]) -> Result<BTreeMap<String, Record>> {
+    if bytes.len() as u64 > MAX_RECORD_BYTES { bail!("INSTALL_RECORD_TOO_LARGE"); }
+    let text = std::str::from_utf8(bytes).context("INSTALL_RECORD_UTF8")?;
     let body = text.strip_prefix(HEADER).context("INSTALL_RECORD_HEADER")?;
     let mut records = BTreeMap::new();
     for line in body.lines() {
