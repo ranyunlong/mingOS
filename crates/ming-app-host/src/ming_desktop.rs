@@ -211,6 +211,10 @@ pub(crate) struct Session {
     storage_authority: Option<Arc<crate::app_data::PackageStorageAuthority>>,
     #[cfg(target_os = "linux")]
     pending_storage: Option<PendingDesktopStorage>,
+    #[cfg(target_os = "linux")]
+    persistent_install_blocked: bool,
+    #[cfg(all(test, target_os = "linux"))]
+    persistent_install_faults: BTreeSet<&'static str>,
     pub options: DesktopOptions,
     pub catalog: Catalog,
     pub scene: DesktopScene,
@@ -294,6 +298,10 @@ impl Session {
             storage_authority: None,
             #[cfg(target_os = "linux")]
             pending_storage: None,
+            #[cfg(target_os = "linux")]
+            persistent_install_blocked: false,
+            #[cfg(all(test, target_os = "linux"))]
+            persistent_install_faults: BTreeSet::new(),
             options,
             catalog,
             scene,
@@ -499,6 +507,10 @@ impl Session {
         if allow && matches!(&pending.pending, DesktopStorageDecision::Information) { bail!("DESKTOP_STORAGE_CONFLICT"); }
         let pending = self.pending_storage.take().expect("checked pending");
         let app = pending.app;
+        if self.options.persistent_install_root.is_some() && matches!(&pending.pending,
+            DesktopStorageDecision::Install { update: true, .. } | DesktopStorageDecision::Uninstall { .. } | DesktopStorageDecision::Purge { .. }) {
+            bail!("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED");
+        }
         match pending.pending {
             DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update, retry: _ } => {
                 if !allow {
@@ -531,6 +543,9 @@ impl Session {
                     self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update, retry: true }, prompt, composed: None, presented: false, presented_sequence: None });
                     self.changed();
                     return Ok(());
+                }
+                if self.options.persistent_install_root.is_some() {
+                    return self.commit_persistent_install(package, app, package_id, version, fingerprint, manifest_path);
                 }
                 let previous_catalog = self.catalog.clone();
                 let authority = if update {
@@ -870,6 +885,63 @@ impl Session {
     }
 
     #[cfg(target_os = "linux")]
+    fn commit_persistent_install(&mut self, package: crate::package::Package, app: u16,
+        package_id: String, version: String, fingerprint: String, manifest_path: PathBuf) -> Result<()> {
+        let registry = self.options.install_registry.as_ref().context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?;
+        #[cfg(not(test))]
+        let result = crate::persistent_install::install_new(registry, &package);
+        #[cfg(test)]
+        let result = if self.persistent_install_faults.is_empty() {
+            crate::persistent_install::install_new(registry, &package)
+        } else {
+            let faults = self.persistent_install_faults.clone();
+            crate::persistent_install::install_new_with_hook(registry, &package, &mut |stage| {
+                if faults.contains(stage) { bail!("injected {stage}"); } Ok(())
+            })
+        };
+        match result {
+            Ok(committed) => {
+                self.emit_persistent_install_receipt("persistent-install-commit", serde_json::to_value(&committed.receipt)?)?;
+                self.catalog = committed.catalog;
+                self.log(0, 0, 0, "installed", package_id);
+                self.changed();
+                self.launch_pending_autostart()?;
+                Ok(())
+            }
+            Err(failure) => {
+                if failure.fatal() {
+                    self.persistent_install_blocked = true;
+                    self.state_error = Some(format!("{} at {}: {}", failure.status, failure.stage, failure.error));
+                    self.changed();
+                }
+                let mut receipt = serde_json::to_value(&failure)?;
+                let fields = receipt.as_object_mut().expect("typed failure object");
+                fields.insert("packageId".into(), package_id.clone().into());
+                fields.insert("version".into(), version.clone().into());
+                fields.insert("fingerprint".into(), fingerprint.clone().into());
+                self.emit_persistent_install_receipt("persistent-install-failed", receipt)?;
+                if failure.fatal() {
+                    return Err(anyhow!("DESKTOP_PERSISTENT_INSTALL_FATAL {} at {}: {}", failure.status, failure.stage, failure.error));
+                }
+                self.log(0, 0, 0, "install_not_saved", failure.error);
+                let prompt = crate::graphics::desktop_shell::StoragePrompt::install(&package_id, &version, &fingerprint, false, true, false)?;
+                self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Install {
+                    package_id, version, fingerprint, manifest_path, update: false, retry: true }, prompt,
+                    composed: None, presented: false, presented_sequence: None });
+                self.changed();
+                Ok(())
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn emit_persistent_install_receipt(&mut self, kind: &'static str, receipt: serde_json::Value) -> Result<()> {
+        self.log(0, 0, 0, kind, serde_json::to_string(&receipt)?);
+        eprintln!("MING_PERSISTENT_INSTALL {}", serde_json::json!({"kind":kind,"bootId":self.state_boot,
+            "sessionId":self.state_session,"desktopPid":std::process::id(),"receipt":receipt}));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn begin_install_from_dock(&mut self) -> Result<()> {
         let source = self
             .options
@@ -881,6 +953,7 @@ impl Session {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn begin_install(&mut self, source: &std::path::Path) -> Result<()> {
+        if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
         if self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen {
             bail!("DESKTOP_INSTALL_UNAVAILABLE");
         }
@@ -896,6 +969,7 @@ impl Session {
             if !crate::package::version_is_newer(&package.manifest.version, &current.manifest.version) {
                 bail!("DESKTOP_INSTALL_VERSION");
             }
+            if self.options.persistent_install_root.is_some() { bail!("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED"); }
             (true, entry.id)
         } else {
             if self.catalog.apps.len() >= 4 { bail!("DESKTOP_CATALOG_LIMIT"); }
@@ -932,6 +1006,7 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn begin_uninstall(&mut self, app: u16) -> Result<()> {
+        if self.options.persistent_install_root.is_some() { bail!("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED"); }
         if self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen {
             bail!("DESKTOP_UNINSTALL_UNAVAILABLE");
         }
@@ -961,6 +1036,7 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn begin_uninstall_with_purge(&mut self, app: u16) -> Result<()> {
+        if self.options.persistent_install_root.is_some() { bail!("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED"); }
         if self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen {
             bail!("DESKTOP_UNINSTALL_UNAVAILABLE");
         }
@@ -1036,6 +1112,8 @@ impl Session {
         Ok(())
     }
     fn launch(&mut self, app: u16) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
         if self.closing.is_some() {
             bail!("DESKTOP_CLOSING");
         }
@@ -1096,6 +1174,8 @@ impl Session {
         self.launch_resolved(entry, #[cfg(target_os = "linux")] granted, #[cfg(target_os = "linux")] public_granted)
     }
     fn launch_resolved(&mut self, entry: crate::desktop_catalog::CatalogEntry, #[cfg(target_os = "linux")] granted: Option<crate::storage_consent::GrantedStorage>, #[cfg(target_os = "linux")] public_granted: Option<(String, crate::app_data::PublicFileSession)>) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
         let app = entry.id;
         let grant = match (&self.app_data.root, self.app_data.grants.get(&app)) {
             (Some(root), Some(binding)) => Some(root.grant(&binding.data_key, &binding.slots).context("DESKTOP_DATA_OPEN")?),
@@ -2045,7 +2125,9 @@ fn model_error(e: crate::desktop_model::ModelError) -> anyhow::Error {
 pub fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<DesktopOutcome> {
     let mut options = DesktopOptions::parse(arguments)?;
     #[cfg(target_os = "linux")]
-    if let Some(root) = options.install_root.as_ref() {
+    if let Some(root) = options.persistent_install_root.as_ref() {
+        options.install_registry = Some(crate::persistent_install::open_existing(root)?.registry);
+    } else if let Some(root) = options.install_root.as_ref() {
         options.install_registry = Some(crate::package_install::PackageInstallRegistry::open_verified(root)?);
     }
     #[cfg(not(target_os = "linux"))]
@@ -2379,6 +2461,168 @@ mod input_backpressure_tests {
             let active = session.options.install_registry.as_ref().unwrap().active_manifest_path("dev.example.install.retry").unwrap();
             assert_eq!(crate::package::load_package(&active).unwrap().manifest.version, "1.0.0");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persistent_install_session() -> (tempfile::TempDir, Session, PathBuf) {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::io::Write;
+        let (temp, opened, package) = crate::persistent_install::transaction_tests::fixture();
+        let root = opened.registry.root_path().to_path_buf();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = source.join("app.json");
+        for (path, bytes) in [(manifest.clone(), serde_json::to_vec(&package.manifest).unwrap()),
+            (source.join("main.wasm"), package.bytes)] {
+            std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path).unwrap().write_all(&bytes).unwrap();
+        }
+        let (catalog, _) = crate::desktop_catalog::load_catalog_with_install_registry(&root.join("catalog.json"), &opened.registry).unwrap();
+        let mut options = DesktopOptions::parse([root.join("catalog.json").into_os_string(),
+            "--persistent-install-state".into(), root.into_os_string(), "--renderer".into(), "cpu".into()]).unwrap();
+        options.install_registry = Some(opened.registry);
+        let session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        (temp, session, manifest)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn present_install_confirmation(session: &mut Session) {
+        let frame = session.compose().unwrap();
+        session.storage_prompt_composed(frame.sequence);
+        session.accepted(frame.sequence, false).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_install_commit_publishes_catalog_without_launching_app2() {
+        let (_temp, mut session, source) = persistent_install_session();
+        session.begin_install(&source).unwrap();
+        present_install_confirmation(&mut session);
+        session.respond_storage_prompt(true).unwrap();
+        assert_eq!(session.catalog.apps.len(), 2);
+        assert_eq!(session.catalog.autostart, [1]);
+        assert!(!session.persistent_install_blocked);
+        assert!(session.records.is_empty() && session.instances.is_empty());
+        let commit = session.trace.iter().position(|record| record.kind == "persistent-install-commit").unwrap();
+        let installed = session.trace.iter().position(|record| record.kind == "installed").unwrap();
+        assert!(commit < installed);
+        assert!(!session.trace.iter().any(|record| record.kind == "launch"));
+        let receipt: serde_json::Value = serde_json::from_str(&session.trace[commit].detail).unwrap();
+        let registry = session.options.install_registry.as_ref().unwrap();
+        assert_eq!(receipt["status"], "committed");
+        assert_eq!(receipt["packageId"], "dev.ming.install-demo");
+        assert_eq!(receipt["content"], serde_json::to_value(crate::persistent_install::snapshot(registry).unwrap()).unwrap());
+        assert!(!registry.root_path().join(crate::persistent_install::PENDING_NAME).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_install_recoverable_failure_keeps_catalog_and_allows_explicit_retry() {
+        let (_temp, mut session, source) = persistent_install_session();
+        let before = crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap();
+        session.persistent_install_faults.insert("catalog-directory-sync");
+        session.begin_install(&source).unwrap();
+        present_install_confirmation(&mut session);
+        session.respond_storage_prompt(true).unwrap();
+        assert_eq!(session.catalog.apps.len(), 1);
+        assert_eq!(session.catalog.autostart, [1]);
+        assert!(!session.persistent_install_blocked);
+        assert!(session.records.is_empty() && session.instances.is_empty());
+        assert!(!session.trace.iter().any(|record| ["installed", "persistent-install-commit", "launch"].contains(&record.kind)));
+        let after = crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap();
+        assert_eq!(after.apps, before.apps);
+        assert_eq!(after.registry_sha256, before.registry_sha256);
+        assert_eq!(after.catalog_sha256, before.catalog_sha256);
+        assert!(matches!(session.pending_storage.as_ref().unwrap().pending, DesktopStorageDecision::Install { retry: true, .. }));
+        session.persistent_install_faults.clear();
+        present_install_confirmation(&mut session);
+        session.respond_storage_prompt(true).unwrap();
+        assert_eq!(session.catalog.apps.len(), 2);
+        assert!(session.storage_prompt().is_none());
+        assert_eq!(session.trace.iter().filter(|record| record.kind == "installed").count(), 1);
+        assert!(session.records.is_empty() && session.instances.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_install_fatal_failure_blocks_every_new_worker_path() {
+        for (trigger, secondary) in [("pending-remove-directory-sync", None),
+            ("pending-remove-directory-sync", Some("compensation-create")),
+            ("pending-remove-directory-sync", Some("compensation-identity")),
+            ("pending-remove-directory-sync", Some("compensation-write")),
+            ("pending-remove-directory-sync", Some("compensation-file-sync")),
+            ("pending-remove-directory-sync", Some("compensation-directory-sync")),
+            ("pending-remove-directory-sync", Some("compensation-readback")),
+            ("catalog-write", Some("registry-restore")),
+            ("catalog-write", Some("catalog-restore-rename")),
+            ("catalog-write", Some("rollback-readback")), ("final-readback", None)] {
+            let (_temp, mut session, source) = persistent_install_session();
+            session.persistent_install_faults.insert(trigger);
+            if let Some(fault) = secondary { session.persistent_install_faults.insert(fault); }
+            session.begin_install(&source).unwrap();
+            present_install_confirmation(&mut session);
+            let error = session.respond_storage_prompt(true).unwrap_err();
+            assert!(format!("{error:#}").contains("DESKTOP_PERSISTENT_INSTALL_FATAL"));
+            assert!(session.persistent_install_blocked);
+            assert_eq!(session.catalog.apps.len(), 1);
+            assert_eq!(session.catalog.autostart, [1]);
+            assert!(session.records.is_empty() && session.instances.is_empty());
+            assert!(!session.trace.iter().any(|record| ["installed", "persistent-install-commit", "launch"].contains(&record.kind)));
+            let receipt: serde_json::Value = serde_json::from_str(&session.trace.iter().find(|record| record.kind == "persistent-install-failed").unwrap().detail).unwrap();
+            let uncertain = secondary.is_some_and(|fault| fault.starts_with("compensation-"));
+            assert_eq!(receipt["status"], if uncertain { "commit-uncertain" } else { "persistent-blocked" });
+            assert_eq!(receipt["persistentBlockConfirmed"], !uncertain);
+            assert_eq!(receipt["compensationAttempted"], trigger != "catalog-write");
+            assert_eq!(receipt["packageId"], "dev.ming.install-demo");
+            assert!(session.state_error.is_some());
+            for app in [1, 2] {
+                let error = session.perform(&DesktopAction::Launch { app }).unwrap_err();
+                assert!(format!("{error:#}").contains("DESKTOP_PERSISTENT_INSTALL_BLOCKED"));
+            }
+            let entry = session.catalog.apps[0].clone();
+            assert!(session.launch_resolved(entry, None, None).unwrap_err().to_string().contains("DESKTOP_PERSISTENT_INSTALL_BLOCKED"));
+            assert!(session.begin_install(&source).unwrap_err().to_string().contains("DESKTOP_PERSISTENT_INSTALL_BLOCKED"));
+            assert!(session.records.is_empty() && session.instances.is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_install_rejects_update_uninstall_and_purge_before_writes() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use ed25519_dalek::{Signer, SigningKey};
+        let (_temp, mut session, source) = persistent_install_session();
+        let before = crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap();
+        let mut package = crate::package::load_package(&source).unwrap();
+        package.manifest.id = "dev.ming.text-entry-demo".into();
+        package.manifest.version = "0.2.0".into();
+        package.manifest.publisher_signature = None;
+        package.manifest.publisher_signature = Some(STANDARD.encode(SigningKey::from_bytes(&[7;32]).sign(&package.signature_message("mingos-dev-2026").unwrap()).to_bytes()));
+        std::fs::write(&source, serde_json::to_vec(&package.manifest).unwrap()).unwrap();
+        for result in [session.begin_install(&source), session.begin_uninstall(1), session.begin_uninstall_with_purge(1)] {
+            assert!(result.unwrap_err().to_string().contains("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED"));
+        }
+        for operation in ["update", "uninstall", "purge"] {
+            let package_id = package.manifest.id.clone();
+            let version = package.manifest.version.clone();
+            let fingerprint = package_fingerprint_hex(&package);
+            let manifest_path = source.clone();
+            let pending = match operation {
+                "update" => DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update: true, retry: false },
+                "uninstall" => DesktopStorageDecision::Uninstall { package_id, version, fingerprint, manifest_path },
+                _ => DesktopStorageDecision::Purge { package_id, version, fingerprint, manifest_path, retry: false },
+            };
+            let prompt = crate::graphics::desktop_shell::StoragePrompt::install(&package.manifest.id, &package.manifest.version,
+                &package_fingerprint_hex(&package), true, false, false).unwrap();
+            session.pending_storage = Some(PendingDesktopStorage { app: 1, pending, prompt, composed: None, presented: false, presented_sequence: None });
+            present_install_confirmation(&mut session);
+            assert!(session.respond_storage_prompt(true).unwrap_err().to_string().contains("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED"));
+            assert_eq!(crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap(), before);
+        }
+        let after = crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap();
+        assert_eq!(after, before);
+        assert!(session.pending_storage.is_none());
+        assert!(session.records.is_empty() && session.instances.is_empty());
     }
 
     #[cfg(target_os = "linux")]

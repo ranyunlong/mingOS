@@ -130,3 +130,93 @@ fn catalog_rejects_distinct_entries_with_the_same_package_identity() {
     fs::write(&catalog, r#"{"schemaVersion":1,"apps":[{"id":1,"title":"A","manifest":"a/app.json"},{"id":2,"title":"B","manifest":"b/app.json"}],"autostart":[]}"#).unwrap();
     assert!(load_catalog(&catalog).is_err());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn persistent_install_mode_accepts_only_one_absolute_root_and_its_catalog() {
+    let root = "/data/mingos/install-root";
+    let catalog = "/data/mingos/install-root/catalog.json";
+    assert!(DesktopOptions::parse(args(&[catalog, "--persistent-install-state", root])).is_ok());
+    for invalid in [
+        vec![catalog,"--persistent-install-state","relative"],
+        vec!["/opt/mingos/catalog.json","--persistent-install-state",root],
+        vec![catalog,"--persistent-install-state",root,"--install-root",root],
+        vec![catalog,"--persistent-install-state",root,"--persistent-install-state",root],
+        vec![catalog,"--persistent-install-state",root,"--state-file","/data/mingos/install-root/state.json"],
+        vec![catalog,"--persistent-install-state",root,"--snapshot","/data/mingos/install-root/frame.png"],
+        vec![catalog,"--persistent-install-state",root,"--install-source","/data/mingos/install-root/app.json"],
+        vec![catalog,"--persistent-install-state","/data/mingos/./install-root"],
+        vec![catalog,"--persistent-install-state","/data/mingos//install-root"],
+    ] { assert!(DesktopOptions::parse(args(&invalid)).is_err(),"{invalid:?}"); }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn persistent_install_rejects_app_data_inside_controlled_content() {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = tempfile::tempdir().unwrap();
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.path().join("install-root");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let child = root.join("data");
+    fs::create_dir(&child).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+    for data in [&root, &child] {
+        let result = DesktopOptions::parse([root.join("catalog.json").into_os_string(),
+            "--persistent-install-state".into(), root.clone().into_os_string(),
+            "--data-root".into(), data.clone().into_os_string()]);
+        assert!(result.is_err(), "app data must not write into the controlled install root");
+    }
+    assert!(DesktopOptions::parse([root.join("catalog.json").into_os_string(),
+        "--persistent-install-state".into(), root.clone().into_os_string(),
+        "--data-root".into(), parent.path().as_os_str().to_owned()]).is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn persistent_output_paths_reject_resolved_aliases_of_controlled_content() {
+    use std::{os::unix::fs::{symlink, PermissionsExt}, path::{Component, PathBuf}};
+    let parent = tempfile::tempdir().unwrap();
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.path().join("install-root");
+    let outside = parent.path().join("outside");
+    for path in [&root, &outside] { fs::create_dir(path).unwrap(); }
+    let catalog = root.join("catalog.json");
+    fs::write(&catalog, b"original catalog bytes").unwrap();
+    let directory_alias = parent.path().join("root-alias");
+    let file_alias = parent.path().join("catalog-alias");
+    let broken_alias = parent.path().join("new-file-alias");
+    symlink(&root, &directory_alias).unwrap();
+    symlink(&catalog, &file_alias).unwrap();
+    symlink(root.join("not-yet-created"), &broken_alias).unwrap();
+    let mut relative = PathBuf::new();
+    for _ in std::env::current_dir().unwrap().components().filter(|part| matches!(part, Component::Normal(_))) { relative.push(".."); }
+    relative.push(catalog.strip_prefix("/").unwrap());
+    let aliases = [relative, outside.join("../install-root/catalog.json"),
+        directory_alias.join("catalog.json"), directory_alias.join("new-state.json"), file_alias, broken_alias];
+    for flag in ["--state-file", "--snapshot"] {
+        for target in &aliases {
+            let result = DesktopOptions::parse([catalog.clone().into_os_string(),
+                "--persistent-install-state".into(), root.clone().into_os_string(), flag.into(), target.clone().into_os_string()]);
+            assert!(result.is_err(), "{flag} accepted root alias {}", target.display());
+            assert_eq!(fs::read(&catalog).unwrap(), b"original catalog bytes");
+            assert!(!root.join("not-yet-created").exists());
+        }
+        let legacy = DesktopOptions::parse([catalog.clone().into_os_string(), flag.into(), aliases[0].clone().into_os_string()]).unwrap();
+        assert_eq!(if flag == "--state-file" { legacy.state_file } else { legacy.snapshot }, Some(aliases[0].clone()));
+        let relative_output = aliases[0].parent().unwrap().parent().unwrap().join("relative-result");
+        for (target, expected) in [(relative_output, parent.path().join("relative-result")),
+            (outside.join("absolute-result"), outside.join("absolute-result"))] {
+            let options = DesktopOptions::parse([catalog.clone().into_os_string(),
+                "--persistent-install-state".into(), root.clone().into_os_string(), flag.into(), target.into_os_string()]).unwrap();
+            assert_eq!(if flag == "--state-file" { options.state_file } else { options.snapshot }, Some(expected));
+        }
+        let output_alias = parent.path().join(format!("outside-alias-{}", &flag[2..]));
+        symlink(&outside, &output_alias).unwrap();
+        let target = output_alias.join("result");
+        let options = DesktopOptions::parse([catalog.clone().into_os_string(),
+            "--persistent-install-state".into(), root.clone().into_os_string(), flag.into(), target.into_os_string()]).unwrap();
+        assert_eq!(if flag == "--state-file" { options.state_file } else { options.snapshot }, Some(outside.join("result")));
+    }
+}

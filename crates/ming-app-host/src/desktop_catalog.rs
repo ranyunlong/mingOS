@@ -95,14 +95,7 @@ struct PersistedCatalogEntry {
 /// The registry remains the package identity authority; this file only records
 /// which installed package IDs the desktop should expose and their UI IDs.
 #[cfg(target_os = "linux")]
-pub(crate) fn persist_installed_catalog(
-    path: &Path,
-    catalog: &Catalog,
-    grants: &BTreeMap<u16, TrustedAppData>,
-) -> Result<()> {
-    if !path.is_absolute() {
-        bail!("DESKTOP_CATALOG_PATH_ABSOLUTE");
-    }
+pub(crate) fn encode_installed_catalog(catalog: &Catalog, grants: &BTreeMap<u16, TrustedAppData>) -> Result<Vec<u8>> {
     if catalog.apps.is_empty() || catalog.apps.len() > 4 || catalog.autostart.len() > 4 {
         bail!("DESKTOP_CATALOG_LIMIT");
     }
@@ -135,6 +128,15 @@ pub(crate) fn persist_installed_catalog(
         .context("DESKTOP_CATALOG_SERIALIZE")?;
     if bytes.len() > 16 * 1024 { bail!("DESKTOP_CATALOG_TOO_LARGE"); }
     bytes.push(b'\n');
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn persist_installed_catalog(
+    path: &Path, catalog: &Catalog, grants: &BTreeMap<u16, TrustedAppData>,
+) -> Result<()> {
+    if !path.is_absolute() { bail!("DESKTOP_CATALOG_PATH_ABSOLUTE"); }
+    let bytes = encode_installed_catalog(catalog, grants)?;
     let parent = path.parent().context("DESKTOP_CATALOG_PARENT")?;
     let parent_metadata = fs::symlink_metadata(parent).context("DESKTOP_CATALOG_PARENT")?;
     if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
@@ -443,6 +445,7 @@ pub enum IsolationMode { Off, Strict }
 pub struct DesktopOptions {
     pub(crate) app_data: DesktopDataConfig,
     pub install_root: Option<PathBuf>,
+    pub persistent_install_root: Option<PathBuf>,
     /// A trusted parent-selected package source for the native install Dock
     /// action. Guest applications cannot modify this value.
     pub install_source: Option<PathBuf>,
@@ -459,6 +462,28 @@ pub struct DesktopOptions {
     pub isolation: IsolationMode,
     pub actions: Vec<TimedAction>,
 }
+
+// Outputs may not exist yet. Resolve the existing parent in that case, but
+// never mistake a dangling final symlink for an absent regular output file.
+fn persistent_output_path(path: &Path, root: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
+    let resolved = match fs::canonicalize(&absolute) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(&absolute) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("DESKTOP_PERSISTENT_OUTPUT_PATH"),
+                Ok(_) => bail!("DESKTOP_PERSISTENT_OUTPUT_PATH"),
+            }
+            let parent = fs::canonicalize(absolute.parent().context("DESKTOP_PERSISTENT_OUTPUT_PATH")?)
+                .context("DESKTOP_PERSISTENT_OUTPUT_PATH")?;
+            parent.join(absolute.file_name().context("DESKTOP_PERSISTENT_OUTPUT_PATH")?)
+        }
+        Err(error) => return Err(error).context("DESKTOP_PERSISTENT_OUTPUT_PATH"),
+    };
+    if resolved.starts_with(root) { bail!("DESKTOP_PERSISTENT_PATH_CONFLICT"); }
+    Ok(resolved)
+}
 impl DesktopOptions {
     pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self> {
         let mut args = arguments.into_iter();
@@ -469,6 +494,7 @@ impl DesktopOptions {
         let mut result = Self {
             app_data: DesktopDataConfig::default(),
             install_root: None,
+            persistent_install_root: None,
             install_source: None,
             #[cfg(target_os = "linux")]
             install_registry: None,
@@ -484,6 +510,7 @@ impl DesktopOptions {
             actions: Vec::new(),
         };
         let mut seen = BTreeSet::new();
+        let mut data_root_path = None;
         while let Some(flag) = args.next() {
             let flag = flag.to_str().context("DESKTOP_OPTION_ENCODING")?;
             if !seen.insert(flag.to_owned()) {
@@ -494,9 +521,20 @@ impl DesktopOptions {
             match flag {
                 "--data-root" => {
                     result.app_data.root = Some(crate::app_data::AppDataRoot::open(Path::new(&value)).context("DESKTOP_DATA_ROOT")?);
+                    data_root_path = Some(PathBuf::from(value));
                 }
                 "--install-root" => {
                     result.install_root = Some(PathBuf::from(value));
+                }
+                "--persistent-install-state" => {
+                    if !cfg!(target_os = "linux") { bail!("DESKTOP_PERSISTENT_INSTALL_UNSUPPORTED"); }
+                    let root = PathBuf::from(value);
+                    let raw = root.to_str().context("DESKTOP_PERSISTENT_ROOT_ENCODING")?;
+                    if !root.is_absolute() || root.file_name().is_none() || raw.len() > 4096
+                        || raw.ends_with('/') || raw.contains("//")
+                        || raw.split('/').any(|part| part == "." || part == "..")
+                    { bail!("DESKTOP_PERSISTENT_ROOT"); }
+                    result.persistent_install_root = Some(root);
                 }
                 "--install-source" => {
                     let source = PathBuf::from(value);
@@ -538,6 +576,20 @@ impl DesktopOptions {
                 }
                 _ => bail!("DESKTOP_UNKNOWN_OPTION: {flag}"),
             }
+        }
+        if let Some(root) = &result.persistent_install_root {
+            let resolved_root = match fs::canonicalize(root) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => root.clone(),
+                Err(error) => return Err(error).context("DESKTOP_PERSISTENT_ROOT"),
+            };
+            let resolved_data_root = data_root_path.map(fs::canonicalize).transpose().context("DESKTOP_DATA_ROOT")?;
+            if result.install_root.is_some() || result.catalog_path.as_os_str() != root.join("catalog.json").as_os_str()
+                || resolved_data_root.as_ref().is_some_and(|path| path.starts_with(&resolved_root))
+                || result.install_source.as_ref().is_some_and(|path| path.starts_with(root))
+            { bail!("DESKTOP_PERSISTENT_PATH_CONFLICT"); }
+            result.state_file = result.state_file.as_ref().map(|path| persistent_output_path(path, &resolved_root)).transpose()?;
+            result.snapshot = result.snapshot.as_ref().map(|path| persistent_output_path(path, &resolved_root)).transpose()?;
         }
         if !(320..=4096).contains(&result.width)
             || !(240..=4096).contains(&result.height)

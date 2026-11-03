@@ -290,6 +290,17 @@ impl PackageInstallRegistry {
         Ok(())
     }
 
+    /// Restores the exact validated bytes and all cached records for a parent
+    /// persistent-install rollback. Immutable package history is retained.
+    pub(crate) fn restore_records_snapshot(&self, bytes: &[u8]) -> Result<()> {
+        let parsed = parse_records(bytes)?;
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let mut records = self.records.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.persist_record_bytes(bytes)?;
+        *records = parsed;
+        Ok(())
+    }
+
     /// Publishes an update with a retained snapshot of the old private files.
     /// The backup survives until a matching desktop startup is confirmed.
     pub fn update_from_manifest(&self, manifest_path: &Path, authority: &PackageStorageAuthority) -> Result<InstallState> {
@@ -651,6 +662,11 @@ impl PackageInstallRegistry {
             bytes.extend_from_slice(hex(&record.fingerprint).as_bytes());
             bytes.push(b'\n');
         }
+        self.persist_record_bytes(&bytes)
+    }
+
+    fn persist_record_bytes(&self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() as u64 > MAX_RECORD_BYTES { bail!("INSTALL_RECORD_TOO_LARGE"); }
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temp_path = self.root.join(format!(".ming-installed-packages.tmp-{}-{sequence}", std::process::id()));
         let mut options = OpenOptions::new();

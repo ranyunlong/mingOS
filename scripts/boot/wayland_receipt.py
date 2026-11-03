@@ -1,5 +1,13 @@
 """Bounded receipt parser for the instrumented MingHost Wayland client only."""
 import re
+PERSISTENT_INSTALL_PREFIX = b'MING_PERSISTENT_INSTALL '
+
+def check_line_size(raw):
+    persistent = raw.startswith(PERSISTENT_INSTALL_PREFIX)
+    if len(raw) > (262144 if persistent else 65536):
+        raise ValueError('persistent install receipt line limit' if persistent else 'Wayland diagnostic line limit')
+    return persistent
+
 POINTER_SYNC_POLICY = {"policy":"wayland-client-pointer-frame-v1", "coordinateTolerancePixels":1,
     "pointerWaitMs":5000, "requireCurrentBootSessionDesktopPid":True, "requireAfterAbsLogOffset":True,
     "requireSameRootSurface":True, "allowEnterOrMotion":True, "leaveInvalidates":True}
@@ -14,8 +22,11 @@ class PointerReceipt:
         self.buffer+=data;records=[]
         while b'\n' in self.buffer:
             raw,self.buffer=self.buffer.split(b'\n',1)
-            if len(raw)>65536:raise ValueError('Wayland diagnostic line limit')
+            persistent=check_line_size(raw)
             self.offset+=len(raw)+1
+            # The complete raw stderr is captured separately. These bounded
+            # JSON records must never contribute Wayland pointer readiness.
+            if persistent:continue
             line=raw.decode('utf-8',errors='replace')
             created=re.search(r'get_pointer\(new id wl_pointer[#@](\d+)\)',line)
             if created:
@@ -35,5 +46,5 @@ class PointerReceipt:
                 self.entered=False;self.dirty=False;self.x=self.y=None;records.append(self.record())
             elif kind=='frame' and self.dirty:
                 self.dirty=False;records.append(self.record())
-        if len(self.buffer)>65536:raise ValueError('Wayland diagnostic line limit')
+        check_line_size(self.buffer)
         return records
