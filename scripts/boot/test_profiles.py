@@ -48,6 +48,74 @@ class ProfileTests(unittest.TestCase):
                   'hostSha256': sha256(root / 'ming-app-host'), 'catalogSha256': sha256(root / 'catalog.json')}
         return catalog, review
 
+    def uninstall_fixture(self, root):
+        catalog, review = self.persistent_fixture(root)
+        (root / 'prepare-persistent-install-fixture').rename(root / 'prepare-persistent-uninstall-fixture')
+        review['profile'] = 'persistent-uninstall'
+        review['extraArgs'][-1] = 'persistent-uninstall-pointer-ready-v1'
+        review['instrumentedProfile'] = 'persistent-uninstall-pointer-ready-v1'
+        fixture = review.pop('persistentInstallFixture')
+        fixture.update(helper='/opt/mingos/prepare-persistent-uninstall-fixture',
+                       receipt='/run/evidence/persistent-uninstall-fixture.json')
+        review['persistentUninstallFixture'] = fixture
+        review['persistentUninstallFixtureSha256'] = review.pop('persistentInstallFixtureSha256')
+        return catalog, review
+
+    def test_persistent_uninstall_accepts_only_its_frozen_helper_and_packaged_wasm(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); catalog, review = self.uninstall_fixture(root)
+            try: actual = verify_payload(root, review)
+            except ValueError as error: self.fail('frozen uninstall profile rejected: ' + str(error))
+            self.assertEqual(actual, catalog)
+            self.assertEqual(checked_session(review, root), review)
+            self.assertFalse((root / 'install-source').exists())
+            self.assertFalse((root / 'install-root').exists())
+            for relative in ('prepare-persistent-uninstall-fixture', 'packages/initial/main.wasm', 'packages/new/main.wasm'):
+                path = root / relative; raw = path.read_bytes(); path.write_bytes(raw + b'drift')
+                with self.subTest(relative=relative), self.assertRaises(ValueError): verify_payload(root, review)
+                path.write_bytes(raw)
+
+    def test_persistent_uninstall_rejects_legacy_unknown_fixture_paths_args_and_hash_fallbacks(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); _, review = self.uninstall_fixture(root)
+            changes = [
+                {'persistentInstallFixture': {}}, {'persistentInstallFixtureSha256': {}},
+                {'installFixture': {}}, {'updateFixture': {}}, {'installRoot': '/data/mingos/install-root'},
+                {'persistentInstallState': '/opt/mingos/install-root'}, {'catalogPath': '/opt/mingos/catalog.json'},
+                {'installSource': '/opt/mingos/other/app.json'}, {'installEvents': '/opt/mingos/events.json'},
+                {'inputScriptSha256': '1' * 64}, {'inputScripts': {'boot1Sha256': '1' * 64}},
+                {'inputScripts': {'boot1Sha256': '1' * 64, 'boot2Sha256': '1' * 64}},
+                {'inputScripts': dict(review['inputScripts'], unknown='3' * 64)},
+                {'extraArgs': review['extraArgs'][:-1] + ['persistent-install-pointer-ready-v1']},
+                {'extraArgs': review['extraArgs'] + ['--events', '/opt/mingos/events.json']},
+                {'extraArgs': review['extraArgs'] + ['--data-root', '/tmp/data']},
+                {'instrumentedProfile': 'persistent-install-pointer-ready-v1'}, {'instrumentedQualification': False},
+                {'persistentUninstallFixtureSha256': dict(review['persistentUninstallFixtureSha256'], unknown='3' * 64)},
+            ]
+            for field, value in [('helper', '/opt/mingos/prepare-persistent-install-fixture'),
+                                 ('installRoot', '/tmp/install-root'), ('initialWasm', '/opt/mingos/packages/new/main.wasm'),
+                                 ('sourceWasm', '/opt/mingos/packages/initial/main.wasm'),
+                                 ('sourceManifest', '/opt/mingos/source.json'), ('receipt', '/run/evidence/desktop-state.json'),
+                                 ('privatePath', '/arbitrary/private')]:
+                changes.append({'persistentUninstallFixture': dict(review['persistentUninstallFixture'], **{field: value})})
+            for change in changes:
+                with self.subTest(change=change), self.assertRaises(ValueError): verify_payload(root, dict(review, **change))
+            (root / 'install-source').mkdir()
+            with self.assertRaises(ValueError): verify_payload(root, review)
+
+    def test_persistent_uninstall_catalog_is_strict_and_never_autostarts_app2(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); catalog, review = self.uninstall_fixture(root)
+            for change in (lambda c: c.update(autostart=[1, 2]), lambda c: c.update(autostart=[True]),
+                           lambda c: c['apps'][0].update(id=True), lambda c: c.update(schemaVersion=3.0),
+                           lambda c: c.update(unknown=True)):
+                changed = copy.deepcopy(catalog); change(changed); self.put(root / 'catalog.json', changed)
+                review['catalogSha256'] = sha256(root / 'catalog.json')
+                with self.subTest(change=change), self.assertRaises(ValueError): verify_payload(root, review)
+            (root / 'catalog.json').write_text(json.dumps(catalog).replace('"schemaVersion": 3', '"schemaVersion": 1, "schemaVersion": 3'))
+            review['catalogSha256'] = sha256(root / 'catalog.json')
+            with self.assertRaises(ValueError): verify_payload(root, review)
+
     def test_persistent_install_accepts_frozen_helper_without_ram_registry_or_events(self):
         with tempfile.TemporaryDirectory() as work:
             root = Path(work); catalog, review = self.persistent_fixture(root)
@@ -96,25 +164,27 @@ class ProfileTests(unittest.TestCase):
             (root / 'catalog.json').write_text(raw); review['catalogSha256'] = sha256(root / 'catalog.json')
             with self.assertRaises(ValueError): verify_payload(root, review)
 
-    def test_persistent_install_vm_input_has_no_single_hash_or_wrong_boot_fallback(self):
+    def test_persistent_profiles_vm_input_has_no_single_hash_or_wrong_boot_fallback(self):
         from bootlib import validate_reviewed_input
-        with tempfile.TemporaryDirectory() as work:
-            first, second = Path(work) / 'first.json', Path(work) / 'second.json'
-            first.write_text('{"boot":1}'); second.write_text('{"boot":2}')
-            review = {'profile': 'persistent-install', 'inputScripts': {
-                'boot1Sha256': sha256(first), 'boot2Sha256': sha256(second)}}
-            validate_reviewed_input(review, first, boot_number=1)
-            validate_reviewed_input(review, second, boot_number=2)
-            for path, number in ((first, 2), (second, 1), (first, None), (first, True), (first, 3), (None, 2)):
-                with self.subTest(number=number, path=path), self.assertRaises(ValueError):
-                    validate_reviewed_input(review, path, boot_number=number)
-            for changed in ({'inputScriptSha256': sha256(first)},
-                            {'inputScripts': {'boot1Sha256': sha256(first)}},
-                            {'inputScripts': dict(review['inputScripts'], extra='0' * 64)}):
-                with self.subTest(change=changed), self.assertRaises(ValueError):
-                    validate_reviewed_input(dict(review, **changed), first, boot_number=1)
-            first.write_text('{"boot":2}')
-            with self.assertRaises(ValueError): validate_reviewed_input(review, first, boot_number=1)
+        for profile in ('persistent-install', 'persistent-uninstall'):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as work:
+                first, second = Path(work) / 'first.json', Path(work) / 'second.json'
+                first.write_text('{"boot":1}'); second.write_text('{"boot":2}')
+                review = {'profile': profile, 'inputScripts': {
+                    'boot1Sha256': sha256(first), 'boot2Sha256': sha256(second)}}
+                validate_reviewed_input(review, first, boot_number=1)
+                validate_reviewed_input(review, second, boot_number=2)
+                for path, number in ((first, 2), (second, 1), (first, None), (first, True), (first, 3), (None, 2)):
+                    with self.subTest(number=number, path=path), self.assertRaises(ValueError):
+                        validate_reviewed_input(review, path, boot_number=number)
+                for changed in ({'inputScriptSha256': sha256(first)},
+                                {'inputScripts': {'boot1Sha256': sha256(first)}},
+                                {'inputScripts': dict(review['inputScripts'], extra='0' * 64)}):
+                    with self.subTest(change=changed), self.assertRaises(ValueError):
+                        validate_reviewed_input(dict(review, **changed), first, boot_number=1)
+                first.write_text('{"boot":2}')
+                with self.assertRaises(ValueError): validate_reviewed_input(review, first, boot_number=1)
+
 
     def test_reviewed_input_rejects_oversized_bytes_even_with_matching_hash(self):
         from bootlib import validate_reviewed_input
@@ -496,6 +566,8 @@ class InputQualificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             for profile, tag in (
                     ('install-lifecycle', 'install-lifecycle-pointer-ready-v1'),
+                    ('persistent-install', 'persistent-install-pointer-ready-v1'),
+                    ('persistent-uninstall', 'persistent-uninstall-pointer-ready-v1'),
                     ('data-text', 'data-text-pointer-ready-v1')):
                 with self.subTest(profile=profile):
                     self.assertTrue(self.validate(Path(work), self.review(profile, tag)))
@@ -505,6 +577,9 @@ class InputQualificationTests(unittest.TestCase):
             for profile, tag in (
                     ('install-lifecycle', 'data-text-pointer-ready-v1'),
                     ('data-text', 'install-lifecycle-pointer-ready-v1'),
+                    ('persistent-install', 'persistent-uninstall-pointer-ready-v1'),
+                    ('persistent-uninstall', 'persistent-install-pointer-ready-v1'),
+                    ('persistent-uninstall-extra', 'persistent-uninstall-pointer-ready-v1'),
                     ('install-lifecycle', None),
                     ('install-lifecycle', 'unknown')):
                 with self.subTest(profile=profile, tag=tag), self.assertRaises(ValueError):

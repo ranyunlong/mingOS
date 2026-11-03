@@ -160,19 +160,25 @@ class PersistentDesktopReceipts:
                 or self.launches.get(self.app2_down, (None,))[0] != 'ready'):
             raise ValueError('missing/out-of-role persistent native/install evidence')
 
-def persistent_context(session, platform, command_line):
-    persistent_session_contract(session)
+def persistent_context(session, platform, command_line, *, uninstall=False):
+    contract, boot_role, prefix = persistent_session_contract, persistent_boot_role, 'persistent_install'
+    if uninstall:
+        from bootlib import persistent_uninstall_boot_role, persistent_uninstall_session_contract
+        contract, boot_role, prefix = persistent_uninstall_session_contract, persistent_uninstall_boot_role, 'persistent_uninstall'
+    contract(session)
     params = {}
     for part in command_line.split():
         key, _, value = part.partition("=")
-        if key in ("mingos.persistent_install_boot", "mingos.persistent_install_role"):
+        if uninstall and key in ('mingos.persistent_install_boot', 'mingos.persistent_install_role'):
+            raise ValueError('old persistent install boot parameter in uninstall profile')
+        if key in (f"mingos.{prefix}_boot", f"mingos.{prefix}_role"):
             if key in params: raise ValueError("duplicate persistent boot parameter")
             params[key] = value
-    value = params.get("mingos.persistent_install_boot")
+    value = params.get(f"mingos.{prefix}_boot")
     if value not in ("1", "2"): raise ValueError("missing/invalid persistent boot number")
     number = int(value)
-    role = persistent_boot_role(number)
-    if params.get("mingos.persistent_install_role") != role:
+    role = boot_role(number)
+    if params.get(f"mingos.{prefix}_role") != role:
         raise ValueError("persistent boot role mismatch")
     marker, previous = platform.marker, platform.previous
     if (platform.mounted is not True or not isinstance(platform.disk_uuid, str) or not platform.disk_uuid
@@ -189,6 +195,20 @@ def persistent_context(session, platform, command_line):
     return {"schemaVersion": 1, "bootId": platform.boot_id, "bootNumber": number, "role": role,
             "marker": marker, "previousMarker": previous, "diskUuid": platform.disk_uuid,
             "registryRoot": PERSISTENT_INSTALL_ROOT, "catalogPath": PERSISTENT_INSTALL_CATALOG}
+
+def persistent_uninstall_context(session, platform, command_line):
+    return persistent_context(session, platform, command_line, uninstall=True)
+
+def persistent_uninstall_helper_argv(session, context, phase):
+    from bootlib import persistent_uninstall_boot_role, persistent_uninstall_session_contract
+    persistent_uninstall_session_contract(session)
+    if phase not in ('pre-desktop', 'post-desktop') or context.get('role') != persistent_uninstall_boot_role(context.get('bootNumber')):
+        raise ValueError('invalid persistent uninstall snapshot role/phase')
+    fixture = session['persistentUninstallFixture']
+    if context['bootNumber'] == 1 and phase == 'pre-desktop':
+        return [fixture['helper'], 'initialize-first', fixture['installRoot'], fixture['initialWasm'],
+                fixture['sourceWasm'], fixture['sourceManifest'], '/opt/mingos/catalog.json', session['catalogSha256'], fixture['receipt']]
+    return [fixture['helper'], 'open-uninstalled', fixture['installRoot'], fixture['sourceWasm'], '/data/mingos', fixture['receipt']]
 
 def persistent_helper_argv(session, context, phase):
     persistent_session_contract(session)
@@ -297,10 +317,41 @@ def persistent_snapshot(receipt, context, phase, session_id):
     envelope = dict(context, sessionId=session_id, phase=phase, status=receipt["status"], actions=actions)
     return {"envelope": envelope, "content": content}
 
-def prepare_persistent_snapshot(session, context, phase, session_id=None):
-    argv = persistent_helper_argv(session, context, phase)
+def persistent_uninstall_snapshot(receipt, context, phase, session_id, desktop_pid=None):
+    from bootlib import persistent_uninstall_boot_role
+    from persistent_uninstall_receipt import exact, private_content, content_snapshot, removed_identity
+    exact(receipt, ('schemaVersion', 'status', 'actions', 'content', 'removed', 'privateContent'))
+    if type(receipt['schemaVersion']) is not int or receipt['schemaVersion'] != 1:
+        raise ValueError('unsupported persistent uninstall helper version')
+    if phase not in ('pre-desktop', 'post-desktop') or context.get('role') != persistent_uninstall_boot_role(context.get('bootNumber')):
+        raise ValueError('invalid persistent uninstall snapshot role/phase')
+    if ((phase == 'pre-desktop' and (session_id is not None or desktop_pid is not None))
+            or (phase == 'post-desktop' and (not isinstance(session_id, str) or not session_id or not integer(desktop_pid, 2)))):
+        raise ValueError('persistent uninstall snapshot desktop/session mismatch')
+    initial = context['bootNumber'] == 1 and phase == 'pre-desktop'
+    if receipt['status'] != ('initialized-first' if initial else 'opened-uninstalled'):
+        raise ValueError('persistent uninstall helper status mismatch')
+    exact(receipt['actions'], ('initializedRoots', 'packagesInstalled', 'trustStoresProvisioned', 'catalogsCreated', 'sourcesCreated'))
+    if any(type(value) is not int or value != int(initial) for value in receipt['actions'].values()):
+        raise ValueError('persistent uninstall helper initialization count mismatch')
+    if initial:
+        if receipt['removed'] is not None or receipt['privateContent'] is not None:
+            raise ValueError('initial uninstall snapshot cannot contain removed/private evidence')
+    else:
+        removed_identity(receipt['removed']); private_content(receipt['privateContent'])
+    content = content_snapshot(receipt['content'], removed=receipt['removed'])
+    if initial and len(content['files']) != 6:
+        raise ValueError('initial uninstall snapshot contains unexpected history')
+    return {'envelope': dict(context, sessionId=session_id, desktopPid=desktop_pid, phase=phase,
+                             status=receipt['status'], actions=receipt['actions']),
+            'content': content, 'removed': receipt['removed'], 'privateContent': receipt['privateContent']}
+
+def prepare_persistent_snapshot(session, context, phase, session_id=None, *, uninstall=False, desktop_pid=None):
+    argv = (persistent_uninstall_helper_argv if uninstall else persistent_helper_argv)(session, context, phase)
+    event = 'persistent-uninstall-state' if uninstall else 'persistent-install-state'
+    snapshot_of = (lambda value: persistent_uninstall_snapshot(value, context, phase, session_id, desktop_pid)) if uninstall else (lambda value: persistent_snapshot(value, context, phase, session_id))
     helper = Path(argv[0])
-    expected = session.get("persistentInstallFixtureSha256", {}).get("helper")
+    expected = session.get("persistentUninstallFixtureSha256" if uninstall else "persistentInstallFixtureSha256", {}).get("helper")
     if expected != hashlib.sha256(helper.read_bytes()).hexdigest(): raise ValueError("persistent helper hash drift")
     path = Path(argv[-1])
     path.unlink(missing_ok=True)
@@ -308,19 +359,35 @@ def prepare_persistent_snapshot(session, context, phase, session_id=None):
     snapshot = None
     try:
         if result.returncode == 0:
-            snapshot = persistent_snapshot(read_persistent_receipt(path), context, phase, session_id)
-            stdout_snapshot = persistent_snapshot(parse_persistent_json(result.stdout), context, phase, session_id)
+            snapshot = snapshot_of(read_persistent_receipt(path))
+            stdout_snapshot = snapshot_of(parse_persistent_json(result.stdout))
             if stdout_snapshot != snapshot: raise ValueError("persistent helper stdout/file receipt mismatch")
     except Exception:
-        emit("persistent-install-state", argv=argv, code=result.returncode, stdout=result.stdout,
+        emit(event, argv=argv, code=result.returncode, stdout=result.stdout,
              stderr=result.stderr, receipt=None)
         raise
-    emit("persistent-install-state", argv=argv, code=result.returncode, stdout=result.stdout,
+    emit(event, argv=argv, code=result.returncode, stdout=result.stdout,
          stderr=result.stderr, receipt=snapshot)
-    if result.returncode: raise RuntimeError("persistent install helper failed")
+    if result.returncode: raise RuntimeError("persistent uninstall helper failed" if uninstall else "persistent install helper failed")
     return snapshot
 
+def verify_persistent_uninstall_after(before, after, parser, boot_number):
+    fields = ('content', 'removed', 'privateContent')
+    expected = ({'content': parser.uninstalled_content, 'removed': parser.removed,
+                 'privateContent': parser.private_content} if boot_number == 1 else before)
+    if any(after[key] != expected[key] for key in fields):
+        raise RuntimeError('persistent uninstall post-desktop content/identity/private evidence mismatch')
+
 def desktop_argv(session, context=None):
+    if session.get('profile') == 'persistent-uninstall':
+        from bootlib import persistent_uninstall_boot_role, persistent_uninstall_session_contract
+        persistent_uninstall_session_contract(session)
+        if not context or context.get('role') != persistent_uninstall_boot_role(context.get('bootNumber')):
+            raise ValueError('persistent uninstall desktop requires verified context')
+        argv = ['/opt/mingos/ming-app-host', 'desktop', PERSISTENT_INSTALL_CATALOG, '--renderer', 'cpu'] + session['extraArgs']
+        argv += ['--persistent-install-state', PERSISTENT_INSTALL_ROOT]
+        if context['bootNumber'] == 1: argv += ['--install-source', session['installSource']]
+        return argv
     if session.get("profile") == "persistent-install":
         persistent_session_contract(session)
         if not context or context.get("role") != persistent_boot_role(context.get("bootNumber")):
@@ -369,6 +436,7 @@ def main():
     stderr_limited = False
     diagnostic = {}
     persistent = persistent_before = None
+    persistent_uninstall = False
     fault_config = fault_receipt = None
     fault_receipt_path = LOG / "fault-injection.json"
     ready_capture_deadline = None
@@ -484,10 +552,11 @@ def main():
             if weston.poll() is not None or time.monotonic() >= deadline: raise RuntimeError("Weston DRM socket not ready")
             time.sleep(0.1)
         session = json.loads(Path("/etc/mingos/session.json").read_text())
-        if session.get("profile") == "persistent-install":
+        if session.get("profile") in ("persistent-install", "persistent-uninstall"):
             session = strict_json(Path("/etc/mingos/session.json").read_text())
-            persistent = persistent_context(session, platform, Path("/proc/cmdline").read_text())
-            persistent_before = prepare_persistent_snapshot(session, persistent, "pre-desktop")
+            persistent_uninstall = session['profile'] == 'persistent-uninstall'
+            persistent = persistent_context(session, platform, Path("/proc/cmdline").read_text(), uninstall=persistent_uninstall)
+            persistent_before = prepare_persistent_snapshot(session, persistent, "pre-desktop", uninstall=persistent_uninstall)
         fixture = session.get("updateFixture")
         if fixture is not None:
             expected = {
@@ -552,7 +621,11 @@ def main():
         desktop = launch(argv, "desktop", desktop_debug=True)
         if persistent:
             if stderr_capture is None: raise RuntimeError("persistent desktop requires captured diagnostic stderr")
-            persistent_parser = PersistentDesktopReceipts(platform.boot_id, desktop.pid)
+            if persistent_uninstall:
+                from persistent_uninstall_receipt import PersistentUninstallReceipts
+                persistent_parser = PersistentUninstallReceipts(platform.boot_id, desktop.pid, persistent['bootNumber'])
+            else:
+                persistent_parser = PersistentDesktopReceipts(platform.boot_id, desktop.pid)
         if fault_config:
             fault_injector = launch(["python3", "-B", "/etc/mingos/fault_injector.py", "--config",
                                      str(fault_config_path), "--state-file", STATE_PATH, "--receipt",
@@ -588,11 +661,15 @@ def main():
         if persistent:
             if not state: raise RuntimeError("persistent desktop ended without session state")
             persistent_parser.complete(persistent['bootNumber'])
-            after = prepare_persistent_snapshot(session, persistent, "post-desktop", state["sessionId"])
-            if persistent_parser.installed_content is not None and after['content'] != persistent_parser.installed_content:
-                raise RuntimeError("persistent post-desktop content disagrees with installed snapshot")
-            if persistent["bootNumber"] == 2 and after["content"] != persistent_before["content"]:
-                raise RuntimeError("persistent content changed during reopen-only second boot")
+            after = prepare_persistent_snapshot(session, persistent, "post-desktop", state["sessionId"],
+                uninstall=persistent_uninstall, desktop_pid=desktop.pid if persistent_uninstall else None)
+            if persistent_uninstall:
+                verify_persistent_uninstall_after(persistent_before, after, persistent_parser, persistent['bootNumber'])
+            else:
+                if persistent_parser.installed_content is not None and after['content'] != persistent_parser.installed_content:
+                    raise RuntimeError("persistent post-desktop content disagrees with installed snapshot")
+                if persistent["bootNumber"] == 2 and after["content"] != persistent_before["content"]:
+                    raise RuntimeError("persistent content changed during reopen-only second boot")
         stop(weston, "weston"); stop(seat, "seatd"); stop(observer, "input-observer")
         platform.strict_after()
     except Exception as caught:

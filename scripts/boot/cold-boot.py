@@ -5,8 +5,8 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from infra import validate_cold_pair
-from bootlib import sha256, strict_json, validate_bundle, validate_reviewed_input
+from infra import InputPlan, validate_cold_pair
+from bootlib import PERSISTENT_PAYLOAD_PROFILES, reviewed_input_spec, sha256, strict_json, validate_bundle, validate_reviewed_input
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -19,21 +19,33 @@ def main():
     args = p.parse_args()
     identity = sha256(args.bundle / "bundle.json")
     manifest = validate_bundle(args.bundle, sha256(args.review))
-    review = json.loads(args.review.read_text())
-    persistent = review.get("profile") == "persistent-install"
+    raw_review = args.review.read_text()
+    review = json.loads(raw_review)
+    persistent = review.get("profile") in PERSISTENT_PAYLOAD_PROFILES
+    frozen_inputs = {}
     if persistent:
-        review = strict_json(args.review.read_text())
+        review = strict_json(raw_review)
         if args.input_script is not None:
             raise ValueError("persistent install cannot use a single input script")
         if review != manifest.get("sessionReview") or review.get("reviewed") is not True or not review.get("reviewer"):
             raise ValueError("main-thread review absent/changed")
         inputs = {1: args.boot1_input_script, 2: args.boot2_input_script}
-        for number, source in inputs.items(): validate_reviewed_input(review, source, boot_number=number)
+        for number, source in inputs.items():
+            frozen_inputs[number], _ = validate_reviewed_input(review, source, boot_number=number)
+            pointer = manifest.get("diagnosticProfile") == "input-pointer-ready-v1"
+            InputPlan(reviewed_input_spec(review, frozen_inputs[number]), args.output / ("boot-%d.inputs.jsonl" % number),
+                      args.timeout, split_transactions=pointer, pointer_handshake=pointer)
     else:
         if args.boot1_input_script is not None or args.boot2_input_script is not None:
             raise ValueError("per-boot input scripts are reserved for persistent install")
         inputs = {1: args.input_script, 2: args.input_script}
     args.output.mkdir(parents=True, exist_ok=False)
+    if persistent:
+        for number, raw in frozen_inputs.items():
+            path = args.output / ("boot-%d.input.json" % number)
+            with path.open("xb") as output: output.write(raw)
+            path.chmod(0o400)
+            inputs[number] = path
     reports = []
     try:
         for number in (1, 2):
@@ -42,7 +54,6 @@ def main():
                     "--review", str(args.review), "--work-root", str(args.work_root), "--data-manifest", args.data_manifest,
                     "--output", str(args.output / ("boot-" + str(number))), "--timeout", str(args.timeout)]
             if persistent:
-                validate_reviewed_input(review, inputs[number], boot_number=number)
                 argv += ["--boot-number", str(number)]
             if inputs[number]: argv += ["--input-script", str(inputs[number])]
             if manifest.get("diagnosticProfile") == "input-pointer-ready-v1": argv += ["--diagnostic-split-input", "--diagnostic-pointer-handshake"]

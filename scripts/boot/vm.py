@@ -7,7 +7,7 @@ import base64
 import subprocess
 import time
 from pathlib import Path
-from bootlib import Qmp, qemu_command, sha256, strict_json, validate_bundle, validate_reviewed_input
+from bootlib import PERSISTENT_PAYLOAD_PROFILES, Qmp, qemu_command, reviewed_input_spec, sha256, strict_json, validate_bundle, validate_reviewed_input
 from infra import InputPlan, STATE_PATH, classify_guest, state_ready, validate_fault_injection, validate_fault_receipt, validate_state
 
 
@@ -125,21 +125,23 @@ def main():
     args = parser.parse_args()
     if not 10 <= args.timeout <= 1800: parser.error("timeout must be 10..1800 seconds")
     if bool(args.work_root) != bool(args.data_manifest): parser.error("work-root/data-manifest must be used together")
-    manifest = None
+    manifest = review = None
     fault_config = None
-    input_bytes = input_digest = None
+    input_bytes = input_digest = input_spec = None
     if not args.probe_paused:
         if not args.bundle or not args.review: parser.error("kernel boot requires bundle and main-thread review")
         manifest = validate_bundle(args.bundle, sha256(args.review))
-        review = json.loads(args.review.read_text())
-        if review.get("profile") == "persistent-install": review = strict_json(args.review.read_text())
+        raw_review = args.review.read_text()
+        review = json.loads(raw_review)
+        if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES: review = strict_json(raw_review)
         if review.get("reviewed") is not True or not review.get("reviewer") or review != manifest["sessionReview"]:
             raise ValueError("main-thread review absent/changed")
         if manifest.get("faultInjection") is not None:
             fault_config = validate_fault_injection(manifest["faultInjection"])
         input_bytes, input_digest = validate_reviewed_input(review, args.input_script, boot_number=args.boot_number)
-        if review.get("profile") == "persistent-install" and (
-                not args.data_manifest or manifest.get("payloadProfile") != "persistent-install"
+        input_spec = reviewed_input_spec(review, input_bytes)
+        if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES and (
+                not args.data_manifest or manifest.get("payloadProfile") != review["profile"]
                 or manifest.get("instrumentedQualification") is not True
                 or manifest.get("diagnosticProfile") != "input-pointer-ready-v1"):
             raise ValueError("persistent install requires its qualified profile and persistent disk")
@@ -165,12 +167,13 @@ def main():
     else:
         lease_context = contextlib.nullcontext()
     args.output.mkdir(parents=True, exist_ok=False)
-    plan = InputPlan(json.loads(input_bytes), args.output / "inputs.jsonl", args.timeout, split_transactions=args.diagnostic_split_input, pointer_handshake=args.diagnostic_pointer_handshake) if input_bytes is not None else None
+    plan = InputPlan(input_spec, args.output / "inputs.jsonl", args.timeout, split_transactions=args.diagnostic_split_input, pointer_handshake=args.diagnostic_pointer_handshake) if input_bytes is not None else None
     with lease_context:
         if disk:
             disk = load_disk(args.work_root, args.data_manifest)
         command = qemu_command(args.bundle, args.output, paused=args.probe_paused, data_disk=disk,
-                               input_diagnostics=bool(manifest and manifest.get("inputDiagnostics")), boot_number=args.boot_number)
+                               input_diagnostics=bool(manifest and manifest.get("inputDiagnostics")), boot_number=args.boot_number,
+                               persistent_profile=review["profile"] if review and review.get("profile") in PERSISTENT_PAYLOAD_PROFILES else None)
         report = {"argv": command, "bootAttempted": False, "status": "planned", "finalSystemAccepted": False,
                   "physicalInput": False, "physicalGpu": False, "probePaused": args.probe_paused,
                   "diagnosticOnly": bool(manifest and manifest.get("diagnosticOnly", manifest.get("inputDiagnostics"))), "diagnosticSplitInput": args.diagnostic_split_input, "pointerHandshake": args.diagnostic_pointer_handshake,

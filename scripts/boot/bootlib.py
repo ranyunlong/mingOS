@@ -25,6 +25,35 @@ PERSISTENT_INSTALL_FIXTURE = {
     "receipt": "/run/evidence/persistent-install-fixture.json",
 }
 
+PERSISTENT_UNINSTALL_PROFILE = "persistent-uninstall-pointer-ready-v1"
+PERSISTENT_UNINSTALL_ARGS = ["--duration-ms", "0", "--isolation", "strict", "--data-root", "/data/mingos",
+                             "--state-file", "/run/evidence/desktop-state.json",
+                             "--qualification-receipts", PERSISTENT_UNINSTALL_PROFILE]
+PERSISTENT_UNINSTALL_FIXTURE = {
+    "helper": "/opt/mingos/prepare-persistent-uninstall-fixture",
+    "installRoot": PERSISTENT_INSTALL_ROOT,
+    "initialWasm": "/opt/mingos/packages/initial/main.wasm",
+    "sourceWasm": "/opt/mingos/packages/new/main.wasm",
+    "sourceManifest": INSTALL_LIFECYCLE_SOURCE,
+    "receipt": "/run/evidence/persistent-uninstall-fixture.json",
+}
+PERSISTENT_PAYLOAD_PROFILES = ("persistent-install", "persistent-uninstall")
+
+def persistent_uninstall_session_contract(review):
+    if (review.get("persistentInstallState") != PERSISTENT_INSTALL_ROOT
+            or review.get("catalogPath") != PERSISTENT_INSTALL_CATALOG
+            or review.get("installSource") != INSTALL_LIFECYCLE_SOURCE
+            or review.get("persistentUninstallFixture") != PERSISTENT_UNINSTALL_FIXTURE
+            or review.get("extraArgs") != PERSISTENT_UNINSTALL_ARGS
+            or any(key in review for key in ("installRoot", "installFixture", "updateFixture", "installEvents", "installEventsSha256",
+                                            "persistentInstallFixture", "persistentInstallFixtureSha256"))):
+        raise ValueError("persistent uninstall requires exact persistent paths/args without legacy fixture overrides")
+
+def persistent_uninstall_boot_role(number):
+    if type(number) is not int or number not in (1, 2):
+        raise ValueError("persistent uninstall requires fixed boot number 1 or 2")
+    return "initialize-first" if number == 1 else "open-uninstalled"
+
 def persistent_session_contract(review):
     if (review.get("persistentInstallState") != PERSISTENT_INSTALL_ROOT
             or review.get("catalogPath") != PERSISTENT_INSTALL_CATALOG
@@ -97,8 +126,9 @@ def checked_session(review, payload):
         raise ValueError("install profile requires reviewed event path")
     if review.get("profile") == "install-lifecycle" and review.get("installSource") != INSTALL_LIFECYCLE_SOURCE:
         raise ValueError("install profile requires reviewed install source")
-    if review.get("profile") == "persistent-install":
-        persistent_session_contract(review)
+    if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES:
+        if review["profile"] == "persistent-uninstall": persistent_uninstall_session_contract(review)
+        else: persistent_session_contract(review)
         persistent_input_hashes(review)
     if any(not isinstance(arg, str) or "\0" in arg for arg in extra):
         raise ValueError("invalid session argument")
@@ -118,8 +148,9 @@ def checked_session(review, payload):
 
 def validate_reviewed_input(review, path, boot_number=None):
     """Return frozen input bytes and their digest for both validation and use."""
-    if review.get("profile") == "persistent-install":
-        persistent_boot_role(boot_number)
+    if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES:
+        if review["profile"] == "persistent-uninstall": persistent_uninstall_boot_role(boot_number)
+        else: persistent_boot_role(boot_number)
         expected = persistent_input_hashes(review)["boot%dSha256" % boot_number]
         mismatch = "reviewed persistent input script hash mismatch for boot " + str(boot_number)
     else:
@@ -139,6 +170,14 @@ def validate_reviewed_input(review, path, boot_number=None):
     if expected is not None and digest != expected: raise ValueError(mismatch)
     return raw, digest
 
+def reviewed_input_spec(review, raw):
+    if raw is None: return None
+    persistent = review.get("profile") in PERSISTENT_PAYLOAD_PROFILES
+    value = strict_json(raw) if persistent else json.loads(raw)
+    if persistent and (not isinstance(value, dict) or set(value) != {"schemaVersion", "requireApps", "steps"}):
+        raise ValueError("persistent input requires exact schemaVersion/requireApps/steps fields")
+    return value
+
 def validate_kernel_config(settings):
     flags = dict(line.split("=", 1) for line in settings.splitlines() if line.startswith("CONFIG_") and "=" in line)
     for name in ("DEVTMPFS", "RD_GZIP", "SERIAL_8250_CONSOLE", "CGROUPS", "MEMCG", "CGROUP_SCHED", "CFS_BANDWIDTH", "CGROUP_PIDS", "SECCOMP_FILTER", "NAMESPACES"):
@@ -157,10 +196,15 @@ def validate_bundle(bundle, review_digest):
             raise ValueError("bundle hash mismatch: " + name)
     return manifest
 
-def qemu_command(bundle, out, paused=False, data_disk=None, input_diagnostics=False, boot_number=None):
+def qemu_command(bundle, out, paused=False, data_disk=None, input_diagnostics=False, boot_number=None, persistent_profile=None):
+    if persistent_profile is not None and persistent_profile not in PERSISTENT_PAYLOAD_PROFILES:
+        raise ValueError("unknown persistent payload profile")
+    if persistent_profile is not None and boot_number is None:
+        raise ValueError("persistent profile requires fixed boot number")
     role = None
+    kernel_prefix = "persistent_uninstall" if persistent_profile == "persistent-uninstall" else "persistent_install"
     if boot_number is not None:
-        role = persistent_boot_role(boot_number)
+        role = persistent_uninstall_boot_role(boot_number) if persistent_profile == "persistent-uninstall" else persistent_boot_role(boot_number)
         if paused or not data_disk:
             raise ValueError("persistent install requires a running guest with persistent data disk")
     command = ["qemu-system-x86_64", "-machine", "q35", "-accel", "tcg,thread=multi",
@@ -185,7 +229,7 @@ def qemu_command(bundle, out, paused=False, data_disk=None, input_diagnostics=Fa
     return command + ["-kernel", str(bundle / "vmlinuz"), "-initrd", str(bundle / "initramfs.cpio.gz"),
                       "-append", "console=tty0 console=ttyS0,115200 rdinit=/init panic=-1"
                       + ((" mingos.data_uuid=" + data_disk["uuid"] + " mingos.data_serial=" + data_disk["serial"]) if data_disk else "")
-                      + ((" mingos.persistent_install_boot=" + str(boot_number) + " mingos.persistent_install_role=" + role) if role else "")]
+                      + ((" mingos." + kernel_prefix + "_boot=" + str(boot_number) + " mingos." + kernel_prefix + "_role=" + role) if role else "")]
 
 class Qmp:
     def __init__(self, path, timeout=15, transcript_path=None):

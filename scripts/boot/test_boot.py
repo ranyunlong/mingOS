@@ -13,7 +13,7 @@ from unittest import mock
 from bootlib import checked_path, checked_session, qemu_command, sha256, validate_bundle, validate_kernel_config
 
 class BootBoundaryTests(unittest.TestCase):
-    def persistent_bundle(self, base):
+    def persistent_bundle(self, base, profile='persistent-install'):
         first, second = base / 'boot1.json', base / 'boot2.json'
         plan = {'schemaVersion': 1, 'requireApps': [1], 'steps': [
             {'name': 'stop', 'events': [{'kind': 'pointer', 'x': 1250, 'y': 12},
@@ -21,13 +21,13 @@ class BootBoundaryTests(unittest.TestCase):
                                      {'kind': 'button', 'button': 'left', 'down': False}],
              'expect': {'phase': 'stopped'}}]}
         first.write_text(json.dumps(plan)); second.write_text(json.dumps(plan, indent=2))
-        review = {'reviewed': True, 'reviewer': 'test only', 'profile': 'persistent-install',
+        review = {'reviewed': True, 'reviewer': 'test only', 'profile': profile,
                   'inputScripts': {'boot1Sha256': sha256(first), 'boot2Sha256': sha256(second)},
                   'extraArgs': ['--state-file', '/run/evidence/desktop-state.json']}
         review_path = base / 'review.json'; review_path.write_text(json.dumps(review))
         for name in ('vmlinuz', 'initramfs.cpio.gz'): (base / name).write_bytes(name.encode())
         manifest = {'reviewSha256': sha256(review_path), 'sessionReview': review,
-                    'infraApiVersion': 1, 'payloadProfile': 'persistent-install',
+                    'infraApiVersion': 1, 'payloadProfile': profile,
                     'instrumentedQualification': True, 'diagnosticProfile': 'input-pointer-ready-v1',
                     'inputDiagnostics': True,
                     'sha256': {name: sha256(base / name) for name in ('vmlinuz', 'initramfs.cpio.gz')}}
@@ -52,19 +52,67 @@ class BootBoundaryTests(unittest.TestCase):
             self.assertEqual(result['inputScriptSha256'], sha256(first))
             self.assertIn('mingos.persistent_install_role=initialize-first', result['argv'][-1])
 
+    def test_persistent_uninstall_vm_dry_run_binds_both_fixed_kernel_roles(self):
+        import vm
+        for number, role in ((1, 'initialize-first'), (2, 'open-uninstalled')):
+            with self.subTest(number=number), tempfile.TemporaryDirectory() as work:
+                base = Path(work); review, first, second = self.persistent_bundle(base, 'persistent-uninstall')
+                source = first if number == 1 else second
+                disk = {'imagePath': '/task/disk.raw', 'uuid': 'disk-uuid', 'serial': 'MINGDATA0123456789ab'}
+                argv = ['vm.py', '--bundle', str(base), '--review', str(review), '--output', str(base / 'out'),
+                        '--input-script', str(source), '--boot-number', str(number), '--work-root', '/unused-test-root',
+                        '--data-manifest', 'disk.json', '--diagnostic-split-input', '--diagnostic-pointer-handshake', '--dry-run']
+                with mock.patch.object(sys, 'argv', argv), mock.patch('data_disk.load_disk', return_value=disk), \
+                     mock.patch('data_disk.lease', return_value=contextlib.nullcontext()), \
+                     mock.patch('subprocess.Popen', side_effect=AssertionError('dry run started a process')):
+                    try:
+                        with contextlib.redirect_stdout(io.StringIO()): result_code = vm.main()
+                    except ValueError as error: self.fail('uninstall dry-run rejected: ' + str(error))
+                self.assertEqual(result_code, 0)
+                result = json.loads((base / 'out/result.json').read_text())
+                self.assertFalse(result['bootAttempted'])
+                self.assertEqual((result['bootNumber'], result['inputScriptSha256']), (number, sha256(source)))
+                self.assertIn('mingos.persistent_uninstall_boot=' + str(number), result['argv'][-1])
+                self.assertIn('mingos.persistent_uninstall_role=' + role, result['argv'][-1])
+                self.assertNotIn('mingos.persistent_install_', result['argv'][-1])
+
+    def test_persistent_vm_rejects_duplicate_and_unknown_input_fields_before_process_start(self):
+        import vm
+        for profile in ('persistent-install', 'persistent-uninstall'):
+            for invalid in ('duplicate-key', 'unknown-root'):
+                with self.subTest(profile=profile, invalid=invalid), tempfile.TemporaryDirectory() as work:
+                    base = Path(work); review_path, source, _ = self.persistent_bundle(base, profile)
+                    if invalid == 'duplicate-key':
+                        source.write_text(source.read_text().replace('"schemaVersion": 1', '"schemaVersion": 1, "schemaVersion": 1', 1))
+                    else:
+                        value = json.loads(source.read_text()); value['unknown'] = True; source.write_text(json.dumps(value))
+                    review = json.loads(review_path.read_text()); review['inputScripts']['boot1Sha256'] = sha256(source)
+                    review_path.write_text(json.dumps(review))
+                    manifest = json.loads((base / 'bundle.json').read_text())
+                    manifest.update(sessionReview=review, reviewSha256=sha256(review_path)); (base / 'bundle.json').write_text(json.dumps(manifest))
+                    disk = {'imagePath': '/task/disk.raw', 'uuid': 'disk-uuid', 'serial': 'MINGDATA0123456789ab'}
+                    argv = ['vm.py', '--bundle', str(base), '--review', str(review_path), '--output', str(base / 'out'),
+                            '--input-script', str(source), '--boot-number', '1', '--work-root', '/unused-test-root',
+                            '--data-manifest', 'disk.json', '--diagnostic-split-input', '--diagnostic-pointer-handshake', '--dry-run']
+                    with mock.patch.object(sys, 'argv', argv), mock.patch('data_disk.load_disk', return_value=disk), \
+                         mock.patch('data_disk.lease', return_value=contextlib.nullcontext()), \
+                         mock.patch('subprocess.Popen', side_effect=AssertionError('invalid input started process')), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(ValueError): vm.main()
+
     def test_vm_keeps_reviewed_input_bytes_when_path_changes_after_validation(self):
         import vm
-        for profile in ('persistent-install', 'data-text'):
+        for profile in ('persistent-install', 'persistent-uninstall', 'data-text'):
             for restore in (False, True):
                 with self.subTest(profile=profile, restore=restore), tempfile.TemporaryDirectory() as work:
-                    base = Path(work); review_path, source, _ = self.persistent_bundle(base)
+                    base = Path(work); review_path, source, _ = self.persistent_bundle(base, profile=profile)
                     approved = source.read_bytes(); approved_hash = sha256(source)
                     approved_spec = json.loads(approved)
                     changed = json.loads(approved)
                     changed['steps'][0]['name'] = 'UNREVIEWED'
                     changed['steps'][0]['events'][0]['x'] = 99
                     review = json.loads(review_path.read_text())
-                    if profile != 'persistent-install':
+                    if profile not in ('persistent-install', 'persistent-uninstall'):
                         review.update(profile=profile, inputScriptSha256=approved_hash)
                         del review['inputScripts']
                         review_path.write_text(json.dumps(review))
@@ -85,7 +133,7 @@ class BootBoundaryTests(unittest.TestCase):
                             '--output', str(base / 'out'), '--input-script', str(source),
                             '--work-root', '/unused-test-root', '--data-manifest', 'disk.json',
                             '--diagnostic-split-input', '--diagnostic-pointer-handshake', '--dry-run']
-                    if profile == 'persistent-install': argv += ['--boot-number', '1']
+                    if profile in ('persistent-install', 'persistent-uninstall'): argv += ['--boot-number', '1']
                     with mock.patch.object(sys, 'argv', argv), \
                          mock.patch('data_disk.load_disk', side_effect=load_disk), \
                          mock.patch('data_disk.lease', return_value=contextlib.nullcontext()), \
@@ -107,7 +155,7 @@ class BootBoundaryTests(unittest.TestCase):
                 number = len(commands)
                 self.assertEqual(argv[argv.index('--boot-number') + 1], str(number))
                 source = first if number == 1 else second
-                self.assertEqual(argv[argv.index('--input-script') + 1], str(source))
+                self.assertEqual(Path(argv[argv.index('--input-script') + 1]).read_bytes(), source.read_bytes())
                 output = Path(argv[argv.index('--output') + 1]); output.mkdir()
                 result = {'status': 'normal-desktop-poweroff', 'bootId': 'boot-' + str(number),
                           'bundleIdentity': sha256(base / 'bundle.json'), 'diskUuid': 'disk',
@@ -130,6 +178,112 @@ class BootBoundaryTests(unittest.TestCase):
                 with self.assertRaises(ValueError): cold.main()
             self.assertEqual(len(commands), before)
             self.assertFalse((base / 'rejected').exists())
+
+    def test_cold_runner_reads_each_persistent_input_once_and_freezes_it_before_first_vm(self):
+        spec = importlib.util.spec_from_file_location('cold_boot_frozen_test', Path(__file__).with_name('cold-boot.py'))
+        cold = importlib.util.module_from_spec(spec); spec.loader.exec_module(cold)
+        for profile in ('persistent-install', 'persistent-uninstall'):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as work:
+                base = Path(work); review, first, second = self.persistent_bundle(base, profile)
+                sources = {1: first.read_bytes(), 2: second.read_bytes()}
+                digests = {1: sha256(first), 2: sha256(second)}
+                original_open = Path.open; reads = {first: 0, second: 0}; commands = []
+                def open_file(path, *args, **kwargs):
+                    if path in reads and args and args[0] == 'rb': reads[path] += 1
+                    return original_open(path, *args, **kwargs)
+                def run_vm(command, **kwargs):
+                    number = len(commands) + 1; commands.append(command)
+                    source = Path(command[command.index('--input-script') + 1])
+                    self.assertNotIn(source, (first, second))
+                    self.assertEqual(source.read_bytes(), sources[number])
+                    self.assertEqual(command[command.index('--boot-number') + 1], str(number))
+                    if number == 1: second.write_text('{"unreviewed":true}')
+                    output = Path(command[command.index('--output') + 1]); output.mkdir()
+                    result = {'status': 'normal-desktop-poweroff', 'bootId': 'boot-' + str(number),
+                              'bundleIdentity': sha256(base / 'bundle.json'), 'diskUuid': 'disk',
+                              'bootNumber': number, 'inputScriptSha256': digests[number],
+                              'marker': {'bootId': 'boot-' + str(number), 'counter': number},
+                              'previousMarker': None if number == 1 else {'bootId': 'boot-1', 'counter': 1}}
+                    (output / 'result.json').write_text(json.dumps(result))
+                    return subprocess.CompletedProcess(command, 0)
+                argv = ['cold-boot.py', '--bundle', str(base), '--review', str(review), '--work-root', '/unused',
+                        '--data-manifest', 'disk.json', '--output', str(base / 'cold'),
+                        '--boot1-input-script', str(first), '--boot2-input-script', str(second)]
+                with mock.patch.object(sys, 'argv', argv), mock.patch.object(Path, 'open', autospec=True, side_effect=open_file), \
+                     mock.patch('subprocess.run', side_effect=run_vm):
+                    try:
+                        with contextlib.redirect_stdout(io.StringIO()): code = cold.main()
+                    except ValueError as error: self.fail('persistent cold inputs rejected: ' + str(error))
+                self.assertEqual(code, 0, (base / 'cold/result.json').read_text())
+                self.assertEqual(len(commands), 2)
+                self.assertEqual(reads, {first: 1, second: 1})
+
+    def test_uninstall_bundle_copies_and_hashes_the_same_relay_bytes(self):
+        import bundle
+        copier = getattr(bundle, 'copy_guest_scripts', None)
+        self.assertTrue(callable(copier), 'guest script copy/hash boundary missing')
+        scripts = Path(__file__).resolve().parent
+        for profile in ('persistent-install', 'persistent-uninstall'):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as work:
+                root = Path(work); (root / 'etc/mingos').mkdir(parents=True)
+                hashes = copier(root, scripts, profile)
+                relay = root / 'etc/mingos/persistent_uninstall_receipt.py'
+                if profile == 'persistent-uninstall':
+                    self.assertEqual(relay.read_bytes(), (scripts / relay.name).read_bytes())
+                    self.assertEqual(hashes[relay.name], sha256(relay))
+                else:
+                    self.assertFalse(relay.exists())
+                    self.assertNotIn(relay.name, hashes)
+                for name, digest in hashes.items():
+                    target = root / ('init' if name == 'init' else 'etc/mingos/' + name)
+                    self.assertEqual(digest, sha256(target))
+
+    def test_uninstall_cold_preflights_second_input_schema_before_creating_output_or_first_vm(self):
+        spec = importlib.util.spec_from_file_location('cold_boot_input_schema_test', Path(__file__).with_name('cold-boot.py'))
+        cold = importlib.util.module_from_spec(spec); spec.loader.exec_module(cold)
+        for invalid in ('duplicate-key', 'unknown-root', 'unknown-step'):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as work:
+                base = Path(work); review_path, first, second = self.persistent_bundle(base, 'persistent-uninstall')
+                value = json.loads(second.read_text())
+                if invalid == 'duplicate-key': second.write_text(second.read_text().replace('"schemaVersion": 1', '"schemaVersion": 1, "schemaVersion": 1', 1))
+                else:
+                    if invalid == 'unknown-root': value['unknown'] = True
+                    else: value['steps'][0]['unknown'] = True
+                    second.write_text(json.dumps(value))
+                review = json.loads(review_path.read_text()); review['inputScripts']['boot2Sha256'] = sha256(second)
+                review_path.write_text(json.dumps(review))
+                manifest = json.loads((base / 'bundle.json').read_text())
+                manifest.update(sessionReview=review, reviewSha256=sha256(review_path)); (base / 'bundle.json').write_text(json.dumps(manifest))
+                argv = ['cold-boot.py', '--bundle', str(base), '--review', str(review_path), '--work-root', '/unused',
+                        '--data-manifest', 'disk.json', '--output', str(base / 'cold'),
+                        '--boot1-input-script', str(first), '--boot2-input-script', str(second)]
+                with mock.patch.object(sys, 'argv', argv), mock.patch('subprocess.run', side_effect=AssertionError('invalid boot2 started VM')), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(ValueError): cold.main()
+                self.assertFalse((base / 'cold').exists())
+
+    def test_uninstall_cold_first_failure_preserves_report_and_never_runs_second_vm(self):
+        spec = importlib.util.spec_from_file_location('cold_boot_failure_test', Path(__file__).with_name('cold-boot.py'))
+        cold = importlib.util.module_from_spec(spec); spec.loader.exec_module(cold)
+        with tempfile.TemporaryDirectory() as work:
+            base = Path(work); review, first, second = self.persistent_bundle(base, 'persistent-uninstall')
+            commands = []
+            def run_vm(command, **kwargs):
+                commands.append(command)
+                self.assertEqual(len(commands), 1, 'failed first boot must never start boot2')
+                output = Path(command[command.index('--output') + 1]); output.mkdir()
+                (output / 'result.json').write_text(json.dumps({'status': 'failed', 'failureEvidence': 'preserve'}))
+                return subprocess.CompletedProcess(command, 1)
+            argv = ['cold-boot.py', '--bundle', str(base), '--review', str(review), '--work-root', '/unused',
+                    '--data-manifest', 'disk.json', '--output', str(base / 'cold'),
+                    '--boot1-input-script', str(first), '--boot2-input-script', str(second)]
+            with mock.patch.object(sys, 'argv', argv), mock.patch('subprocess.run', side_effect=run_vm):
+                with contextlib.redirect_stdout(io.StringIO()): self.assertEqual(cold.main(), 1)
+            self.assertEqual(len(commands), 1)
+            report = json.loads((base / 'cold/result.json').read_text())
+            self.assertEqual(report['status'], 'failed'); self.assertFalse(report['finalSystemAccepted'])
+            self.assertEqual(json.loads((base / 'cold/boot-1/result.json').read_text())['failureEvidence'], 'preserve')
+            self.assertFalse((base / 'cold/boot-2').exists())
 
     def test_persistent_boot_number_binds_qemu_kernel_role_and_requires_disk(self):
         disk = {'imagePath': '/task/disk.raw', 'uuid': 'disk-uuid', 'serial': 'MINGDATA0123456789ab'}

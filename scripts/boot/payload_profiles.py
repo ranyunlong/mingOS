@@ -1,7 +1,7 @@
 """Closed, main-reviewed payload profiles. No build or guest execution on import."""
 import json
 from pathlib import Path
-from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_INSTALL_ARGS, PERSISTENT_INSTALL_FIXTURE, PERSISTENT_INSTALL_PROFILE, PERSISTENT_UPDATE_INSTALL_ROOT, checked_path, persistent_input_hashes, sha256
+from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_INSTALL_ARGS, PERSISTENT_INSTALL_FIXTURE, PERSISTENT_INSTALL_PROFILE, PERSISTENT_UPDATE_INSTALL_ROOT, PERSISTENT_UNINSTALL_ARGS, PERSISTENT_UNINSTALL_FIXTURE, PERSISTENT_UNINSTALL_PROFILE, checked_path, persistent_input_hashes, sha256
 from wayland_receipt import POINTER_SYNC_POLICY
 
 DATA_TEXT_ARGS = ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
@@ -196,6 +196,36 @@ def verify_persistent_install(payload, review, catalog):
             header = source.read(8)
         require(header[:4] == b'\x7fELF' if field == 'helper' else header == b'\0asm\x01\0\0\0',
                 'persistent fixture executable format: ' + field)
+    return catalog
+
+def verify_persistent_uninstall(payload, review, catalog):
+    """Freeze the uninstall fixture; later boots only open its removed disk state."""
+    require(review.get('sessionMode') == 'long-lived' and review.get('extraArgs') == PERSISTENT_UNINSTALL_ARGS,
+            'exact reviewed uninstall strict/data/state/qualification session required')
+    require(catalog == {'schemaVersion': 3, 'apps': [
+        {'id': 1, 'title': 'Text Lab', 'packageId': 'dev.ming.text-entry-demo'}], 'autostart': [1]}
+        and type(catalog['schemaVersion']) is int and type(catalog['apps'][0]['id']) is int
+        and type(catalog['autostart'][0]) is int,
+        'persistent uninstall requires only initial app1 and autostart [1]')
+    require(review.get('persistentUninstallFixture') == PERSISTENT_UNINSTALL_FIXTURE,
+            'persistent uninstall fixture contract')
+    require(review.get('instrumentedQualification') is True
+            and review.get('instrumentedProfile') == PERSISTENT_UNINSTALL_PROFILE
+            and review.get('inputSynchronization') == POINTER_SYNC_POLICY,
+            'persistent uninstall pointer qualification required')
+    persistent_input_hashes(review)
+    require(not (payload / 'install-root').exists() and not (payload / 'install-source').exists()
+            and not (payload / 'install-events.json').exists(), 'persistent payload must not seed a RAM registry/source/events')
+    expected = review.get('persistentUninstallFixtureSha256')
+    require(isinstance(expected, dict) and set(expected) == {'helper', 'initialWasm', 'sourceWasm'},
+            'reviewed persistent uninstall helper and Wasm hashes required')
+    for field in ('helper', 'initialWasm', 'sourceWasm'):
+        path = checked_path(payload, PERSISTENT_UNINSTALL_FIXTURE[field].removeprefix('/opt/mingos/'))
+        require(path.is_file() and expected[field] == sha256(path), 'persistent uninstall fixture hash mismatch: ' + field)
+        with path.open('rb') as source:
+            header = source.read(8)
+        require(header[:4] == b'\x7fELF' if field == 'helper' else header == b'\0asm\x01\0\0\0',
+                'persistent uninstall fixture executable format: ' + field)
     return catalog
 
 def verify_data_text_private_probe(payload, review, catalog):

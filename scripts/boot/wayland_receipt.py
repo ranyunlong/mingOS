@@ -1,11 +1,13 @@
 """Bounded receipt parser for the instrumented MingHost Wayland client only."""
 import re
 PERSISTENT_INSTALL_PREFIX = b'MING_PERSISTENT_INSTALL '
+PERSISTENT_UNINSTALL_PREFIX = b'MING_PERSISTENT_UNINSTALL '
 
 def check_line_size(raw):
-    persistent = raw.startswith(PERSISTENT_INSTALL_PREFIX)
+    persistent = raw.startswith((PERSISTENT_INSTALL_PREFIX, PERSISTENT_UNINSTALL_PREFIX))
     if len(raw) > (262144 if persistent else 65536):
-        raise ValueError('persistent install receipt line limit' if persistent else 'Wayland diagnostic line limit')
+        label = 'persistent uninstall receipt' if raw.startswith(PERSISTENT_UNINSTALL_PREFIX) else 'persistent install receipt'
+        raise ValueError(label + ' line limit' if persistent else 'Wayland diagnostic line limit')
     return persistent
 
 POINTER_SYNC_POLICY = {"policy":"wayland-client-pointer-frame-v1", "coordinateTolerancePixels":1,
