@@ -4,10 +4,13 @@ import base64
 import json
 import hashlib
 import os
+import re
+import stat
 import subprocess
 import time
 import traceback
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from bootlib import PERSISTENT_INSTALL_CATALOG, PERSISTENT_INSTALL_ROOT, persistent_boot_role, persistent_session_contract, strict_json
 from infra import STATE_PATH, validate_fault_injection, validate_state
 from guest_platform import Platform
 from bounded_log import BoundedLog, LogLimitExceeded
@@ -15,9 +18,176 @@ from wayland_receipt import PointerReceipt
 from worker_resources import process_table
 
 LOG = Path("/run/evidence")
-LOG.mkdir(parents=True, exist_ok=True)
 channel = None
 log_offsets = {}
+
+def persistent_context(session, platform, command_line):
+    persistent_session_contract(session)
+    params = {}
+    for part in command_line.split():
+        key, _, value = part.partition("=")
+        if key in ("mingos.persistent_install_boot", "mingos.persistent_install_role"):
+            if key in params: raise ValueError("duplicate persistent boot parameter")
+            params[key] = value
+    value = params.get("mingos.persistent_install_boot")
+    if value not in ("1", "2"): raise ValueError("missing/invalid persistent boot number")
+    number = int(value)
+    role = persistent_boot_role(number)
+    if params.get("mingos.persistent_install_role") != role:
+        raise ValueError("persistent boot role mismatch")
+    marker, previous = platform.marker, platform.previous
+    if (platform.mounted is not True or not isinstance(platform.disk_uuid, str) or not platform.disk_uuid
+            or not isinstance(platform.boot_id, str) or not platform.boot_id
+            or not isinstance(marker, dict) or set(marker) != {"bootId", "counter"}
+            or marker["bootId"] != platform.boot_id or type(marker["counter"]) is not int or marker["counter"] != number):
+        raise ValueError("persistent boot requires verified mounted disk and matching marker")
+    if number == 1:
+        if previous is not None: raise ValueError("persistent first boot requires fresh disk marker1")
+    elif (not isinstance(previous, dict) or set(previous) != {"bootId", "counter"}
+          or type(previous["counter"]) is not int or previous["counter"] != 1
+          or not isinstance(previous["bootId"], str) or not previous["bootId"] or previous["bootId"] == platform.boot_id):
+        raise ValueError("persistent second boot requires distinct previous marker1")
+    return {"schemaVersion": 1, "bootId": platform.boot_id, "bootNumber": number, "role": role,
+            "marker": marker, "previousMarker": previous, "diskUuid": platform.disk_uuid,
+            "registryRoot": PERSISTENT_INSTALL_ROOT, "catalogPath": PERSISTENT_INSTALL_CATALOG}
+
+def persistent_helper_argv(session, context, phase):
+    persistent_session_contract(session)
+    if phase not in ("pre-desktop", "post-desktop"): raise ValueError("invalid persistent snapshot phase")
+    if context.get("role") != persistent_boot_role(context.get("bootNumber")):
+        raise ValueError("persistent snapshot role mismatch")
+    fixture = session["persistentInstallFixture"]
+    initialize = context["bootNumber"] == 1 and phase == "pre-desktop"
+    argv = [fixture["helper"], "initialize-first" if initialize else "open-existing", fixture["installRoot"]]
+    if initialize:
+        argv += [fixture["initialWasm"], fixture["sourceWasm"], fixture["sourceManifest"],
+                 "/opt/mingos/catalog.json", session["catalogSha256"]]
+    return argv + [fixture["receipt"]]
+
+def parse_persistent_json(raw):
+    if len(raw) > 262144: raise ValueError("persistent receipt exceeds bound")
+    return strict_json(raw)
+
+def read_persistent_receipt(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 262144):
+            raise ValueError("unsafe persistent receipt metadata/size")
+        with os.fdopen(fd, "rb", closefd=False) as source: raw = source.read(262145)
+        return parse_persistent_json(raw)
+    finally:
+        os.close(fd)
+
+def persistent_snapshot(receipt, context, phase, session_id):
+    def exact(value, keys):
+        if not isinstance(value, dict) or set(value) != set(keys): raise ValueError("persistent receipt schema mismatch")
+    def digest(value):
+        if not isinstance(value, str) or not re.fullmatch("[0-9a-f]{64}", value): raise ValueError("invalid persistent hash")
+    def relative(value):
+        if (not isinstance(value, str) or not value or len(value) > 768 or "\\" in value or ":" in value or "\0" in value
+                or PurePosixPath(value).is_absolute() or any(part in ("", ".", "..") for part in value.split("/"))):
+            raise ValueError("unsafe persistent relative content path")
+    exact(receipt, ("schemaVersion", "status", "actions", "content"))
+    if type(receipt["schemaVersion"]) is not int or receipt["schemaVersion"] != 1:
+        raise ValueError("unsupported persistent helper receipt version")
+    if phase not in ("pre-desktop", "post-desktop") or context.get("role") != persistent_boot_role(context.get("bootNumber")):
+        raise ValueError("invalid persistent snapshot phase/role")
+    if (phase == "pre-desktop" and session_id is not None) or (phase == "post-desktop" and (not isinstance(session_id, str) or not session_id)):
+        raise ValueError("persistent snapshot session mismatch")
+    initialize = context["bootNumber"] == 1 and phase == "pre-desktop"
+    if receipt["status"] != ("initialized-first" if initialize else "opened-existing"):
+        raise ValueError("persistent helper status mismatch")
+    actions = receipt["actions"]
+    exact(actions, ("initializedRoots", "packagesInstalled", "trustStoresProvisioned", "catalogsCreated", "sourcesCreated"))
+    if any(type(value) is not int or value != int(initialize) for value in actions.values()):
+        raise ValueError("persistent helper writes do not match role")
+    content = receipt["content"]
+    exact(content, ("catalogSha256", "registrySha256", "trustSha256", "bootstrapSha256", "apps", "files"))
+    for field in ("catalogSha256", "registrySha256", "trustSha256", "bootstrapSha256"): digest(content[field])
+    apps, files = content["apps"], content["files"]
+    if (not isinstance(apps, list) or len(apps) != (1 if initialize else 2)
+            or not isinstance(files, list) or not 1 <= len(files) <= 256):
+        raise ValueError("persistent content app/file list mismatch")
+    identities = {}
+    for app in apps:
+        exact(app, ("app", "packageId", "version", "fingerprint", "manifestPath", "manifestSha256", "wasmPath", "wasmSha256"))
+        if type(app["app"]) is not int or app["app"] in identities: raise ValueError("invalid/duplicate persistent app ID")
+        identities[app["app"]] = (app["packageId"], app["version"])
+        for field in ("fingerprint", "manifestSha256", "wasmSha256"): digest(app[field])
+        for field in ("manifestPath", "wasmPath"): relative(app[field])
+    expected = {1: ("dev.ming.text-entry-demo", "0.1.0")}
+    if not initialize: expected[2] = ("dev.ming.install-demo", "1.0.0")
+    if identities != expected or [app["packageId"] for app in apps] != sorted(app["packageId"] for app in apps):
+        raise ValueError("persistent app identity/order mismatch")
+    for app in apps:
+        directory = "packages/" + app["packageId"].encode().hex() + "/" + app["version"] + "-" + app["fingerprint"]
+        if app["manifestPath"] != directory + "/app.json" or app["wasmPath"] != directory + "/main.wasm":
+            raise ValueError("noncanonical persistent active package path")
+    file_hashes = {}
+    package_files = {}
+    for item in files:
+        exact(item, ("path", "sha256")); relative(item["path"]); digest(item["sha256"])
+        if item["path"] in file_hashes or item["path"] in (
+                "desktop-install-pending-v1.json", "update-journal-v1", ".ming-installed-packages.lock", ".ming-publisher-keyring.lock"):
+            raise ValueError("duplicate or forbidden persistent content file")
+        if item["path"] not in ("catalog.json", "installed-packages-v1", "trusted-publishers-v1", "desktop-install-state-v1.json"):
+            match = re.fullmatch(r"packages/([0-9a-f]+)/([0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{64})/(app\.json|main\.wasm)", item["path"])
+            if not match or len(match[1]) % 2 or len(match[1]) > 512 or len(match[2]) > 160:
+                raise ValueError("unknown persistent content file")
+            package_files.setdefault(item["path"].rsplit("/", 1)[0], set()).add(match[3])
+        file_hashes[item["path"]] = item["sha256"]
+    if any(names != {"app.json", "main.wasm"} for names in package_files.values()):
+        raise ValueError("incomplete persistent package content")
+    if list(file_hashes) != sorted(file_hashes): raise ValueError("persistent file list must be sorted")
+    bindings = {"catalog.json": content["catalogSha256"], "installed-packages-v1": content["registrySha256"],
+                "trusted-publishers-v1": content["trustSha256"], "desktop-install-state-v1.json": content["bootstrapSha256"]}
+    for app in apps:
+        for field in ("manifest", "wasm"):
+            path, expected_hash = app[field + "Path"], app[field + "Sha256"]
+            if path in bindings and bindings[path] != expected_hash: raise ValueError("persistent file binding conflict")
+            bindings[path] = expected_hash
+    if any(file_hashes.get(path) != expected_hash for path, expected_hash in bindings.items()):
+        raise ValueError("persistent file hashes disagree with content identities")
+    envelope = dict(context, sessionId=session_id, phase=phase, status=receipt["status"], actions=actions)
+    return {"envelope": envelope, "content": content}
+
+def prepare_persistent_snapshot(session, context, phase, session_id=None):
+    argv = persistent_helper_argv(session, context, phase)
+    helper = Path(argv[0])
+    expected = session.get("persistentInstallFixtureSha256", {}).get("helper")
+    if expected != hashlib.sha256(helper.read_bytes()).hexdigest(): raise ValueError("persistent helper hash drift")
+    path = Path(argv[-1])
+    path.unlink(missing_ok=True)
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    snapshot = None
+    try:
+        if result.returncode == 0:
+            snapshot = persistent_snapshot(read_persistent_receipt(path), context, phase, session_id)
+            stdout_snapshot = persistent_snapshot(parse_persistent_json(result.stdout), context, phase, session_id)
+            if stdout_snapshot != snapshot: raise ValueError("persistent helper stdout/file receipt mismatch")
+    except Exception:
+        emit("persistent-install-state", argv=argv, code=result.returncode, stdout=result.stdout,
+             stderr=result.stderr, receipt=None)
+        raise
+    emit("persistent-install-state", argv=argv, code=result.returncode, stdout=result.stdout,
+         stderr=result.stderr, receipt=snapshot)
+    if result.returncode: raise RuntimeError("persistent install helper failed")
+    return snapshot
+
+def desktop_argv(session, context=None):
+    if session.get("profile") == "persistent-install":
+        persistent_session_contract(session)
+        if not context or context.get("role") != persistent_boot_role(context.get("bootNumber")):
+            raise ValueError("persistent desktop requires verified boot context")
+        argv = ["/opt/mingos/ming-app-host", "desktop", PERSISTENT_INSTALL_CATALOG, "--renderer", "cpu"] + session["extraArgs"]
+        argv += ["--persistent-install-state", PERSISTENT_INSTALL_ROOT]
+        if context["bootNumber"] == 1: argv += ["--install-source", session["installSource"]]
+        return argv
+    argv = ["/opt/mingos/ming-app-host", "desktop", "/opt/mingos/catalog.json", "--renderer", "cpu"] + session["extraArgs"]
+    if session.get("installRoot") is not None: argv += ["--install-root", session["installRoot"]]
+    return argv
 
 def emit(kind, **fields):
     record = dict(type=kind, uptime=round(time.monotonic(), 3), **fields)
@@ -43,6 +213,7 @@ def command(argv):
 
 def main():
     global channel
+    LOG.mkdir(parents=True, exist_ok=True)
     desktop = weston = seat = observer = fault_injector = platform = None
     streams = []
     error = None
@@ -53,6 +224,7 @@ def main():
     stderr_source = stderr_capture = None
     stderr_limited = False
     diagnostic = {}
+    persistent = persistent_before = None
     fault_config = fault_receipt = None
     fault_receipt_path = LOG / "fault-injection.json"
     ready_capture_deadline = None
@@ -162,6 +334,10 @@ def main():
             if weston.poll() is not None or time.monotonic() >= deadline: raise RuntimeError("Weston DRM socket not ready")
             time.sleep(0.1)
         session = json.loads(Path("/etc/mingos/session.json").read_text())
+        if session.get("profile") == "persistent-install":
+            session = strict_json(Path("/etc/mingos/session.json").read_text())
+            persistent = persistent_context(session, platform, Path("/proc/cmdline").read_text())
+            persistent_before = prepare_persistent_snapshot(session, persistent, "pre-desktop")
         fixture = session.get("updateFixture")
         if fixture is not None:
             expected = {
@@ -209,9 +385,7 @@ def main():
                  stderr=result.stderr, receipt=receipt)
             if result.returncode:
                 raise RuntimeError("install fixture failed: " + result.stderr.strip())
-        argv = ["/opt/mingos/ming-app-host", "desktop", "/opt/mingos/catalog.json", "--renderer", "cpu"] + session["extraArgs"]
-        if session.get("installRoot") is not None:
-            argv += ["--install-root", session["installRoot"]]
+        argv = desktop_argv(session, persistent)
         if session.get("profile") == "install-lifecycle":
             source = session.get("installSource")
             if source != "/opt/mingos/install-source/app.json" or not Path(source).is_file():
@@ -257,6 +431,11 @@ def main():
         active = [p for p in process_table() if "__worker" in p["argv"]]
         emit("desktop-workers-stopped", active=active)
         if active: raise RuntimeError("Kotlin workers still active; resource probe forbidden")
+        if persistent:
+            if not state: raise RuntimeError("persistent desktop ended without session state")
+            after = prepare_persistent_snapshot(session, persistent, "post-desktop", state["sessionId"])
+            if persistent["bootNumber"] == 2 and after["content"] != persistent_before["content"]:
+                raise RuntimeError("persistent content changed during reopen-only second boot")
         stop(weston, "weston"); stop(seat, "seatd"); stop(observer, "input-observer")
         platform.strict_after()
     except Exception as caught:

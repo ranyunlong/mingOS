@@ -9,10 +9,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from bootlib import checked_path, checked_session, sha256, validate_kernel_config
+from bootlib import PERSISTENT_INSTALL_PROFILE, checked_path, checked_session, sha256, strict_json, validate_kernel_config
 from infra import validate_fault_injection
 from isolation_profiles import verify_review_and_files
-from payload_profiles import verify_data_text, verify_data_text_update, verify_install_lifecycle, verify_data_text_private_probe, verify_data_text_public_probe, verify_public_probe
+from payload_profiles import verify_data_text, verify_data_text_update, verify_install_lifecycle, verify_persistent_install, verify_data_text_private_probe, verify_data_text_public_probe, verify_public_probe
 from wayland_receipt import POINTER_SYNC_POLICY
 
 MODULES = ("virtio_pci", "virtio_gpu", "virtio_input", "virtio_console", "virtio_rng", "evdev", "virtio_blk", "ext4")
@@ -39,7 +39,7 @@ def install_fault_injection(root, scripts, fault_config):
 def verify_payload(payload, review):
     checked_session(review, payload)
     profile = review.get("profile", "desktop")
-    if profile not in ("desktop", "data-text", "data-text-update", "install-lifecycle", "data-text-private-probe", "data-text-public-probe", "public-probe"):
+    if profile not in ("desktop", "data-text", "data-text-update", "install-lifecycle", "persistent-install", "data-text-private-probe", "data-text-public-probe", "public-probe"):
         raise ValueError("unknown reviewed payload profile")
     if any(item.is_symlink() for item in payload.rglob("*")):
         raise ValueError("frozen payload must contain no symlinks")
@@ -47,13 +47,16 @@ def verify_payload(payload, review):
         header = source.read(4)
     if header != b"\x7fELF":
         raise ValueError("Linux ELF release host required")
-    catalog = json.loads((payload / "catalog.json").read_text())
+    raw_catalog = (payload / "catalog.json").read_text()
+    catalog = strict_json(raw_catalog) if profile == "persistent-install" else json.loads(raw_catalog)
     if profile == "data-text":
         return verify_data_text(payload, review, catalog)
     if profile == "data-text-update":
         return verify_data_text_update(payload, review, catalog)
     if profile == "install-lifecycle":
         return verify_install_lifecycle(payload, review, catalog)
+    if profile == "persistent-install":
+        return verify_persistent_install(payload, review, catalog)
     if profile == "data-text-private-probe":
         return verify_data_text_private_probe(payload, review, catalog)
     if profile == "data-text-public-probe":
@@ -160,17 +163,19 @@ def main():
     if args.isolation_profile != "legacy-v1" and not args.isolation_probes:
         raise ValueError("non-legacy isolation profile requires --isolation-probes")
     review = json.loads(args.review.read_text())
+    if review.get("profile") == "persistent-install": review = strict_json(args.review.read_text())
     fault_config = fault_config_from_review(review)
     catalog = verify_payload(args.payload, review)  # before any large filesystem write
-    if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-update", "install-lifecycle", "data-text-private-probe", "data-text-public-probe", "public-probe") or not args.isolation_probes):
+    if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-update", "install-lifecycle", "persistent-install", "data-text-private-probe", "data-text-public-probe", "public-probe") or not args.isolation_probes):
         raise ValueError("input diagnostics requires reviewed data-text with strict probes")
     if args.wayland_client_diagnostics and not args.input_diagnostics:
         raise ValueError("Wayland client logging requires diagnostic-only input bundle")
     if args.pointer_handshake_diagnostics and not args.wayland_client_diagnostics:
         raise ValueError("pointer handshake requires instrumented Wayland client receipts")
     qualification = review.get("instrumentedQualification") is True
-    qualification_profile = ("install-lifecycle-pointer-ready-v1"
-                             if review.get("profile") == "install-lifecycle" else "data-text-pointer-ready-v1")
+    qualification_profile = (PERSISTENT_INSTALL_PROFILE if review.get("profile") == "persistent-install"
+                             else "install-lifecycle-pointer-ready-v1" if review.get("profile") == "install-lifecycle"
+                             else "data-text-pointer-ready-v1")
     if qualification and (not args.pointer_handshake_diagnostics or review.get("instrumentedProfile") != qualification_profile or review.get("inputSynchronization") != POINTER_SYNC_POLICY):
         raise ValueError("explicit reviewed instrumented pointer qualification policy required")
     if qualification:
@@ -219,7 +224,7 @@ def main():
         for item in sorted(install_root.rglob("*"), key=lambda path: len(path.parts), reverse=True):
             item.chmod(0o700 if item.is_dir() else 0o600)
         install_root.chmod(0o700)
-    for name in ("init", "guest.py", "guest_platform.py", "infra.py", "bounded_log.py", "wayland_receipt.py", "worker_resources.py", "weston.ini"):
+    for name in ("init", "bootlib.py", "guest.py", "guest_platform.py", "infra.py", "bounded_log.py", "wayland_receipt.py", "worker_resources.py", "weston.ini"):
         target = root / ("init" if name == "init" else "etc/mingos/" + name)
         shutil.copyfile(scripts / name, target)
     if review.get("profile") in ("data-text-public-probe", "public-probe"):

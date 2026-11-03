@@ -2,10 +2,214 @@ import copy
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from pathlib import Path
 from infra import contained, regular_file, validate_state, state_ready, state_input_ready, input_events, classify_guest, validate_cold_pair, InputPlan
 
 class InfraTests(unittest.TestCase):
+    def persistent_helper_receipt(self, initialize=False):
+        apps = [{'app': 1, 'packageId': 'dev.ming.text-entry-demo', 'version': '0.1.0', 'fingerprint': 'a' * 64,
+                 'manifestPath': 'packages/initial/app.json', 'manifestSha256': 'b' * 64,
+                 'wasmPath': 'packages/initial/main.wasm', 'wasmSha256': 'c' * 64}]
+        if not initialize:
+            apps.insert(0, {'app': 2, 'packageId': 'dev.ming.install-demo', 'version': '1.0.0', 'fingerprint': 'd' * 64,
+                            'manifestPath': 'packages/new/app.json', 'manifestSha256': 'e' * 64,
+                            'wasmPath': 'packages/new/main.wasm', 'wasmSha256': 'f' * 64})
+        for app in apps:
+            directory = 'packages/' + app['packageId'].encode().hex() + '/' + app['version'] + '-' + app['fingerprint']
+            app['manifestPath'], app['wasmPath'] = directory + '/app.json', directory + '/main.wasm'
+        content = {'catalogSha256': '1' * 64, 'registrySha256': '2' * 64, 'trustSha256': '3' * 64,
+                   'bootstrapSha256': '4' * 64, 'apps': apps, 'files': sorted([
+                       {'path': path, 'sha256': digest} for path, digest in (
+                           ('catalog.json', '1' * 64), ('installed-packages-v1', '2' * 64),
+                           ('trusted-publishers-v1', '3' * 64), ('desktop-install-state-v1.json', '4' * 64))] + [
+                       {'path': app[field + 'Path'], 'sha256': app[field + 'Sha256']}
+                       for app in apps for field in ('manifest', 'wasm')], key=lambda row: row['path'])}
+        return {'schemaVersion': 1, 'status': 'initialized-first' if initialize else 'opened-existing', 'content': content,
+                'actions': {name: int(initialize) for name in ('initializedRoots', 'packagesInstalled',
+                    'trustStoresProvisioned', 'catalogsCreated', 'sourcesCreated')}}
+
+    def test_persistent_helper_snapshot_strict_schema_counts_paths_and_content(self):
+        import guest
+        for initialize in (True, False):
+            receipt = self.persistent_helper_receipt(initialize)
+            context = {'schemaVersion': 1, 'bootId': 'boot-one', 'bootNumber': 1, 'role': 'initialize-first',
+                       'marker': {'bootId': 'boot-one', 'counter': 1}, 'previousMarker': None, 'diskUuid': 'disk',
+                       'registryRoot': '/data/mingos/install-root', 'catalogPath': '/data/mingos/install-root/catalog.json'}
+            phase = 'pre-desktop' if initialize else 'post-desktop'
+            snapshot = guest.persistent_snapshot(receipt, context, phase, None if initialize else 'session-one')
+            self.assertEqual(snapshot['content'], receipt['content'])
+            self.assertEqual(snapshot['envelope']['status'], receipt['status'])
+            self.assertEqual(snapshot['envelope']['phase'], phase)
+            self.assertEqual(snapshot['envelope']['actions']['packagesInstalled'], int(initialize))
+        original = self.persistent_helper_receipt()
+        changes = [lambda r: r.update(extra=True), lambda r: r['content'].update(extra=True),
+                   lambda r: r['actions'].update(packagesInstalled=1), lambda r: r['actions'].update(catalogsCreated=False),
+                   lambda r: r['content']['apps'][0].update(extra=1),
+                   lambda r: r['content']['apps'][0].update(manifestPath='../outside/app.json'),
+                   lambda r: r['content']['apps'][0].update(fingerprint='G' * 64),
+                   lambda r: r['content']['apps'][0].update(app=True),
+                   lambda r: r['content']['apps'].reverse(), lambda r: r['content']['files'].reverse(),
+                   lambda r: r['content']['files'].pop(),
+                   lambda r: r['content']['files'].append({'path': 'desktop-install-pending-v1.json', 'sha256': 'a' * 64})]
+        for change in changes:
+            changed = copy.deepcopy(original); change(changed)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                guest.persistent_snapshot(changed, context, 'post-desktop', 'session-one')
+
+    def test_persistent_snapshot_rejects_noncanonical_unknown_and_unbounded_files(self):
+        import guest
+        context = {'bootNumber': 2, 'role': 'open-existing'}
+        original = self.persistent_helper_receipt()
+        drift = copy.deepcopy(original)
+        app = drift['content']['apps'][0]
+        old_path = app['manifestPath']; app['manifestPath'] = 'packages/initial/app.json'
+        for item in drift['content']['files']:
+            if item['path'] == old_path: item['path'] = app['manifestPath']
+        drift['content']['files'].sort(key=lambda row: row['path'])
+        unknown = copy.deepcopy(original)
+        unknown['content']['files'].append({'path': 'unapproved.txt', 'sha256': 'a' * 64})
+        unknown['content']['files'].sort(key=lambda row: row['path'])
+        history = copy.deepcopy(original)
+        for number in range(124):
+            directory = 'packages/' + b'dev.ming.history'.hex() + '/2.0.' + str(number) + '-' + 'e' * 64
+            for name in ('app.json', 'main.wasm'):
+                history['content']['files'].append({'path': directory + '/' + name, 'sha256': 'a' * 64})
+        history['content']['files'].sort(key=lambda row: row['path'])
+        self.assertEqual(len(history['content']['files']), 256)
+        guest.persistent_snapshot(history, context, 'pre-desktop', None)
+        oversized = copy.deepcopy(history)
+        directory = 'packages/' + b'dev.ming.history'.hex() + '/3.0.0-' + 'e' * 64
+        oversized['content']['files'] += [{'path': directory + '/' + name, 'sha256': 'a' * 64}
+                                         for name in ('app.json', 'main.wasm')]
+        oversized['content']['files'].sort(key=lambda row: row['path'])
+        incomplete = copy.deepcopy(history)
+        missing = 'packages/' + b'dev.ming.history'.hex() + '/2.0.0-' + 'e' * 64 + '/main.wasm'
+        incomplete['content']['files'] = [item for item in incomplete['content']['files'] if item['path'] != missing]
+        for name, receipt in (('active-path', drift), ('unknown-file', unknown),
+                              ('over-256', oversized), ('incomplete-history', incomplete)):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                guest.persistent_snapshot(receipt, context, 'pre-desktop', None)
+
+    def test_persistent_receipt_read_rejects_duplicates_oversize_and_unsafe_metadata(self):
+        import guest
+        import os
+        with tempfile.TemporaryDirectory() as work:
+            path = Path(work) / 'receipt.json'; path.write_text(json.dumps(self.persistent_helper_receipt()))
+            path.chmod(0o600)
+            self.assertEqual(guest.read_persistent_receipt(path)['status'], 'opened-existing')
+            original = path.read_bytes()
+            for raw in (b'{"schemaVersion":1,"schemaVersion":1}', b' ' * (262144 + 1)):
+                path.write_bytes(raw)
+                with self.assertRaises(ValueError): guest.read_persistent_receipt(path)
+            path.write_bytes(original); path.chmod(0o644)
+            with self.assertRaises(ValueError): guest.read_persistent_receipt(path)
+            path.chmod(0o600)
+            alias = Path(work) / 'alias'; os.link(path, alias)
+            with self.assertRaises(ValueError): guest.read_persistent_receipt(path)
+            alias.unlink(); alias.symlink_to(path)
+            with self.assertRaises((ValueError, OSError)): guest.read_persistent_receipt(alias)
+
+    def test_persistent_helper_replaces_old_evidence_and_binds_stdout_to_file(self):
+        import guest
+        import contextlib
+        import hashlib
+        import io
+        import subprocess
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); helper = root / 'helper'; helper.write_bytes(b'synthetic-helper')
+            output = root / 'receipt.json'; output.write_text('stale receipt must be removed')
+            session = self.persistent_session()
+            session['persistentInstallFixtureSha256'] = {'helper': hashlib.sha256(helper.read_bytes()).hexdigest()}
+            context = {'schemaVersion': 1, 'bootId': 'two', 'bootNumber': 2, 'role': 'open-existing',
+                       'marker': {'bootId': 'two', 'counter': 2}, 'previousMarker': {'bootId': 'one', 'counter': 1},
+                       'diskUuid': 'disk', 'registryRoot': '/data/mingos/install-root',
+                       'catalogPath': '/data/mingos/install-root/catalog.json'}
+            mapping = {'/opt/mingos/prepare-persistent-install-fixture': helper,
+                       '/run/evidence/persistent-install-fixture.json': output}
+            receipt = self.persistent_helper_receipt()
+            for changed_stdout in (False, True):
+                def invoke(argv, **kwargs):
+                    self.assertEqual(argv, ['/opt/mingos/prepare-persistent-install-fixture', 'open-existing',
+                                            '/data/mingos/install-root', '/run/evidence/persistent-install-fixture.json'])
+                    self.assertFalse(output.exists(), 'stale receipt survived before helper execution')
+                    output.write_text(json.dumps(receipt)); output.chmod(0o600)
+                    stdout = copy.deepcopy(receipt)
+                    if changed_stdout: stdout['actions']['packagesInstalled'] = 1
+                    return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(stdout) + '\n', stderr='')
+                lines = io.StringIO()
+                with mock.patch.object(guest, 'Path', side_effect=lambda value: mapping[value]), \
+                     mock.patch.object(guest.subprocess, 'run', side_effect=invoke), contextlib.redirect_stdout(lines):
+                    if changed_stdout:
+                        with self.assertRaises(ValueError): guest.prepare_persistent_snapshot(session, context, 'pre-desktop')
+                    else:
+                        snapshot = guest.prepare_persistent_snapshot(session, context, 'pre-desktop')
+                        self.assertEqual(snapshot['envelope']['bootNumber'], 2)
+                raw = json.loads(lines.getvalue().removeprefix('MINGOS_EVIDENCE ').strip())
+                self.assertEqual(raw['type'], 'persistent-install-state')
+                self.assertEqual(raw['receipt'] is None, changed_stdout)
+
+    def persistent_session(self):
+        return {'profile': 'persistent-install', 'persistentInstallState': '/data/mingos/install-root',
+                'catalogPath': '/data/mingos/install-root/catalog.json',
+                'catalogSha256': '9' * 64,
+                'extraArgs': ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
+                              '--state-file', '/run/evidence/desktop-state.json'],
+                'installSource': '/opt/mingos/install-source/app.json',
+                'persistentInstallFixture': {
+                    'helper': '/opt/mingos/prepare-persistent-install-fixture',
+                    'installRoot': '/data/mingos/install-root',
+                    'initialWasm': '/opt/mingos/packages/initial/main.wasm',
+                    'sourceWasm': '/opt/mingos/packages/new/main.wasm',
+                    'sourceManifest': '/opt/mingos/install-source/app.json',
+                    'receipt': '/run/evidence/persistent-install-fixture.json'}}
+
+    def test_persistent_guest_role_requires_mounted_identity_and_exact_marker_sequence(self):
+        import guest
+        session = self.persistent_session()
+        first = SimpleNamespace(mounted=True, disk_uuid='disk-uuid', boot_id='boot-one', previous=None,
+                                marker={'bootId': 'boot-one', 'counter': 1})
+        first_line = 'rdinit=/init mingos.persistent_install_boot=1 mingos.persistent_install_role=initialize-first'
+        context = guest.persistent_context(session, first, first_line)
+        self.assertEqual((context['bootNumber'], context['role'], context['marker']['counter']), (1, 'initialize-first', 1))
+        second = SimpleNamespace(mounted=True, disk_uuid='disk-uuid', boot_id='boot-two', previous=first.marker,
+                                 marker={'bootId': 'boot-two', 'counter': 2})
+        second_line = 'rdinit=/init mingos.persistent_install_boot=2 mingos.persistent_install_role=open-existing'
+        self.assertEqual(guest.persistent_context(session, second, second_line)['previousMarker'], first.marker)
+        for line in (first_line.replace('boot=1', 'boot=2'), first_line.replace('initialize-first', 'open-existing'),
+                     first_line + ' mingos.persistent_install_boot=1', first_line.replace('boot=1', 'boot=01'), ''):
+            with self.subTest(line=line), self.assertRaises(ValueError): guest.persistent_context(session, first, line)
+        for change in ({'mounted': False}, {'disk_uuid': None}, {'previous': first.marker},
+                       {'marker': {'bootId': 'other', 'counter': 1}}, {'marker': {'bootId': 'boot-one', 'counter': True}}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                guest.persistent_context(session, SimpleNamespace(**dict(vars(first), **change)), first_line)
+
+    def test_persistent_guest_second_boot_never_passes_seed_source_or_legacy_events(self):
+        import guest
+        session = self.persistent_session()
+        first, second = {'bootNumber': 1, 'role': 'initialize-first'}, {'bootNumber': 2, 'role': 'open-existing'}
+        self.assertEqual(guest.persistent_helper_argv(session, first, 'pre-desktop'), [
+            '/opt/mingos/prepare-persistent-install-fixture', 'initialize-first', '/data/mingos/install-root',
+            '/opt/mingos/packages/initial/main.wasm', '/opt/mingos/packages/new/main.wasm',
+            '/opt/mingos/install-source/app.json', '/opt/mingos/catalog.json', '9' * 64,
+            '/run/evidence/persistent-install-fixture.json'])
+        for context, phase in ((first, 'post-desktop'), (second, 'pre-desktop'), (second, 'post-desktop')):
+            self.assertEqual(guest.persistent_helper_argv(session, context, phase), [
+                '/opt/mingos/prepare-persistent-install-fixture', 'open-existing', '/data/mingos/install-root',
+                '/run/evidence/persistent-install-fixture.json'])
+        first_argv = guest.desktop_argv(session, first)
+        self.assertEqual(first_argv[:3], ['/opt/mingos/ming-app-host', 'desktop', '/data/mingos/install-root/catalog.json'])
+        self.assertEqual(first_argv[-4:], ['--persistent-install-state', '/data/mingos/install-root',
+                                         '--install-source', '/opt/mingos/install-source/app.json'])
+        second_argv = guest.desktop_argv(session, second)
+        self.assertEqual(second_argv[-2:], ['--persistent-install-state', '/data/mingos/install-root'])
+        self.assertNotIn('--events', second_argv); self.assertNotIn('--install-root', second_argv)
+        self.assertNotIn('--install-source', second_argv)
+        for field in ('installFixture', 'updateFixture', 'installEvents', 'installRoot'):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                guest.desktop_argv(dict(session, **{field: {}}), second)
+
     def test_paths_reject_escape_and_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

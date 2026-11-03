@@ -7,7 +7,7 @@ import base64
 import subprocess
 import time
 from pathlib import Path
-from bootlib import Qmp, qemu_command, sha256, validate_bundle, validate_reviewed_input
+from bootlib import Qmp, qemu_command, sha256, strict_json, validate_bundle, validate_reviewed_input
 from infra import InputPlan, STATE_PATH, classify_guest, state_ready, validate_fault_injection, validate_fault_receipt, validate_state
 
 
@@ -118,6 +118,7 @@ def main():
     parser.add_argument("--work-root", type=Path)
     parser.add_argument("--data-manifest", help="relative manifest inside owned work-root")
     parser.add_argument("--input-script", type=Path)
+    parser.add_argument("--boot-number", type=int, choices=(1, 2))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--diagnostic-split-input", action="store_true")
     parser.add_argument("--diagnostic-pointer-handshake", action="store_true")
@@ -126,23 +127,30 @@ def main():
     if bool(args.work_root) != bool(args.data_manifest): parser.error("work-root/data-manifest must be used together")
     manifest = None
     fault_config = None
+    input_bytes = input_digest = None
     if not args.probe_paused:
         if not args.bundle or not args.review: parser.error("kernel boot requires bundle and main-thread review")
         manifest = validate_bundle(args.bundle, sha256(args.review))
         review = json.loads(args.review.read_text())
+        if review.get("profile") == "persistent-install": review = strict_json(args.review.read_text())
         if review.get("reviewed") is not True or not review.get("reviewer") or review != manifest["sessionReview"]:
             raise ValueError("main-thread review absent/changed")
         if manifest.get("faultInjection") is not None:
             fault_config = validate_fault_injection(manifest["faultInjection"])
-        validate_reviewed_input(review, args.input_script)
+        input_bytes, input_digest = validate_reviewed_input(review, args.input_script, boot_number=args.boot_number)
+        if review.get("profile") == "persistent-install" and (
+                not args.data_manifest or manifest.get("payloadProfile") != "persistent-install"
+                or manifest.get("instrumentedQualification") is not True
+                or manifest.get("diagnosticProfile") != "input-pointer-ready-v1"):
+            raise ValueError("persistent install requires its qualified profile and persistent disk")
         if args.data_manifest or args.input_script:
             if manifest.get("infraApiVersion") != 1: raise ValueError("data/input requires infrastructure API v1 bundle")
         if args.input_script:
             extra = review["extraArgs"]
             if "--state-file" not in extra or extra[extra.index("--state-file") + 1] != STATE_PATH:
                 raise ValueError("input requires explicitly reviewed --state-file " + STATE_PATH)
-    elif args.input_script:
-        parser.error("paused probes cannot run ready-driven input scripts")
+    elif args.input_script or args.boot_number is not None:
+        parser.error("paused probes cannot run ready-driven input scripts or persistent boot roles")
     if args.diagnostic_split_input and (not manifest or not manifest.get("inputDiagnostics") or not args.input_script):
         parser.error("split input requires an input-diagnostics bundle and reviewed input script")
     if args.diagnostic_pointer_handshake and (not args.diagnostic_split_input or not manifest or manifest.get("diagnosticProfile") != "input-pointer-ready-v1"):
@@ -157,16 +165,18 @@ def main():
     else:
         lease_context = contextlib.nullcontext()
     args.output.mkdir(parents=True, exist_ok=False)
-    plan = InputPlan(json.loads(args.input_script.read_text()), args.output / "inputs.jsonl", args.timeout, split_transactions=args.diagnostic_split_input, pointer_handshake=args.diagnostic_pointer_handshake) if args.input_script else None
+    plan = InputPlan(json.loads(input_bytes), args.output / "inputs.jsonl", args.timeout, split_transactions=args.diagnostic_split_input, pointer_handshake=args.diagnostic_pointer_handshake) if input_bytes is not None else None
     with lease_context:
         if disk:
             disk = load_disk(args.work_root, args.data_manifest)
-        command = qemu_command(args.bundle, args.output, paused=args.probe_paused, data_disk=disk, input_diagnostics=bool(manifest and manifest.get("inputDiagnostics")))
+        command = qemu_command(args.bundle, args.output, paused=args.probe_paused, data_disk=disk,
+                               input_diagnostics=bool(manifest and manifest.get("inputDiagnostics")), boot_number=args.boot_number)
         report = {"argv": command, "bootAttempted": False, "status": "planned", "finalSystemAccepted": False,
                   "physicalInput": False, "physicalGpu": False, "probePaused": args.probe_paused,
                   "diagnosticOnly": bool(manifest and manifest.get("diagnosticOnly", manifest.get("inputDiagnostics"))), "diagnosticSplitInput": args.diagnostic_split_input, "pointerHandshake": args.diagnostic_pointer_handshake,
                   "bundleIdentity": sha256(args.bundle / "bundle.json") if manifest else None,
-                  "diskUuid": disk["uuid"] if disk else None}
+                  "diskUuid": disk["uuid"] if disk else None,
+                  "bootNumber": args.boot_number, "inputScriptSha256": input_digest}
         def save(): (args.output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
         save()
         if args.dry_run: print(json.dumps(report, indent=2)); return 0

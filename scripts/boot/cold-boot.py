@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from infra import validate_cold_pair
-from bootlib import sha256, validate_bundle
+from bootlib import sha256, strict_json, validate_bundle, validate_reviewed_input
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -14,9 +14,25 @@ def main():
     p.add_argument("--work-root", type=Path, required=True); p.add_argument("--data-manifest", required=True)
     p.add_argument("--output", type=Path, required=True); p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--input-script", type=Path)
+    p.add_argument("--boot1-input-script", type=Path)
+    p.add_argument("--boot2-input-script", type=Path)
     args = p.parse_args()
     identity = sha256(args.bundle / "bundle.json")
     manifest = validate_bundle(args.bundle, sha256(args.review))
+    review = json.loads(args.review.read_text())
+    persistent = review.get("profile") == "persistent-install"
+    if persistent:
+        review = strict_json(args.review.read_text())
+        if args.input_script is not None:
+            raise ValueError("persistent install cannot use a single input script")
+        if review != manifest.get("sessionReview") or review.get("reviewed") is not True or not review.get("reviewer"):
+            raise ValueError("main-thread review absent/changed")
+        inputs = {1: args.boot1_input_script, 2: args.boot2_input_script}
+        for number, source in inputs.items(): validate_reviewed_input(review, source, boot_number=number)
+    else:
+        if args.boot1_input_script is not None or args.boot2_input_script is not None:
+            raise ValueError("per-boot input scripts are reserved for persistent install")
+        inputs = {1: args.input_script, 2: args.input_script}
     args.output.mkdir(parents=True, exist_ok=False)
     reports = []
     try:
@@ -25,12 +41,18 @@ def main():
             argv = [sys.executable, "-B", str(Path(__file__).with_name("vm.py")), "--bundle", str(args.bundle),
                     "--review", str(args.review), "--work-root", str(args.work_root), "--data-manifest", args.data_manifest,
                     "--output", str(args.output / ("boot-" + str(number))), "--timeout", str(args.timeout)]
-            if args.input_script: argv += ["--input-script", str(args.input_script)]
+            if persistent:
+                validate_reviewed_input(review, inputs[number], boot_number=number)
+                argv += ["--boot-number", str(number)]
+            if inputs[number]: argv += ["--input-script", str(inputs[number])]
             if manifest.get("diagnosticProfile") == "input-pointer-ready-v1": argv += ["--diagnostic-split-input", "--diagnostic-pointer-handshake"]
             with (args.output / ("boot-%d.stdout.log" % number)).open("wb") as out, (args.output / ("boot-%d.stderr.log" % number)).open("wb") as err:
                 result = subprocess.run(argv, stdout=out, stderr=err, timeout=args.timeout + 45)
             reports.append(json.loads((args.output / ("boot-%d/result.json" % number)).read_text()))
             if result.returncode: raise RuntimeError("cold boot failed; preserve disk/evidence; no retry or format")
+            if persistent and (reports[-1].get("bootNumber") != number
+                               or reports[-1].get("inputScriptSha256") != review["inputScripts"]["boot%dSha256" % number]):
+                raise ValueError("cold boot number/input receipt mismatch")
         validate_cold_pair(*reports)
         report = {"status": "same-bundle-disk-cold-boot-verified", "bootIds": [x["bootId"] for x in reports],
                   "instrumentedProfile": manifest.get("diagnosticProfile"), "bundleIdentity": identity, "diskUuid": reports[0]["diskUuid"],

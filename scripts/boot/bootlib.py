@@ -1,6 +1,7 @@
 """Shared validation and bounded QMP protocol; no Docker or guest startup on import."""
 import hashlib
 import json
+import re
 import socket
 import time
 from pathlib import Path, PurePosixPath
@@ -9,6 +10,53 @@ PERSISTENT_UPDATE_INSTALL_ROOT = "/data/mingos/install-root"
 INSTALL_LIFECYCLE_INSTALL_ROOT = "/opt/mingos/install-root"
 INSTALL_LIFECYCLE_EVENTS = "/opt/mingos/install-events.json"
 INSTALL_LIFECYCLE_SOURCE = "/opt/mingos/install-source/app.json"
+PERSISTENT_INSTALL_ROOT = "/data/mingos/install-root"
+PERSISTENT_INSTALL_CATALOG = PERSISTENT_INSTALL_ROOT + "/catalog.json"
+PERSISTENT_INSTALL_PROFILE = "persistent-install-pointer-ready-v1"
+PERSISTENT_INSTALL_ARGS = ["--duration-ms", "0", "--isolation", "strict", "--data-root", "/data/mingos",
+                           "--state-file", "/run/evidence/desktop-state.json"]
+PERSISTENT_INSTALL_FIXTURE = {
+    "helper": "/opt/mingos/prepare-persistent-install-fixture",
+    "installRoot": PERSISTENT_INSTALL_ROOT,
+    "initialWasm": "/opt/mingos/packages/initial/main.wasm",
+    "sourceWasm": "/opt/mingos/packages/new/main.wasm",
+    "sourceManifest": INSTALL_LIFECYCLE_SOURCE,
+    "receipt": "/run/evidence/persistent-install-fixture.json",
+}
+
+def persistent_session_contract(review):
+    if (review.get("persistentInstallState") != PERSISTENT_INSTALL_ROOT
+            or review.get("catalogPath") != PERSISTENT_INSTALL_CATALOG
+            or review.get("installSource") != INSTALL_LIFECYCLE_SOURCE
+            or review.get("persistentInstallFixture") != PERSISTENT_INSTALL_FIXTURE
+            or review.get("extraArgs") != PERSISTENT_INSTALL_ARGS
+            or any(key in review for key in ("installRoot", "installFixture", "updateFixture", "installEvents", "installEventsSha256"))):
+        raise ValueError("persistent install requires exact persistent paths/args without legacy fixture overrides")
+
+def persistent_boot_role(number):
+    if type(number) is not int or number not in (1, 2):
+        raise ValueError("persistent install requires fixed boot number 1 or 2")
+    return "initialize-first" if number == 1 else "open-existing"
+
+def persistent_input_hashes(review):
+    hashes = review.get("inputScripts")
+    if ("inputScriptSha256" in review or not isinstance(hashes, dict)
+            or set(hashes) != {"boot1Sha256", "boot2Sha256"}
+            or any(not isinstance(value, str) or not re.fullmatch("[0-9a-f]{64}", value) for value in hashes.values())
+            or hashes["boot1Sha256"] == hashes["boot2Sha256"]):
+        raise ValueError("persistent install requires two distinct reviewed input hashes without single-hash fallback")
+    return hashes
+
+def strict_json(raw):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value: raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+    def invalid_constant(value):
+        raise ValueError("non-JSON numeric constant: " + value)
+    return json.loads(raw, object_pairs_hook=unique, parse_constant=invalid_constant)
 
 def sha256(path):
     with Path(path).open("rb") as source:
@@ -48,6 +96,9 @@ def checked_session(review, payload):
         raise ValueError("install profile requires reviewed event path")
     if review.get("profile") == "install-lifecycle" and review.get("installSource") != INSTALL_LIFECYCLE_SOURCE:
         raise ValueError("install profile requires reviewed install source")
+    if review.get("profile") == "persistent-install":
+        persistent_session_contract(review)
+        persistent_input_hashes(review)
     if any(not isinstance(arg, str) or "\0" in arg for arg in extra):
         raise ValueError("invalid session argument")
     if any(arg.split("=", 1)[0] in ("--backend", "--renderer", "--snapshot", "--events") for arg in extra):
@@ -64,14 +115,28 @@ def checked_session(review, payload):
         raise ValueError("long-lived session requires exact main-thread args and budgetEvidence")
     return review
 
-def validate_reviewed_input(review, path):
-    expected = review.get("inputScriptSha256")
-    if expected is None:
-        if review.get("profile") in ("data-text", "data-text-update", "install-lifecycle", "data-text-private-probe", "data-text-public-probe"):
+def validate_reviewed_input(review, path, boot_number=None):
+    """Return frozen input bytes and their digest for both validation and use."""
+    if review.get("profile") == "persistent-install":
+        persistent_boot_role(boot_number)
+        expected = persistent_input_hashes(review)["boot%dSha256" % boot_number]
+        mismatch = "reviewed persistent input script hash mismatch for boot " + str(boot_number)
+    else:
+        if boot_number is not None:
+            raise ValueError("boot number is reserved for persistent install")
+        expected = review.get("inputScriptSha256")
+        if expected is None and review.get("profile") in ("data-text", "data-text-update", "install-lifecycle", "data-text-private-probe", "data-text-public-probe"):
             raise ValueError("data-text input script review hash required")
-        return
-    if path is None or sha256(path) != expected:
-        raise ValueError("reviewed input script hash mismatch")
+        mismatch = "reviewed input script hash mismatch"
+    if path is None:
+        if expected is not None: raise ValueError(mismatch)
+        return None, None
+    with Path(path).open("rb") as source:
+        raw = source.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024: raise ValueError("input script exceeds 1 MiB bound")
+    digest = hashlib.sha256(raw).hexdigest()
+    if expected is not None and digest != expected: raise ValueError(mismatch)
+    return raw, digest
 
 def validate_kernel_config(settings):
     flags = dict(line.split("=", 1) for line in settings.splitlines() if line.startswith("CONFIG_") and "=" in line)
@@ -91,7 +156,12 @@ def validate_bundle(bundle, review_digest):
             raise ValueError("bundle hash mismatch: " + name)
     return manifest
 
-def qemu_command(bundle, out, paused=False, data_disk=None, input_diagnostics=False):
+def qemu_command(bundle, out, paused=False, data_disk=None, input_diagnostics=False, boot_number=None):
+    role = None
+    if boot_number is not None:
+        role = persistent_boot_role(boot_number)
+        if paused or not data_disk:
+            raise ValueError("persistent install requires a running guest with persistent data disk")
     command = ["qemu-system-x86_64", "-machine", "q35", "-accel", "tcg,thread=multi",
                "-cpu", "max", "-smp", "2", "-m", "2048", "-nodefaults", "-no-reboot",
                "-display", "none", "-vga", "none", "-nic", "none",
@@ -113,7 +183,8 @@ def qemu_command(bundle, out, paused=False, data_disk=None, input_diagnostics=Fa
         return command + ["-S"]
     return command + ["-kernel", str(bundle / "vmlinuz"), "-initrd", str(bundle / "initramfs.cpio.gz"),
                       "-append", "console=tty0 console=ttyS0,115200 rdinit=/init panic=-1"
-                      + ((" mingos.data_uuid=" + data_disk["uuid"] + " mingos.data_serial=" + data_disk["serial"]) if data_disk else "")]
+                      + ((" mingos.data_uuid=" + data_disk["uuid"] + " mingos.data_serial=" + data_disk["serial"]) if data_disk else "")
+                      + ((" mingos.persistent_install_boot=" + str(boot_number) + " mingos.persistent_install_role=" + role) if role else "")]
 
 class Qmp:
     def __init__(self, path, timeout=15, transcript_path=None):

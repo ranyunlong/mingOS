@@ -12,6 +12,111 @@ from bundle import verify_payload
 from wayland_receipt import POINTER_SYNC_POLICY
 
 class ProfileTests(unittest.TestCase):
+    def persistent_fixture(self, root):
+        (root / 'ming-app-host').write_bytes(b'\x7fELFsynthetic-host')
+        helper = root / 'prepare-persistent-install-fixture'
+        helper.write_bytes(b'\x7fELFsynthetic-helper')
+        for name in ('initial', 'new'):
+            package = root / 'packages' / name
+            package.mkdir(parents=True)
+            (package / 'main.wasm').write_bytes(b'\0asm\x01\0\0\0' + name.encode())
+        catalog = {'schemaVersion': 3, 'apps': [
+            {'id': 1, 'title': 'Text Lab', 'packageId': 'dev.ming.text-entry-demo'}], 'autostart': [1]}
+        self.put(root / 'catalog.json', catalog)
+        review = {'reviewed': True, 'reviewer': 'synthetic test only', 'profile': 'persistent-install',
+                  'sessionMode': 'long-lived', 'budgetEvidence': 'no VM or production review',
+                  'extraArgs': ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
+                                '--state-file', '/run/evidence/desktop-state.json'],
+                  'persistentInstallState': '/data/mingos/install-root',
+                  'catalogPath': '/data/mingos/install-root/catalog.json',
+                  'installSource': '/opt/mingos/install-source/app.json',
+                  'inputScripts': {'boot1Sha256': '1' * 64, 'boot2Sha256': '2' * 64},
+                  'instrumentedQualification': True,
+                  'instrumentedProfile': 'persistent-install-pointer-ready-v1',
+                  'inputSynchronization': POINTER_SYNC_POLICY,
+                  'persistentInstallFixture': {
+                      'helper': '/opt/mingos/prepare-persistent-install-fixture',
+                      'installRoot': '/data/mingos/install-root',
+                      'initialWasm': '/opt/mingos/packages/initial/main.wasm',
+                      'sourceWasm': '/opt/mingos/packages/new/main.wasm',
+                      'sourceManifest': '/opt/mingos/install-source/app.json',
+                      'receipt': '/run/evidence/persistent-install-fixture.json'},
+                  'persistentInstallFixtureSha256': {
+                      'helper': sha256(helper), 'initialWasm': sha256(root / 'packages/initial/main.wasm'),
+                      'sourceWasm': sha256(root / 'packages/new/main.wasm')},
+                  'hostSha256': sha256(root / 'ming-app-host'), 'catalogSha256': sha256(root / 'catalog.json')}
+        return catalog, review
+
+    def test_persistent_install_accepts_frozen_helper_without_ram_registry_or_events(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); catalog, review = self.persistent_fixture(root)
+            self.assertEqual(verify_payload(root, review), catalog)
+            self.assertFalse((root / 'install-root').exists())
+            self.assertFalse((root / 'install-events.json').exists())
+
+    def test_persistent_install_rejects_legacy_roots_inputs_and_mutable_fixture(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); _, review = self.persistent_fixture(root)
+            for change in ({'persistentInstallState': '/opt/mingos/install-root'},
+                           {'catalogPath': '/opt/mingos/catalog.json'}, {'installRoot': '/data/mingos/install-root'},
+                           {'installFixture': {}}, {'updateFixture': {}}, {'installEvents': '/opt/mingos/events.json'},
+                           {'inputScriptSha256': '1' * 64}, {'inputScripts': {'boot1Sha256': '1' * 64}},
+                           {'inputScripts': {'boot1Sha256': '1' * 64, 'boot2Sha256': '1' * 64}},
+                           {'extraArgs': review['extraArgs'] + ['--install-root', '/opt/mingos/install-root']},
+                           {'instrumentedQualification': False}, {'instrumentedProfile': 'install-lifecycle-pointer-ready-v1'}):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    verify_payload(root, dict(review, **change))
+            for relative in ('prepare-persistent-install-fixture', 'packages/initial/main.wasm', 'packages/new/main.wasm'):
+                path = root / relative; original = path.read_bytes(); path.write_bytes(original + b'drift')
+                with self.subTest(relative=relative), self.assertRaises(ValueError): verify_payload(root, review)
+                path.write_bytes(original)
+            (root / 'install-root').mkdir()
+            with self.assertRaises(ValueError): verify_payload(root, review)
+
+    def test_persistent_install_catalog_rejects_duplicate_keys_boolean_ids_and_autostart_app2(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); catalog, review = self.persistent_fixture(root)
+            for change in (lambda c: c.update(autostart=[1, 2]), lambda c: c.update(autostart=[True]),
+                           lambda c: c['apps'][0].update(id=True), lambda c: c.update(schemaVersion=3.0)):
+                changed = copy.deepcopy(catalog); change(changed); self.put(root / 'catalog.json', changed)
+                review['catalogSha256'] = sha256(root / 'catalog.json')
+                with self.subTest(change=change), self.assertRaises(ValueError): verify_payload(root, review)
+            raw = json.dumps(catalog).replace('"schemaVersion": 3', '"schemaVersion": 1, "schemaVersion": 3')
+            (root / 'catalog.json').write_text(raw); review['catalogSha256'] = sha256(root / 'catalog.json')
+            with self.assertRaises(ValueError): verify_payload(root, review)
+
+    def test_persistent_install_vm_input_has_no_single_hash_or_wrong_boot_fallback(self):
+        from bootlib import validate_reviewed_input
+        with tempfile.TemporaryDirectory() as work:
+            first, second = Path(work) / 'first.json', Path(work) / 'second.json'
+            first.write_text('{"boot":1}'); second.write_text('{"boot":2}')
+            review = {'profile': 'persistent-install', 'inputScripts': {
+                'boot1Sha256': sha256(first), 'boot2Sha256': sha256(second)}}
+            validate_reviewed_input(review, first, boot_number=1)
+            validate_reviewed_input(review, second, boot_number=2)
+            for path, number in ((first, 2), (second, 1), (first, None), (first, True), (first, 3), (None, 2)):
+                with self.subTest(number=number, path=path), self.assertRaises(ValueError):
+                    validate_reviewed_input(review, path, boot_number=number)
+            for changed in ({'inputScriptSha256': sha256(first)},
+                            {'inputScripts': {'boot1Sha256': sha256(first)}},
+                            {'inputScripts': dict(review['inputScripts'], extra='0' * 64)}):
+                with self.subTest(change=changed), self.assertRaises(ValueError):
+                    validate_reviewed_input(dict(review, **changed), first, boot_number=1)
+            first.write_text('{"boot":2}')
+            with self.assertRaises(ValueError): validate_reviewed_input(review, first, boot_number=1)
+
+    def test_reviewed_input_rejects_oversized_bytes_even_with_matching_hash(self):
+        from bootlib import validate_reviewed_input
+        with tempfile.TemporaryDirectory() as work:
+            source = Path(work) / 'input.json'
+            source.write_bytes(b'{}' + b' ' * (1024 * 1024 - 1))
+            digest = sha256(source)
+            for review, number in (({'profile': 'data-text', 'inputScriptSha256': digest}, None),
+                                   ({'profile': 'persistent-install', 'inputScripts': {
+                                       'boot1Sha256': digest, 'boot2Sha256': '0' * 64}}, 1)):
+                with self.subTest(profile=review['profile']), self.assertRaises(ValueError):
+                    validate_reviewed_input(review, source, boot_number=number)
+
     def put(self, path, data): path.write_text(json.dumps(data))
     def fixture(self, root):
         (root / 'ming-app-host').write_bytes(b'\x7fELFsynthetic-test-only')

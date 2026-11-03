@@ -1,7 +1,8 @@
 """Closed, main-reviewed payload profiles. No build or guest execution on import."""
 import json
 from pathlib import Path
-from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_UPDATE_INSTALL_ROOT, checked_path, sha256
+from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_INSTALL_FIXTURE, PERSISTENT_INSTALL_PROFILE, PERSISTENT_UPDATE_INSTALL_ROOT, checked_path, persistent_input_hashes, sha256
+from wayland_receipt import POINTER_SYNC_POLICY
 
 DATA_TEXT_ARGS = ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
                   '--state-file', '/run/evidence/desktop-state.json']
@@ -164,6 +165,37 @@ def verify_install_lifecycle(payload, review, catalog):
             and review['installLifecycle'].get('newPackageId') == 'dev.ming.install-demo'
             and review['installLifecycle'].get('newVersion') == '1.0.0',
             'install lifecycle identity contract')
+    return catalog
+
+def verify_persistent_install(payload, review, catalog):
+    """Freeze the initialization inputs; the second boot must only reopen disk state."""
+    require(review.get('sessionMode') == 'long-lived' and review.get('extraArgs') == DATA_TEXT_ARGS,
+            'exact reviewed strict/data/state session required')
+    require(catalog == {'schemaVersion': 3, 'apps': [
+        {'id': 1, 'title': 'Text Lab', 'packageId': 'dev.ming.text-entry-demo'}], 'autostart': [1]}
+        and type(catalog['schemaVersion']) is int and type(catalog['apps'][0]['id']) is int
+        and type(catalog['autostart'][0]) is int,
+        'persistent install requires only initial app1 and autostart [1]')
+    require(review.get('persistentInstallFixture') == PERSISTENT_INSTALL_FIXTURE,
+            'persistent fixture contract')
+    require(review.get('instrumentedQualification') is True
+            and review.get('instrumentedProfile') == PERSISTENT_INSTALL_PROFILE
+            and review.get('inputSynchronization') == POINTER_SYNC_POLICY,
+            'persistent install pointer qualification required')
+    persistent_input_hashes(review)
+    require(not (payload / 'install-root').exists() and not (payload / 'install-source').exists()
+            and not (payload / 'install-events.json').exists(), 'persistent payload must not seed a RAM registry/source/events')
+    expected = review.get('persistentInstallFixtureSha256')
+    require(isinstance(expected, dict) and set(expected) == {'helper', 'initialWasm', 'sourceWasm'},
+            'reviewed persistent helper and Wasm hashes required')
+    for field in ('helper', 'initialWasm', 'sourceWasm'):
+        relative = PERSISTENT_INSTALL_FIXTURE[field].removeprefix('/opt/mingos/')
+        path = checked_path(payload, relative)
+        require(path.is_file() and expected[field] == sha256(path), 'persistent fixture hash mismatch: ' + field)
+        with path.open('rb') as source:
+            header = source.read(8)
+        require(header[:4] == b'\x7fELF' if field == 'helper' else header == b'\0asm\x01\0\0\0',
+                'persistent fixture executable format: ' + field)
     return catalog
 
 def verify_data_text_private_probe(payload, review, catalog):
