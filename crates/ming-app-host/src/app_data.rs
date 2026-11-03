@@ -107,6 +107,24 @@ pub struct PrivateFileEntry {
     pub is_directory: bool,
 }
 
+/// A bounded, read-only observation of existing private file content.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrivateContentFile { pub path: String, pub size: u64, pub sha256: String }
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrivateContentSnapshot { pub package_id: String, pub files: Vec<PrivateContentFile> }
+
+/// Never initializes storage, grants, policies, or locks. Only single-level regular files
+/// are accepted; every directory entry counts toward the bound before validation.
+#[cfg(target_os = "linux")]
+pub fn snapshot_private_read_only(root: &Path, package_id: &str) -> Result<PrivateContentSnapshot> {
+    if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+    platform::snapshot_private_read_only(root, package_id)
+}
+
 /// Parent-held root capability. Linux reopens generations relative to the retained directory fd.
 #[derive(Clone)]
 pub struct AppDataRoot { root: Arc<platform::Root> }
@@ -1425,6 +1443,85 @@ mod platform {
     pub fn stamp_private(file: &File) -> Result<Stamp> {
         file_stamp_with_limit(file.metadata().map_err(io_error)?, MAX_PRIVATE_FILE_BYTES)
     }
+    pub fn snapshot_private_read_only(path: &Path, package_id: &str) -> Result<PrivateContentSnapshot> {
+        snapshot_private_read_only_checked(path, package_id, || {})
+    }
+    pub(super) fn snapshot_private_read_only_checked(path: &Path, package_id: &str, after_read: impl FnOnce()) -> Result<PrivateContentSnapshot> {
+        use sha2::{Digest, Sha256};
+        const MAX_ENTRIES: usize = 32;
+        const MAX_BYTES: usize = 65_536;
+        fn directory_stamp(file: &File) -> Result<(u64, u64, i64, i64, i64, i64)> {
+            private_directory(file)?;
+            let m = file.metadata().map_err(io_error)?;
+            Ok((m.dev(), m.ino(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()))
+        }
+        fn names(dir: &File) -> Result<Vec<String>> {
+            let raw = open_at(dir, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?.into_raw_fd();
+            let stream = unsafe { libc::fdopendir(raw) };
+            if stream.is_null() { unsafe { libc::close(raw); } return Err(AppDataError::Io); }
+            let result = (|| {
+                let mut names = Vec::new();
+                loop {
+                    unsafe { *libc::__errno_location() = 0; }
+                    let entry = unsafe { libc::readdir(stream) };
+                    if entry.is_null() {
+                        if unsafe { *libc::__errno_location() } != 0 { return Err(AppDataError::Io); }
+                        break;
+                    }
+                    let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_str().map_err(|_| AppDataError::Io)?;
+                    if name == "." || name == ".." { continue; }
+                    names.push(name.to_owned());
+                    if names.len() > MAX_ENTRIES { return Err(AppDataError::Io); }
+                }
+                names.sort();
+                Ok(names)
+            })();
+            unsafe { libc::closedir(stream); }
+            result
+        }
+        fn read(file: &mut File, limit: usize) -> Result<Vec<u8>> {
+            file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+            let mut bytes = Vec::new();
+            Read::by_ref(file).take(limit as u64 + 1).read_to_end(&mut bytes).map_err(io_error)?;
+            if bytes.len() > limit { return Err(AppDataError::Io); }
+            Ok(bytes)
+        }
+        // All opens are no-follow and relative to pinned, already existing descriptors.
+        let root = Root::open(path)?;
+        let package_name = package_directory_name(package_id);
+        let package = Directory(open_at(&root.0, &package_name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?);
+        let files = package.child("files", false)?;
+        let before = (directory_stamp(&root.0)?, directory_stamp(&package.0)?, directory_stamp(&files.0)?);
+        let entries = names(&files.0)?;
+        if entries.is_empty() { return Err(AppDataError::NotFound); }
+        let mut total = 0usize;
+        let mut observed = Vec::new();
+        let mut content = Vec::new();
+        for name in &entries {
+            if name.starts_with('.') { return Err(AppDataError::Io); }
+            validate_private_path(name).map_err(|_| AppDataError::Io)?;
+            let mut file = open_at(&files.0, name, libc::O_RDONLY, 0)?;
+            let stamp = file_stamp_with_limit(file.metadata().map_err(io_error)?, MAX_BYTES - total)?;
+            let bytes = read(&mut file, MAX_BYTES - total)?;
+            if bytes.len() as u64 != stamp.size { return Err(AppDataError::Io); }
+            total += bytes.len();
+            content.push(PrivateContentFile { path: name.clone(), size: stamp.size, sha256: format!("{:x}", Sha256::digest(&bytes)) });
+            observed.push((file, stamp, bytes));
+        }
+        after_read();
+        // Re-read each pinned file and reopen each name to reject changes or replacement.
+        for (name, (mut file, stamp, bytes)) in entries.iter().zip(observed) {
+            if read(&mut file, MAX_BYTES)? != bytes { return Err(AppDataError::Io); }
+            files.unchanged_private(name, &file, &stamp)?;
+        }
+        if names(&files.0)? != entries { return Err(AppDataError::Io); }
+        let reopened = Root::open(path)?;
+        let reopened_package = Directory(open_at(&reopened.0, &package_name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?);
+        let reopened_files = reopened_package.child("files", false)?;
+        let after = (directory_stamp(&reopened.0)?, directory_stamp(&reopened_package.0)?, directory_stamp(&reopened_files.0)?);
+        if before != after || before != (directory_stamp(&root.0)?, directory_stamp(&package.0)?, directory_stamp(&files.0)?) { return Err(AppDataError::Io); }
+        Ok(PrivateContentSnapshot { package_id: package_id.to_owned(), files: content })
+    }
     impl Root {
         pub fn open(root: &Path) -> Result<Self> {
             if !root.is_absolute() {
@@ -2124,3 +2221,91 @@ mod platform {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 compile_error!("App data storage supports Linux and the documented Windows prototype only");
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod snapshot_tests {
+    use super::*;
+    use std::{fs, os::unix::fs::{symlink, PermissionsExt}, path::PathBuf};
+    const ID: &str = "dev.ming.install-demo";
+    fn directory(path: &Path) { fs::create_dir(path).unwrap(); fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap(); }
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data"); directory(&root);
+        let package = root.join(package_directory_name(ID)); directory(&package);
+        let files = package.join("files"); directory(&files);
+        file(&files.join("note.txt"), b"alpha");
+        (temp, root, files)
+    }
+    fn file(path: &Path, bytes: &[u8]) { fs::write(path, bytes).unwrap(); fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap(); }
+    fn tree(path: &Path) -> Vec<(PathBuf, u64, Vec<u8>)> {
+        use std::os::unix::fs::MetadataExt;
+        fn walk(path: &Path, out: &mut Vec<(PathBuf,u64,Vec<u8>)>) {
+            let m = fs::symlink_metadata(path).unwrap();
+            let bytes = if m.is_file() { fs::read(path).unwrap() } else if m.file_type().is_symlink() { fs::read_link(path).unwrap().as_os_str().as_encoded_bytes().to_vec() } else { Vec::new() };
+            let mut evidence = format!("{}:{}:{}:{}:{}:{}:{}:{}:",m.mode(),m.uid(),m.nlink(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec()).into_bytes();
+            evidence.extend(bytes);
+            out.push((path.to_owned(), m.ino(), evidence));
+            if m.is_dir() { let mut children: Vec<_> = fs::read_dir(path).unwrap().map(|e|e.unwrap().path()).collect(); children.sort(); for child in children { walk(&child,out); } }
+        }
+        let mut out=Vec::new(); walk(path,&mut out); out
+    }
+    #[test]
+    fn missing_components_are_not_created() {
+        let temp=tempfile::tempdir().unwrap(); let root=temp.path().join("data");
+        assert!(snapshot_private_read_only(&root,ID).is_err()); assert!(!root.exists());
+        directory(&root); let before=tree(&root); assert!(snapshot_private_read_only(&root,ID).is_err()); assert_eq!(tree(&root),before);
+        directory(&root.join(package_directory_name(ID))); let before=tree(&root); assert!(snapshot_private_read_only(&root,ID).is_err()); assert_eq!(tree(&root),before);
+    }
+    #[test]
+    fn existing_snapshot_is_sorted_and_does_not_write() {
+        let (_temp,root,files)=fixture(); file(&files.join("a.txt"),b"beta"); let before=tree(&root);
+        let snapshot=snapshot_private_read_only(&root,ID).unwrap();
+        assert_eq!(snapshot.package_id,ID); assert_eq!(snapshot.files.iter().map(|f|f.path.as_str()).collect::<Vec<_>>(),["a.txt","note.txt"]);
+        assert_eq!(snapshot.files[1].size,5); assert_eq!(snapshot.files[1].sha256,"8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8"); assert_eq!(tree(&root),before);
+        let encoded=serde_json::to_value(&snapshot).unwrap(); assert!(serde_json::from_value::<PrivateContentSnapshot>(serde_json::json!({"packageId":ID,"files":[],"unknown":true})).is_err()); assert_eq!(encoded["packageId"],ID);
+    }
+    #[test]
+    fn links_hidden_temporary_and_directories_are_rejected_without_writes() {
+        for case in 0..7 {
+            let (_temp,root,files)=fixture();
+            match case {
+                0=>symlink("note.txt",files.join("link")).unwrap(),
+                1=>fs::hard_link(files.join("note.txt"),files.join("hard")).unwrap(),
+                2=>file(&files.join(".hidden"),b"x"),
+                3=>file(&files.join(".ming-data-tmp"),b"x"),
+                4=>directory(&files.join("empty")),
+                5=>{fs::remove_file(files.join("note.txt")).unwrap();},
+                _=>{fs::rename(&files,root.join("actual")).unwrap();symlink(root.join("actual"),&files).unwrap();}
+            }
+            let before=tree(&root); assert!(snapshot_private_read_only(&root,ID).is_err(),"case {case}"); assert_eq!(tree(&root),before);
+        }
+    }
+    #[test]
+    fn changed_content_or_name_during_observation_is_rejected() {
+        for case in 0..3 {
+            let (_temp,root,files)=fixture();
+            let result=platform::snapshot_private_read_only_checked(&root,ID,|| {
+                match case {
+                    0=>file(&files.join("note.txt"),b"bravo"),
+                    1=>{fs::remove_file(files.join("note.txt")).unwrap();file(&files.join("note.txt"),b"alpha");},
+                    _=>file(&files.join("extra.txt"),b"x"),
+                }
+            });
+            assert!(result.is_err(),"unstable case {case}");
+        }
+    }
+    #[test]
+    fn bounded_entries_and_total_content_are_enforced() {
+        for case in 0..3 {
+            let (_temp,root,files)=fixture();
+            match case {
+                0=>for i in 0..32 {file(&files.join(format!("f{i}")),b"");},
+                1=>for i in 0..32 {directory(&files.join(format!("d{i}")));},
+                _=>file(&files.join("large"),&vec![0;65_536]),
+            }
+            let before=tree(&root); assert!(snapshot_private_read_only(&root,ID).is_err()); assert_eq!(tree(&root),before);
+        }
+        let (_temp,root,files)=fixture(); file(&files.join("note.txt"),&vec![0;65_536]); assert_eq!(snapshot_private_read_only(&root,ID).unwrap().files[0].size,65_536);
+    }
+}

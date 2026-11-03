@@ -2340,6 +2340,64 @@ pub fn run(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<De
 #[cfg(test)]
 mod input_backpressure_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires packaged persistent-uninstall-demo Wasm"]
+    fn persistent_uninstall_fixture_writes_private_data_and_closes() {
+        use std::os::unix::fs::PermissionsExt;
+        let wasm = PathBuf::from(std::env::var_os("MING_UNINSTALL_FIXTURE_WASM").expect("packaged fixture path required"));
+        assert!(wasm.is_absolute());
+        let worker = PathBuf::from(std::env::var_os("MING_TEST_PRIVATE_WORKER").expect("real release Host worker path required"));
+        assert!(worker.is_absolute() && worker.is_file());
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::copy(&wasm, temp.path().join("main.wasm")).unwrap();
+        std::fs::write(temp.path().join("app.json"), include_bytes!("../../../samples/persistent-uninstall-demo/app.json")).unwrap();
+        let catalog_path = temp.path().join("catalog.json");
+        std::fs::write(&catalog_path, br#"{"schemaVersion":1,"apps":[{"id":1,"title":"Private fixture","manifest":"app.json"}],"autostart":[1]}"#).unwrap();
+        let catalog = crate::desktop_catalog::load_catalog(&catalog_path).unwrap();
+        let options = DesktopOptions::parse([catalog_path.into_os_string(), "--renderer".into(), "cpu".into(), "--data-root".into(), data.clone().into_os_string()]).unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature="gpu")] None).unwrap();
+        session.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut requested_close = false;
+        while Instant::now() < deadline {
+            session.tick().unwrap();
+            if session.dirty {
+                let frame = session.compose().unwrap();
+                session.accepted(frame.sequence, true).unwrap();
+            }
+            if !requested_close && session.records.last().is_some_and(|r| r.first_ready_ms.is_some())
+                && session.views().iter().any(|v| v.input_ready && v.presented_sequence != 0) {
+                let snapshot = crate::app_data::snapshot_private_read_only(&data, "dev.ming.install-demo").unwrap();
+                assert_eq!(snapshot.files, vec![crate::app_data::PrivateContentFile { path:"note.txt".into(),size:5,
+                    sha256:"8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8".into() }]);
+                session.perform(&DesktopAction::Close { app:1 }).unwrap();
+                requested_close = true;
+            }
+            if requested_close && session.instances.is_empty() { break; }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(requested_close, "fixture never reached presented Ready: {:?}", session.records);
+        assert!(session.instances.is_empty(), "fixture did not reap after Close");
+        let record = session.records.last().unwrap();
+        assert!(record.first_ready_ms.is_some());
+        assert!(record.completed); assert_eq!(record.status,"closed"); assert!(record.error.is_none(), "{:?}", record.error);
+        assert!(record.frames_submitted.is_some_and(|frames| frames > 0));
+        assert!(session.trace.iter().any(|e| e.kind == "result-accepted"));
+        assert!(session.trace.iter().any(|e| e.kind == "worker-reaped"));
+        eprintln!("fixture Ready→Close result: {}", serde_json::to_string(record).unwrap());
+        session.finish().unwrap();
+        assert!(session.instances.is_empty());
+        let snapshot = crate::app_data::snapshot_private_read_only(&data,"dev.ming.install-demo").unwrap();
+        eprintln!("privateContent: {}",serde_json::to_string(&snapshot).unwrap());
+        assert_eq!(snapshot.files.len(),1); assert_eq!(snapshot.files[0].path,"note.txt");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn native_install_requires_a_trusted_source_option() {
