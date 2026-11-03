@@ -340,6 +340,45 @@ impl NativeDesktop {
             .context("DESKTOP_SESSION")?
             .user_action(&action)
     }
+    fn mouse_button(&mut self, down: bool) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        self.session.as_mut().context("DESKTOP_SESSION")?.begin_native_input(down, self.mouse)?;
+        self.left = down;
+        if down { self.down()?; } else { self.up()?; }
+        #[cfg(target_os = "linux")]
+        self.session.as_mut().context("DESKTOP_SESSION")?.end_native_input()?;
+        Ok(())
+    }
+    fn up(&mut self) -> Result<()> {
+        self.drag = None;
+        #[cfg(target_os = "linux")]
+        if self.purge_dock_release()? { return Ok(()); }
+        #[cfg(target_os = "linux")]
+        if self.uninstall_dock_release()? { return Ok(()); }
+        #[cfg(target_os = "linux")]
+        if self.storage_dock_release()? { return Ok(()); }
+        #[cfg(target_os = "linux")]
+        if self.install_release()? { return Ok(()); }
+        #[cfg(target_os = "linux")]
+        if self.storage_release()? { return Ok(()); }
+        if let Some((x, y)) = self.mouse {
+            self.session
+                .as_mut()
+                .context("DESKTOP_SESSION")?
+                .pointer_update_modifiers(
+                    x,
+                    y,
+                    false,
+                    self.input.modifier_bits(),
+                )?;
+        } else {
+            self.session
+                .as_mut()
+                .context("DESKTOP_SESSION")?
+                .reset_input()?;
+        }
+        Ok(())
+    }
     fn down(&mut self) -> Result<()> {
         let Some((x, y)) = self.mouse else {
             return Ok(());
@@ -392,6 +431,8 @@ impl NativeDesktop {
                     self.storage_dock_press = Some((app.id, session.frames_presented));
                     return Ok(());
                 }
+                #[cfg(target_os = "linux")]
+                session.native_dock_launch(app.id);
                 return self.action(DesktopAction::Launch { app: app.id });
             }
         }
@@ -658,38 +699,7 @@ impl ApplicationHandler for NativeDesktop {
                     button: MouseButton::Left,
                     ..
                 } if self.active => {
-                    self.left = state == ElementState::Pressed;
-                    if self.left {
-                        self.down()?;
-                    } else {
-                        self.drag = None;
-                        #[cfg(target_os = "linux")]
-                        if self.purge_dock_release()? { return Ok(()); }
-                        #[cfg(target_os = "linux")]
-                        if self.uninstall_dock_release()? { return Ok(()); }
-                        #[cfg(target_os = "linux")]
-                        if self.storage_dock_release()? { return Ok(()); }
-                        #[cfg(target_os = "linux")]
-                        if self.install_release()? { return Ok(()); }
-                        #[cfg(target_os = "linux")]
-                        if self.storage_release()? { return Ok(()); }
-                        if let Some((x, y)) = self.mouse {
-                            self.session
-                                .as_mut()
-                                .context("DESKTOP_SESSION")?
-                                .pointer_update_modifiers(
-                                    x,
-                                    y,
-                                    false,
-                                    self.input.modifier_bits(),
-                                )?;
-                        } else {
-                            self.session
-                                .as_mut()
-                                .context("DESKTOP_SESSION")?
-                                .reset_input()?;
-                        }
-                    }
+                    self.mouse_button(state == ElementState::Pressed)?;
                 }
                 WindowEvent::MouseWheel { delta, .. } if self.active => {
                     #[cfg(target_os = "linux")]
@@ -861,6 +871,63 @@ fn window_error(error: softbuffer::SoftBufferError) -> anyhow::Error {
 #[cfg(test)]
 mod input_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_native_dock_down_records_new_launch_and_up_does_not_repeat_it() {
+        let (temp, opened, package) = crate::persistent_install::transaction_tests::fixture();
+        let committed = crate::persistent_install::install_new(&opened.registry, &package).unwrap();
+        let root = opened.registry.root_path().to_path_buf();
+        let mut options = DesktopOptions::parse([root.join("catalog.json").into_os_string(),
+            "--persistent-install-state".into(), root.into_os_string(), "--renderer".into(), "cpu".into(),
+            "--state-file".into(), temp.path().join("state.json").into_os_string(),
+            "--qualification-receipts".into(), "persistent-install-pointer-ready-v1".into()]).unwrap();
+        options.install_registry = Some(opened.registry);
+        let mut app = NativeDesktop::new(options, committed.catalog);
+        let (options, catalog) = app.pending.take().unwrap();
+        let mut session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
+        // Present the actual native shell; no autostart or synthetic Launch action.
+        let mut shell = DesktopShell::cpu();
+        let frame = render(&mut session, &mut shell).unwrap();
+        session.accepted(frame.sequence, false).unwrap();
+        app.session = Some(session);
+        let cell = dock_cell(1280, 800, 1, 2);
+        app.mouse = Some((cell.x + 32, cell.y + 30));
+        app.mouse_button(true).unwrap();
+        app.mouse_button(false).unwrap();
+        let session = app.session.as_mut().unwrap();
+        let events = &session.test_native_receipts;
+        assert_eq!(events.len(), 2);
+        let down = &events[0]["receipt"];
+        let up = &events[1]["receipt"];
+        assert_eq!(down["action"], "launch");
+        assert_eq!(down["targetApp"], 2);
+        assert_eq!(down["before"]["history"], serde_json::json!([]));
+        let after = down["after"]["history"].as_array().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0]["app"], 2);
+        assert_eq!(after[0]["generation"], 1);
+        assert_eq!(down["trace"].as_array().unwrap().iter().filter(|t| t["kind"] == "launch").count(), 1);
+        assert_eq!(up["action"], "other");
+        assert_eq!(up["pressSequence"], 1);
+        assert_eq!(up["after"]["history"].as_array().unwrap().len(), 1);
+        assert!(!up["trace"].as_array().unwrap().iter().any(|t|t["kind"] == "launch"));
+        // Observe the supervisor's real PID via normal poll. The minimal module
+        // does not supply a ready frame, so it must never produce a ready receipt.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !session.test_native_receipts.iter().any(|e|e["kind"] == "native-launch") {
+            assert!(std::time::Instant::now() < deadline, "real worker PID not observed");
+            session.tick().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let started = session.test_native_receipts.iter().find(|e|e["kind"] == "native-launch").unwrap();
+        assert_eq!(started["receipt"]["downSequence"], 1);
+        assert_eq!(started["receipt"]["phase"], "worker-started");
+        assert_eq!(started["receipt"]["generation"], 1);
+        assert!(started["receipt"]["workerPid"].as_u64().unwrap() > 0);
+        assert!(!session.test_native_receipts.iter().any(|e|e["receipt"]["phase"] == "ready"));
+        session.finish().unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn dock_no_longer_opens_private_storage_permissions() {

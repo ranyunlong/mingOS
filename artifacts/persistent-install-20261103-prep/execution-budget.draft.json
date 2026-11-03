@@ -1,0 +1,36 @@
+{
+  "status": "draft-source-binding-pending",
+  "vm": {
+    "boots": 2,
+    "sequential": true,
+    "timeoutSecondsEach": 900,
+    "coldPairStageTimeoutSeconds": 2000,
+    "memoryMiBEach": 2048,
+    "vcpusEach": 2,
+    "accelerator": "tcg,thread=multi",
+    "network": "none"
+  },
+  "pointerWaitMs": 5000,
+  "stderrLimitBytes": 8388608,
+  "observerMaxEvents": 4096,
+  "observerMaxSeconds": 900,
+  "exclusiveGrab": false,
+  "readyCaptureSeconds": null,
+  "retainedWorkerBudgets": {
+    "isolation": "strict",
+    "cgroupMemoryBytes": 536870912,
+    "pids": 64,
+    "startupCpuMax": "100000 100000",
+    "steadyCpuMax": "25000 100000",
+    "wasmLinearMemoryBytes": 67108864,
+    "progressTimeoutMs": 300000,
+    "fuelCap": 300000000,
+    "fuelRefillPerSecond": 100000000,
+    "maxRequestsPerMinute": 32768,
+    "serviceBurstNanoseconds": 1000000000,
+    "serviceRateNanosecondsPerSecond": 500000000,
+    "changed": false
+  },
+  "sourceSha256": null,
+  "finalSystemAccepted": false
+}

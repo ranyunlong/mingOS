@@ -1,0 +1,79 @@
+{
+  "reviewed": false,
+  "reviewer": null,
+  "status": "draft-persistent-install-implementation-and-binary-hashes-pending",
+  "profile": "persistent-install",
+  "sessionMode": "long-lived",
+  "extraArgs": [
+    "--duration-ms",
+    "0",
+    "--isolation",
+    "strict",
+    "--data-root",
+    "/data/mingos",
+    "--state-file",
+    "/run/evidence/desktop-state.json",
+    "--qualification-receipts",
+    "persistent-install-pointer-ready-v1"
+  ],
+  "persistentInstallState": "/data/mingos/install-root",
+  "catalogPath": "/data/mingos/install-root/catalog.json",
+  "hostSha256": null,
+  "helperSha256": null,
+  "catalogSha256": null,
+  "inputScripts": {
+    "boot1Sha256": "fdadb4fb252a1edaf0befc35fcc912eeb0837c320d3d7f8ce293eab5ca986f54",
+    "boot2Sha256": "82fd7911b7b0851bf94e77550de52cffc69d457496b75e835998e4b0b1d76169"
+  },
+  "strictProbeProfile": "source-v2",
+  "strictProbeSha256": {
+    "mingos-isolation-probe": "f70072ef5f115d2ceb5523accdb7e478d152d548f99415fe7ad7e77c0a133bd7",
+    "vm-prepare.sh": "7b7140efb3b9c073dd38db9382ccbcf3794626603e5f5afb2b6475eae9d769fe"
+  },
+  "instrumentedQualification": true,
+  "instrumentedProfile": "persistent-install-pointer-ready-v1",
+  "inputSynchronization": {
+    "policy": "wayland-client-pointer-frame-v1",
+    "coordinateTolerancePixels": 1,
+    "pointerWaitMs": 5000,
+    "requireCurrentBootSessionDesktopPid": true,
+    "requireAfterAbsLogOffset": true,
+    "requireSameRootSurface": true,
+    "allowEnterOrMotion": true,
+    "leaveInvalidates": true
+  },
+  "instrumentation": {
+    "desktopEnv": {
+      "WAYLAND_DEBUG": "client"
+    },
+    "stderrLimitBytes": 8388608,
+    "observerSha256": "6ed25955e7ce25a3f78a06f4f57605ad559da66fd61e6f6c2b55d2f0263af350",
+    "observerMaxEvents": 4096,
+    "observerMaxSeconds": 900,
+    "exclusiveGrab": false,
+    "readyCaptureSeconds": null
+  },
+  "budgetEvidence": null,
+  "budgetEvidenceSha256": null,
+  "finalSystemAccepted": false,
+  "unresolved": [
+    "fresh Linux release host/helper hash and source fingerprint",
+    "frozen bootstrap/catalog/Wasm/trust inputs",
+    "exact final budget evidence bound to implementation sources",
+    "final independent checker/producer/guest source freeze and explicit qualification argv review"
+  ],
+  "installSource": "/opt/mingos/install-source/app.json",
+  "persistentInstallFixture": {
+    "helper": "/opt/mingos/prepare-persistent-install-fixture",
+    "installRoot": "/data/mingos/install-root",
+    "initialWasm": "/opt/mingos/packages/initial/main.wasm",
+    "sourceWasm": "/opt/mingos/packages/new/main.wasm",
+    "sourceManifest": "/opt/mingos/install-source/app.json",
+    "receipt": "/run/evidence/persistent-install-fixture.json"
+  },
+  "persistentInstallFixtureSha256": {
+    "helper": null,
+    "initialWasm": "b126b28f1dedac19b3f0344a9795a3663d49dbe15c70a01d3595af20de8912f4",
+    "sourceWasm": "b126b28f1dedac19b3f0344a9795a3663d49dbe15c70a01d3595af20de8912f4"
+  }
+}

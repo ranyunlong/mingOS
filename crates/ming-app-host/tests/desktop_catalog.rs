@@ -220,3 +220,23 @@ fn persistent_output_paths_reject_resolved_aliases_of_controlled_content() {
         assert_eq!(if flag == "--state-file" { options.state_file } else { options.snapshot }, Some(outside.join("result")));
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qualification_receipts_cli_requires_explicit_persistent_native_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state.json");
+    let state = state.to_str().unwrap();
+    let root = "/data/mingos/install-root";
+    let catalog = "/data/mingos/install-root/catalog.json";
+    let marker = "persistent-install-pointer-ready-v1";
+    let valid = [catalog,"--persistent-install-state",root,"--state-file",state,"--qualification-receipts",marker];
+    assert!(DesktopOptions::parse(args(&valid)).is_ok());
+    for invalid in [
+        vec![catalog,"--qualification-receipts",marker,"--state-file",state],
+        vec![catalog,"--persistent-install-state",root,"--qualification-receipts",marker],
+        vec![catalog,"--persistent-install-state",root,"--state-file",state,"--qualification-receipts",marker,"--backend","offscreen"],
+        vec![catalog,"--persistent-install-state",root,"--state-file",state,"--qualification-receipts","v2"],
+        vec![catalog,"--persistent-install-state",root,"--state-file",state,"--qualification-receipts",marker,"--qualification-receipts",marker],
+    ] { assert!(DesktopOptions::parse(args(&invalid)).is_err(),"{invalid:?}"); }
+}

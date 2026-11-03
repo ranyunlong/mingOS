@@ -205,6 +205,34 @@ impl Instance {
     }
 }
 
+// Qualification evidence is parent-owned and never supplied by a worker.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct NativeEvidence {
+    sequence: u64,
+    press: Option<u64>,
+    pending: Option<NativeInputEvidence>,
+    receipts: usize,
+    launches: Vec<NativeLaunchEvidence>,
+}
+#[cfg(target_os = "linux")]
+struct NativeInputEvidence {
+    sequence: u64,
+    press: u64,
+    down: bool,
+    mouse: Option<(i32, i32)>,
+    before: serde_json::Value,
+    trace_start: usize,
+    target: Option<u16>,
+}
+#[cfg(target_os = "linux")]
+struct NativeLaunchEvidence {
+    record: usize,
+    down: u64,
+    started: bool,
+    ready: bool,
+}
+
 pub(crate) struct Session {
     app_data: crate::desktop_catalog::DesktopDataConfig,
     #[cfg(target_os = "linux")]
@@ -215,6 +243,10 @@ pub(crate) struct Session {
     persistent_install_blocked: bool,
     #[cfg(all(test, target_os = "linux"))]
     persistent_install_faults: BTreeSet<&'static str>,
+    #[cfg(target_os = "linux")]
+    native_evidence: NativeEvidence,
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) test_native_receipts: Vec<serde_json::Value>,
     pub options: DesktopOptions,
     pub catalog: Catalog,
     pub scene: DesktopScene,
@@ -302,6 +334,10 @@ impl Session {
             persistent_install_blocked: false,
             #[cfg(all(test, target_os = "linux"))]
             persistent_install_faults: BTreeSet::new(),
+            #[cfg(target_os = "linux")]
+            native_evidence: NativeEvidence::default(),
+            #[cfg(all(test, target_os = "linux"))]
+            test_native_receipts: Vec::new(),
             options,
             catalog,
             scene,
@@ -905,6 +941,13 @@ impl Session {
                 self.catalog = committed.catalog;
                 self.log(0, 0, 0, "installed", package_id);
                 self.changed();
+                if self.native_receipts_enabled() {
+                    self.write_state(true)?;
+                    self.emit_native_receipt("persistent-install-installed", serde_json::json!({
+                        "schemaVersion":1,"registryRoot":committed.receipt.registry_root,
+                        "catalogPath":committed.receipt.catalog_path,"stateRevision":self.state_revision,
+                        "content":committed.receipt.content}))?;
+                }
                 self.launch_pending_autostart()?;
                 Ok(())
             }
@@ -933,6 +976,102 @@ impl Session {
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    fn native_receipts_enabled(&self) -> bool {
+        self.options.persistent_install_receipts && self.options.persistent_install_root.is_some()
+            && self.options.state_file.is_some() && !self.options.offscreen
+    }
+    #[cfg(target_os = "linux")]
+    fn check_native_evidence(&mut self) -> Result<()> {
+        if self.native_receipts_enabled() && (self.persistent_install_blocked || self.dropped_trace != 0 || self.dropped_inputs != 0) {
+            self.persistent_install_blocked = true;
+            bail!("DESKTOP_NATIVE_EVIDENCE_DROPPED_OR_BLOCKED");
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn native_anchor(&mut self) -> Result<serde_json::Value> {
+        self.check_native_evidence()?;
+        self.write_state(true)?;
+        Ok(serde_json::json!({"state":self.state_snapshot(self.state_revision),"history":self.records,
+            "traceCount":self.trace.len(),"droppedTrace":self.dropped_trace,"droppedInputs":self.dropped_inputs}))
+    }
+    #[cfg(target_os = "linux")]
+    fn emit_native_receipt(&mut self, kind: &'static str, receipt: serde_json::Value) -> Result<()> {
+        use std::io::Write;
+        self.check_native_evidence()?;
+        let record = serde_json::json!({"kind":kind,"bootId":self.state_boot,"sessionId":self.state_session,
+            "desktopPid":std::process::id(),"receipt":receipt});
+        let mut line = b"MING_PERSISTENT_INSTALL ".to_vec();
+        line.extend_from_slice(&serde_json::to_vec(&record)?);
+        if line.len() > 262144 || self.native_evidence.receipts >= 128 {
+            self.persistent_install_blocked = true;
+            bail!("DESKTOP_NATIVE_EVIDENCE_BOUND");
+        }
+        line.push(b'\n');
+        if let Err(error) = std::io::stderr().lock().write_all(&line) {
+            self.persistent_install_blocked = true;
+            return Err(error).context("DESKTOP_NATIVE_EVIDENCE_WRITE");
+        }
+        self.native_evidence.receipts += 1;
+        #[cfg(test)]
+        self.test_native_receipts.push(record);
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_native_input(&mut self, down: bool, mouse: Option<(i32, i32)>) -> Result<()> {
+        if !self.native_receipts_enabled() { return Ok(()); }
+        self.check_native_evidence()?;
+        if self.native_evidence.pending.is_some() || self.native_evidence.sequence >= 64
+            || (down && self.native_evidence.press.is_some()) || (!down && self.native_evidence.press.is_none()) {
+            self.persistent_install_blocked = true;
+            bail!("DESKTOP_NATIVE_EVIDENCE_SEQUENCE");
+        }
+        let sequence = self.native_evidence.sequence + 1;
+        let press = if down { sequence } else { self.native_evidence.press.expect("checked press") };
+        let before = self.native_anchor()?;
+        self.native_evidence.sequence = sequence;
+        self.native_evidence.press = down.then_some(press);
+        self.native_evidence.pending = Some(NativeInputEvidence { sequence, press, down, mouse, before,
+            trace_start: self.trace.len(), target: None });
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn native_dock_launch(&mut self, app: u16) {
+        if let Some(input) = self.native_evidence.pending.as_mut().filter(|input| input.down) { input.target = Some(app); }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn end_native_input(&mut self) -> Result<()> {
+        let Some(input) = self.native_evidence.pending.take() else { return Ok(()); };
+        let after = self.native_anchor()?;
+        self.emit_native_receipt("native-input", serde_json::json!({"schemaVersion":1,
+            "sequence":input.sequence,"pressSequence":input.press,"edge":if input.down {"down"} else {"up"},
+            "x":input.mouse.map(|p|p.0),"y":input.mouse.map(|p|p.1),
+            "action":if input.target.is_some() {"launch"} else {"other"},"targetApp":input.target,
+            "before":input.before,"after":after,"trace":self.trace[input.trace_start..]}))
+    }
+    #[cfg(target_os = "linux")]
+    fn emit_native_launches(&mut self) -> Result<()> {
+        if !self.native_receipts_enabled() { return Ok(()); }
+        self.check_native_evidence()?;
+        for index in 0..self.native_evidence.launches.len() {
+            let cause = &self.native_evidence.launches[index];
+            let record = &self.records[cause.record];
+            let phases = [(!cause.started && record.worker_pid != 0, "worker-started"),
+                (!cause.ready && record.worker_pid != 0 && record.first_ready_ms.is_some(), "ready")];
+            let (app,generation,window,pid,down) = (record.app,record.generation,record.window,record.worker_pid,cause.down);
+            for (emit, phase) in phases {
+                if !emit { continue; }
+                let anchor = self.native_anchor()?;
+                self.emit_native_receipt("native-launch", serde_json::json!({"schemaVersion":1,"downSequence":down,
+                    "phase":phase,"app":app,"generation":generation,"window":window,"workerPid":pid,"anchor":anchor}))?;
+                if phase == "worker-started" { self.native_evidence.launches[index].started = true; }
+                else { self.native_evidence.launches[index].ready = true; }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     fn emit_persistent_install_receipt(&mut self, kind: &'static str, receipt: serde_json::Value) -> Result<()> {
         self.log(0, 0, 0, kind, serde_json::to_string(&receipt)?);
@@ -1304,6 +1443,10 @@ impl Session {
                 self.reset_input()?;
                 bail!("DESKTOP_THREAD_SPAWN: {e}");
             }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(input) = self.native_evidence.pending.as_ref().filter(|input| input.down && input.target == Some(app)) {
+            self.native_evidence.launches.push(NativeLaunchEvidence { record, down: input.sequence, started: false, ready: false });
         }
         self.log(app, window.0, generation, "launch", String::new());
         self.changed();
@@ -1794,6 +1937,8 @@ impl Session {
                 self.finish_update_startup(&expected, &evidence)?;
             }
         }
+        #[cfg(target_os = "linux")]
+        self.emit_native_launches()?;
         Ok(())
     }
     #[cfg(target_os = "linux")]
@@ -1926,6 +2071,8 @@ impl Session {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        self.emit_native_launches()?;
         self.write_state(false)?;
         Ok(())
     }
@@ -1957,22 +2104,7 @@ impl Session {
         self.state_error = Some(format!("{error:#}").chars().take(2048).collect());
         let _ = self.write_state(true);
     }
-    fn write_state(&mut self, force: bool) -> Result<()> {
-        use std::io::Write;
-        let Some(path) = self.options.state_file.clone() else {
-            return Ok(());
-        };
-        if !force
-            && self
-                .state_last_write
-                .is_some_and(|at| at.elapsed() < Duration::from_millis(100))
-        {
-            return Ok(());
-        }
-        let revision = self
-            .state_revision
-            .checked_add(1)
-            .context("DESKTOP_STATE_REVISION")?;
+    fn state_snapshot(&self, revision: u64) -> serde_json::Value {
         let phase = if self.state_error.is_some() {
             "failed"
         } else if self.closing.is_some() {
@@ -2012,7 +2144,25 @@ impl Session {
             value["storagePromptPresentedSequence"] = serde_json::json!(prompt_presented_sequence);
             value
         });
-        let state = serde_json::json!({"schemaVersion":1,"bootId":self.state_boot,"sessionId":self.state_session,"revision":revision,"phase":phase,"root":root,"apps":apps,"error":self.state_error});
+        serde_json::json!({"schemaVersion":1,"bootId":self.state_boot,"sessionId":self.state_session,"revision":revision,"phase":phase,"root":root,"apps":apps,"error":self.state_error})
+    }
+    fn write_state(&mut self, force: bool) -> Result<()> {
+        use std::io::Write;
+        let Some(path) = self.options.state_file.clone() else {
+            return Ok(());
+        };
+        if !force
+            && self
+                .state_last_write
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(100))
+        {
+            return Ok(());
+        }
+        let revision = self
+            .state_revision
+            .checked_add(1)
+            .context("DESKTOP_STATE_REVISION")?;
+        let state = self.state_snapshot(revision);
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -2483,6 +2633,145 @@ mod input_backpressure_tests {
         options.install_registry = Some(opened.registry);
         let session = Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap();
         (temp, session, manifest)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_receipts_pair_real_edges_and_capture_full_history() {
+        let (temp, mut session, _) = persistent_install_session();
+        session.options.state_file = Some(temp.path().join("state.json"));
+        session.options.persistent_install_receipts = true;
+        session.begin_native_input(true, Some((17, 23))).unwrap();
+        session.end_native_input().unwrap();
+        session.begin_native_input(false, Some((17, 23))).unwrap();
+        session.end_native_input().unwrap();
+        let events = &session.test_native_receipts;
+        assert_eq!(events.len(), 2);
+        let down = &events[0]["receipt"];
+        let up = &events[1]["receipt"];
+        assert_eq!(down["sequence"], 1);
+        assert_eq!(down["pressSequence"], 1);
+        assert_eq!(up["sequence"], 2);
+        assert_eq!(up["pressSequence"], 1);
+        assert_eq!(down["before"]["history"], serde_json::json!([]));
+        assert_eq!(down["before"]["state"]["revision"], 1);
+        assert_eq!(down["after"]["state"]["revision"], 2);
+        assert!(down["after"]["state"]["revision"].as_u64().unwrap() <= up["before"]["state"]["revision"].as_u64().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_receipts_fail_closed_for_drops_and_unpaired_edges() {
+        for trace_drop in [false, true] {
+            let (temp, mut session, _) = persistent_install_session();
+            session.options.state_file = Some(temp.path().join("state.json"));
+            session.options.persistent_install_receipts = true;
+            if trace_drop { session.dropped_trace = 1; } else { session.dropped_inputs = 1; }
+            assert!(session.begin_native_input(true, Some((1, 2))).is_err());
+            assert!(session.persistent_install_blocked);
+            assert!(session.launch(1).is_err());
+        }
+        let (temp, mut session, _) = persistent_install_session();
+        session.options.state_file = Some(temp.path().join("state.json"));
+        session.options.persistent_install_receipts = true;
+        assert!(session.begin_native_input(false, Some((1, 2))).is_err());
+        assert!(session.persistent_install_blocked);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_ready_receipt_requires_actual_scene_acceptance_and_emits_once() {
+        // Synthetic parent fixture tests the presentation boundary; it is not
+        // worker or VM qualification. Native route/PID is tested separately.
+        let (temp, mut session, _) = persistent_install_session();
+        session.options.state_file = Some(temp.path().join("state.json"));
+        session.options.persistent_install_receipts = true;
+        let (mut fixture, _, _keepalive) = super::close_grace_tests::closing_session(crate::desktop_catalog::IsolationMode::Off);
+        session.records = std::mem::take(&mut fixture.records);
+        session.instances = std::mem::take(&mut fixture.instances);
+        let window = session.scene.model_mut().open(1).unwrap().0;
+        session.instances[0].window = Some(window);
+        session.instances[0].closing = None;
+        session.instances[0].pid.store(42, Ordering::SeqCst);
+        session.records[0].window = window.0;
+        session.records[0].status = "starting";
+        session.native_evidence.launches.push(NativeLaunchEvidence { record:0, down:1, started:false, ready:false });
+        let content = session.scene.model().view(window).unwrap().outer.content();
+        session.instances[0].bridge.publish(RenderedFrame { width:content.width as usize, height:content.height as usize,
+            pixels:crate::graphics::FramePixels::Cpu(Arc::new(vec![0; content.width as usize * content.height as usize])),
+            sequence:1, render_us:0, text_prepare_us:None, gpu_timing:None, commands:0 });
+        session.poll().unwrap();
+        assert_eq!(session.test_native_receipts.len(), 1);
+        assert_eq!(session.test_native_receipts[0]["receipt"]["phase"], "worker-started");
+        assert!(session.records[0].first_ready_ms.is_none());
+        let frame = session.compose().unwrap();
+        // Composition alone cannot attest input readiness.
+        assert_eq!(session.test_native_receipts.len(), 1);
+        session.accepted(frame.sequence, false).unwrap();
+        assert_eq!(session.test_native_receipts.len(), 2);
+        let ready = &session.test_native_receipts[1]["receipt"];
+        assert_eq!(ready["phase"], "ready");
+        assert_eq!(ready["workerPid"], 42);
+        assert_eq!(ready["anchor"]["state"]["apps"][0]["inputReady"], true);
+        assert_eq!(ready["anchor"]["history"][0]["presentedSourceSequence"], 1);
+        session.emit_native_launches().unwrap();
+        assert_eq!(session.test_native_receipts.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_receipts_bound_sequences_and_bytes_without_affecting_ordinary_mode() {
+        let (temp, mut ordinary, _) = persistent_install_session();
+        // Ordinary persistent native sessions may use state files indefinitely.
+        ordinary.options.state_file = Some(temp.path().join("ordinary-state.json"));
+        for _ in 0..70 {
+            ordinary.begin_native_input(true, None).unwrap();
+            ordinary.end_native_input().unwrap();
+            ordinary.begin_native_input(false, None).unwrap();
+            ordinary.end_native_input().unwrap();
+        }
+        ordinary.dropped_inputs = 1;
+        ordinary.begin_native_input(false, None).unwrap();
+        ordinary.end_native_input().unwrap();
+        assert!(!ordinary.persistent_install_blocked);
+        assert!(ordinary.test_native_receipts.is_empty());
+        for oversized in [false, true] {
+            let (temp, mut session, _) = persistent_install_session();
+            session.options.state_file = Some(temp.path().join("state.json"));
+            session.options.persistent_install_receipts = true;
+            if oversized {
+                assert!(session.emit_native_receipt("native-input", serde_json::json!({"oversized":"x".repeat(262144)})).is_err());
+            } else {
+                session.native_evidence.sequence = 64;
+                assert!(session.begin_native_input(true, None).is_err());
+            }
+            assert!(session.persistent_install_blocked);
+            assert!(session.test_native_receipts.is_empty());
+        }
+        let (temp, mut session, _) = persistent_install_session();
+        session.options.state_file = Some(temp.path().join("state.json"));
+        session.options.persistent_install_receipts = true;
+        session.native_evidence.receipts = 128;
+        assert!(session.emit_native_receipt("native-input", serde_json::json!({})).is_err());
+        assert!(session.persistent_install_blocked);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installed_receipt_contains_committed_content_and_published_revision() {
+        let (temp, mut session, source) = persistent_install_session();
+        session.options.state_file = Some(temp.path().join("state.json"));
+        session.options.persistent_install_receipts = true;
+        session.begin_install(&source).unwrap();
+        present_install_confirmation(&mut session);
+        session.respond_storage_prompt(true).unwrap();
+        let event = session.test_native_receipts.iter().find(|e| e["kind"] == "persistent-install-installed").unwrap();
+        let committed = session.trace.iter().find(|e| e.kind == "persistent-install-commit").unwrap();
+        let commit: serde_json::Value = serde_json::from_str(&committed.detail).unwrap();
+        assert_eq!(event["receipt"]["content"], commit["content"]);
+        assert_eq!(event["receipt"]["stateRevision"], session.state_revision);
+        assert_eq!(session.catalog.apps.len(), 2);
+        assert!(session.records.is_empty());
     }
 
     #[cfg(target_os = "linux")]

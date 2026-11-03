@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "requireApps": [
+    1
+  ],
+  "steps": [
+    {
+      "name": "dock-launch-app2",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 680,
+          "y": 770
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "apps": [
+          {
+            "app": 2,
+            "generation": 1,
+            "state": "running"
+          }
+        ]
+      }
+    },
+    {
+      "name": "power-off-after-both-ready",
+      "requireApps": [
+        1,
+        2
+      ],
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 1250,
+          "y": 12
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "phase": "stopped"
+      }
+    }
+  ]
+}

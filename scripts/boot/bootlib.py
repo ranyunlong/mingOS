@@ -14,7 +14,8 @@ PERSISTENT_INSTALL_ROOT = "/data/mingos/install-root"
 PERSISTENT_INSTALL_CATALOG = PERSISTENT_INSTALL_ROOT + "/catalog.json"
 PERSISTENT_INSTALL_PROFILE = "persistent-install-pointer-ready-v1"
 PERSISTENT_INSTALL_ARGS = ["--duration-ms", "0", "--isolation", "strict", "--data-root", "/data/mingos",
-                           "--state-file", "/run/evidence/desktop-state.json"]
+                           "--state-file", "/run/evidence/desktop-state.json",
+                           "--qualification-receipts", PERSISTENT_INSTALL_PROFILE]
 PERSISTENT_INSTALL_FIXTURE = {
     "helper": "/opt/mingos/prepare-persistent-install-fixture",
     "installRoot": PERSISTENT_INSTALL_ROOT,

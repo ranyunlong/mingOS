@@ -1,0 +1,26 @@
+{
+  "screen": {
+    "width": 1280,
+    "height": 800
+  },
+  "catalogCount": 2,
+  "app2Index": 1,
+  "app2Cell": {
+    "x": 644,
+    "y": 736,
+    "width": 64,
+    "height": 64
+  },
+  "dockPoint": {
+    "x": 680,
+    "y": 770
+  },
+  "excludedControlsY": [
+    740,
+    756
+  ],
+  "trigger": "ordinary Dock down invokes DesktopAction::Launch; paired up does not activate installation",
+  "source": "crates/ming-app-host/src/graphics/desktop_shell.rs",
+  "sourceSha256": "f956e468bab8c5d964a4eac95df8227b9026511c75586af7d9298292dcb8d102",
+  "runtimeNativeRouteTestPending": true
+}

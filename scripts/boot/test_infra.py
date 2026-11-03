@@ -8,6 +8,131 @@ from pathlib import Path
 from infra import contained, regular_file, validate_state, state_ready, state_input_ready, input_events, classify_guest, validate_cold_pair, InputPlan
 
 class InfraTests(unittest.TestCase):
+    def test_persistent_desktop_stream_preserves_raw_byte_offsets_across_chunks(self):
+        import guest
+        record = {'kind': 'persistent-install-commit', 'bootId': 'boot-one',
+                  'sessionId': 'session-one', 'desktopPid': 42, 'receipt': {'packageId': 'dev.ming.install-demo'}}
+        line = b'MING_PERSISTENT_INSTALL ' + json.dumps(record).encode() + b'\n'
+        raw = 'noise: 汉字\n'.encode() + line + b'ordinary trailing diagnostics'
+        for boundary in range(len(raw) + 1):
+            parser = guest.PersistentDesktopReceipts('boot-one', 42)
+            rows = parser.feed(raw[:boundary]) + parser.feed(raw[boundary:])
+            parser.finish()
+            self.assertEqual(rows, [{'logStartOffset': len('noise: 汉字\n'.encode()),
+                                    'logEndOffset': len('noise: 汉字\n'.encode()) + len(line), 'record': record}])
+            parser.bind_state(self.state() | {'bootId': 'boot-one', 'sessionId': 'session-one'})
+
+    def test_persistent_desktop_stream_rejects_truncated_duplicate_and_wrong_identity(self):
+        import guest
+        record = {'kind': 'persistent-install-commit', 'bootId': 'boot-one',
+                  'sessionId': 'session-one', 'desktopPid': 42, 'receipt': {}}
+        prefix = b'MING_PERSISTENT_INSTALL '
+        for name, raw in [('truncated', prefix + json.dumps(record).encode()),
+                          ('truncated-prefix', prefix[:-1]),
+                          ('duplicate-json-key', prefix + b'{"kind":"x","kind":"x"}\n'),
+                          ('oversize', prefix + b' ' * 262144),
+                          ('ordinary-oversize', b'x' * 65537)]:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                parser = guest.PersistentDesktopReceipts('boot-one', 42)
+                parser.feed(raw); parser.finish()
+        for field, value in [('bootId', 'old'), ('desktopPid', 41), ('desktopPid', True),
+                             ('sessionId', ''), ('receipt', []), ('extra', True)]:
+            changed = dict(record, **{field: value})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                guest.PersistentDesktopReceipts('boot-one', 42).feed(prefix + json.dumps(changed).encode() + b'\n')
+        parser = guest.PersistentDesktopReceipts('boot-one', 42)
+        parser.feed(prefix + json.dumps(record).encode() + b'\n')
+        with self.assertRaises(ValueError): parser.bind_state(self.state())
+
+    def persistent_desktop_records(self, boot_number=1):
+        def anchor(revision, phase):
+            state = self.state() | {'bootId': 'boot-one', 'sessionId': 'session-one', 'revision': revision}
+            history = []
+            if phase:
+                state['apps'].append({'app': 2, 'generation': 1, 'window': 2, 'workerPid': 21 if phase > 1 else 0,
+                                      'state': 'ready' if phase == 3 else 'starting', 'sourceSequence': int(phase == 3),
+                                      'presentedSourceSequence': int(phase == 3), 'inputReady': phase == 3})
+                history.append({'app': 2, 'generation': 1, 'window': 2, 'title': 'Install Demo',
+                                'workerPid': 21 if phase > 1 else 0, 'status': 'running', 'completed': False,
+                                'firstFrameMs': None, 'firstReadyMs': 1 if phase == 3 else None,
+                                'framesSubmitted': None, 'lastSourceSequence': int(phase == 3),
+                                'presentedSourceSequence': int(phase == 3), 'presentedViewport': None,
+                                'packageId': 'dev.ming.install-demo', 'requests': None, 'inputCounts': None,
+                                'events': None, 'gpuStats': None, 'error': None})
+            return {'state': state, 'history': history, 'traceCount': 1, 'droppedTrace': 0, 'droppedInputs': 0}
+        def wrap(kind, receipt):
+            return {'kind': kind, 'bootId': 'boot-one', 'sessionId': 'session-one', 'desktopPid': 42, 'receipt': receipt}
+        records = []
+        if boot_number == 1:
+            records += [wrap('persistent-install-commit', {}), wrap('persistent-install-installed', {
+                'schemaVersion': 1, 'registryRoot': '/data/mingos/install-root',
+                'catalogPath': '/data/mingos/install-root/catalog.json', 'stateRevision': 1,
+                'content': self.persistent_helper_receipt()['content']})]
+        records += [wrap('native-input', {'schemaVersion': 1, 'sequence': 1, 'pressSequence': 1,
+                    'edge': 'down', 'x': 683, 'y': 744, 'action': 'launch', 'targetApp': 2,
+                    'before': anchor(2, 0), 'after': anchor(3, 1), 'trace': [
+                        {'atMs': 1, 'app': 2, 'generation': 1, 'window': 2, 'kind': 'launch', 'detail': ''}]}),
+                    wrap('native-launch', {'schemaVersion': 1, 'downSequence': 1, 'phase': 'worker-started',
+                        'app': 2, 'generation': 1, 'window': 2, 'workerPid': 21, 'anchor': anchor(4, 2)}),
+                    wrap('native-input', {'schemaVersion': 1, 'sequence': 2, 'pressSequence': 1,
+                        'edge': 'up', 'x': 683, 'y': 744, 'action': 'other', 'targetApp': None,
+                        'before': anchor(5, 2), 'after': anchor(6, 2), 'trace': []}),
+                    wrap('native-launch', {'schemaVersion': 1, 'downSequence': 1, 'phase': 'ready',
+                        'app': 2, 'generation': 1, 'window': 2, 'workerPid': 21, 'anchor': anchor(7, 3)})]
+        return records
+
+    def test_persistent_desktop_complete_requires_install_and_native_first_launch_chain(self):
+        import guest
+        prefix = b'MING_PERSISTENT_INSTALL '
+        for boot_number in (1, 2):
+            parser = guest.PersistentDesktopReceipts('boot-one', 42)
+            records = self.persistent_desktop_records(boot_number)
+            for record in records: parser.feed(prefix + json.dumps(record).encode() + b'\n')
+            parser.finish(); parser.complete(boot_number)
+        records = self.persistent_desktop_records()
+        changes = [('missing-installed', lambda r: r.pop(1)),
+                   ('missing-ready', lambda r: r.pop()),
+                   ('missing-up', lambda r: r.pop(4)),
+                   ('installed-before-commit', lambda r: r.insert(0, r.pop(1))),
+                   ('ready-before-worker', lambda r: r.insert(3, r.pop())),
+                   ('duplicate-down', lambda r: r.insert(3, copy.deepcopy(r[2]))),
+                   ('wrong-generation', lambda r: r[3]['receipt'].update(generation=2)),
+                   ('wrong-anchor-boot', lambda r: r[2]['receipt']['before']['state'].update(bootId='old')),
+                   ('prior-app2-history', lambda r: r[2]['receipt']['before']['history'].append(
+                       copy.deepcopy(r[2]['receipt']['after']['history'][0]))),
+                   ('missing-before', lambda r: r[2]['receipt'].pop('before')),
+                   ('wrong-installed-content', lambda r: r[1]['receipt']['content'].update(catalogSha256='f' * 64)),
+                   ('dropped-trace', lambda r: r[2]['receipt']['before'].update(droppedTrace=1))]
+        for name, change in changes:
+            changed = copy.deepcopy(records); change(changed)
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                parser = guest.PersistentDesktopReceipts('boot-one', 42)
+                for record in changed: parser.feed(prefix + json.dumps(record).encode() + b'\n')
+                parser.finish(); parser.complete(1)
+        with self.assertRaises(ValueError):
+            parser = guest.PersistentDesktopReceipts('boot-one', 42)
+            for record in records: parser.feed(prefix + json.dumps(record).encode() + b'\n')
+            parser.complete(2)
+
+    def test_persistent_desktop_stream_relays_large_installed_content_in_bounded_reads(self):
+        import guest
+        records = self.persistent_desktop_records()[:2]
+        content = records[1]['receipt']['content']
+        for number in range(124):
+            directory = 'packages/' + (b'h' * 256).hex() + '/2.0.' + str(number) + '-' + 'a' * 64
+            content['files'] += [{'path': directory + '/' + name, 'sha256': 'a' * 64}
+                                 for name in ('app.json', 'main.wasm')]
+        content['files'].sort(key=lambda row: row['path'])
+        lines = [b'MING_PERSISTENT_INSTALL ' + json.dumps(record).encode() + b'\n' for record in records]
+        self.assertGreater(len(lines[1]), 65536)
+        raw = b''.join(lines)
+        parser = guest.PersistentDesktopReceipts('boot-one', 42)
+        rows = []
+        for offset in range(0, len(raw), 65536): rows += parser.feed(raw[offset:offset+65536])
+        parser.finish()
+        self.assertEqual(rows[1], {'logStartOffset': len(lines[0]), 'logEndOffset': len(raw), 'record': records[1]})
+        self.assertEqual(parser.installed_content, content)
+
     def persistent_helper_receipt(self, initialize=False):
         apps = [{'app': 1, 'packageId': 'dev.ming.text-entry-demo', 'version': '0.1.0', 'fingerprint': 'a' * 64,
                  'manifestPath': 'packages/initial/app.json', 'manifestSha256': 'b' * 64,
@@ -155,7 +280,8 @@ class InfraTests(unittest.TestCase):
                 'catalogPath': '/data/mingos/install-root/catalog.json',
                 'catalogSha256': '9' * 64,
                 'extraArgs': ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
-                              '--state-file', '/run/evidence/desktop-state.json'],
+                              '--state-file', '/run/evidence/desktop-state.json',
+                              '--qualification-receipts', 'persistent-install-pointer-ready-v1'],
                 'installSource': '/opt/mingos/install-source/app.json',
                 'persistentInstallFixture': {
                     'helper': '/opt/mingos/prepare-persistent-install-fixture',
@@ -206,9 +332,25 @@ class InfraTests(unittest.TestCase):
         self.assertEqual(second_argv[-2:], ['--persistent-install-state', '/data/mingos/install-root'])
         self.assertNotIn('--events', second_argv); self.assertNotIn('--install-root', second_argv)
         self.assertNotIn('--install-source', second_argv)
+        self.assertEqual(second_argv.count('--qualification-receipts'), 1)
+        self.assertEqual(second_argv[second_argv.index('--qualification-receipts') + 1], 'persistent-install-pointer-ready-v1')
         for field in ('installFixture', 'updateFixture', 'installEvents', 'installRoot'):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 guest.desktop_argv(dict(session, **{field: {}}), second)
+
+    def test_persistent_guest_requires_qualification_flag_without_changing_ordinary_argv(self):
+        import guest
+        session = self.persistent_session()
+        context = {'bootNumber': 2, 'role': 'open-existing'}
+        for extra in (session['extraArgs'][:-2], session['extraArgs'][:-1] + ['wrong-profile'],
+                      session['extraArgs'] + ['--qualification-receipts', 'persistent-install-pointer-ready-v1']):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                guest.desktop_argv(dict(session, extraArgs=extra), context)
+            with self.subTest(extra=extra, operation='helper'), self.assertRaises(ValueError):
+                guest.persistent_helper_argv(dict(session, extraArgs=extra), context, 'pre-desktop')
+        ordinary = {'profile': 'data-text', 'extraArgs': ['--duration-ms', '0', '--state-file', '/run/evidence/desktop-state.json']}
+        self.assertEqual(guest.desktop_argv(ordinary), ['/opt/mingos/ming-app-host', 'desktop', '/opt/mingos/catalog.json',
+                         '--renderer', 'cpu', '--duration-ms', '0', '--state-file', '/run/evidence/desktop-state.json'])
 
     def test_paths_reject_escape_and_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:

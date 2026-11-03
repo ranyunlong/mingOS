@@ -26,7 +26,8 @@ class ProfileTests(unittest.TestCase):
         review = {'reviewed': True, 'reviewer': 'synthetic test only', 'profile': 'persistent-install',
                   'sessionMode': 'long-lived', 'budgetEvidence': 'no VM or production review',
                   'extraArgs': ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
-                                '--state-file', '/run/evidence/desktop-state.json'],
+                                '--state-file', '/run/evidence/desktop-state.json',
+                                '--qualification-receipts', 'persistent-install-pointer-ready-v1'],
                   'persistentInstallState': '/data/mingos/install-root',
                   'catalogPath': '/data/mingos/install-root/catalog.json',
                   'installSource': '/opt/mingos/install-source/app.json',
@@ -53,6 +54,16 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(verify_payload(root, review), catalog)
             self.assertFalse((root / 'install-root').exists())
             self.assertFalse((root / 'install-events.json').exists())
+
+    def test_persistent_install_requires_explicit_exact_qualification_receipts(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); catalog, review = self.persistent_fixture(root)
+            self.assertEqual(verify_payload(root, review), catalog)
+            for extra in (review['extraArgs'][:-2], review['extraArgs'][:-1] + ['wrong-profile'],
+                          review['extraArgs'] + ['--qualification-receipts', 'persistent-install-pointer-ready-v1'],
+                          review['extraArgs'][:-2] + ['--qualification-receipts=persistent-install-pointer-ready-v1']):
+                with self.subTest(extra=extra), self.assertRaises(ValueError):
+                    verify_payload(root, dict(review, extraArgs=extra))
 
     def test_persistent_install_rejects_legacy_roots_inputs_and_mutable_fixture(self):
         with tempfile.TemporaryDirectory() as work:

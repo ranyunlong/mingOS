@@ -1,7 +1,7 @@
 """Closed, main-reviewed payload profiles. No build or guest execution on import."""
 import json
 from pathlib import Path
-from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_INSTALL_FIXTURE, PERSISTENT_INSTALL_PROFILE, PERSISTENT_UPDATE_INSTALL_ROOT, checked_path, persistent_input_hashes, sha256
+from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_INSTALL_ARGS, PERSISTENT_INSTALL_FIXTURE, PERSISTENT_INSTALL_PROFILE, PERSISTENT_UPDATE_INSTALL_ROOT, checked_path, persistent_input_hashes, sha256
 from wayland_receipt import POINTER_SYNC_POLICY
 
 DATA_TEXT_ARGS = ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
@@ -169,8 +169,8 @@ def verify_install_lifecycle(payload, review, catalog):
 
 def verify_persistent_install(payload, review, catalog):
     """Freeze the initialization inputs; the second boot must only reopen disk state."""
-    require(review.get('sessionMode') == 'long-lived' and review.get('extraArgs') == DATA_TEXT_ARGS,
-            'exact reviewed strict/data/state session required')
+    require(review.get('sessionMode') == 'long-lived' and review.get('extraArgs') == PERSISTENT_INSTALL_ARGS,
+            'exact reviewed strict/data/state/qualification session required')
     require(catalog == {'schemaVersion': 3, 'apps': [
         {'id': 1, 'title': 'Text Lab', 'packageId': 'dev.ming.text-entry-demo'}], 'autostart': [1]}
         and type(catalog['schemaVersion']) is int and type(catalog['apps'][0]['id']) is int

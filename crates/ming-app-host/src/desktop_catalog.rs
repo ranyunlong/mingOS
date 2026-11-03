@@ -446,6 +446,7 @@ pub struct DesktopOptions {
     pub(crate) app_data: DesktopDataConfig,
     pub install_root: Option<PathBuf>,
     pub persistent_install_root: Option<PathBuf>,
+    pub persistent_install_receipts: bool,
     /// A trusted parent-selected package source for the native install Dock
     /// action. Guest applications cannot modify this value.
     pub install_source: Option<PathBuf>,
@@ -495,6 +496,7 @@ impl DesktopOptions {
             app_data: DesktopDataConfig::default(),
             install_root: None,
             persistent_install_root: None,
+            persistent_install_receipts: false,
             install_source: None,
             #[cfg(target_os = "linux")]
             install_registry: None,
@@ -536,6 +538,10 @@ impl DesktopOptions {
                     { bail!("DESKTOP_PERSISTENT_ROOT"); }
                     result.persistent_install_root = Some(root);
                 }
+                "--qualification-receipts" => {
+                    if text != "persistent-install-pointer-ready-v1" { bail!("DESKTOP_QUALIFICATION_RECEIPTS"); }
+                    result.persistent_install_receipts = true;
+                }
                 "--install-source" => {
                     let source = PathBuf::from(value);
                     if !source.is_absolute() || source.as_os_str().len() > 4096 {
@@ -576,6 +582,10 @@ impl DesktopOptions {
                 }
                 _ => bail!("DESKTOP_UNKNOWN_OPTION: {flag}"),
             }
+        }
+        if result.persistent_install_receipts && (result.persistent_install_root.is_none()
+            || result.offscreen || result.state_file.is_none()) {
+            bail!("DESKTOP_QUALIFICATION_RECEIPTS_REQUIRES_PERSISTENT_NATIVE_STATE");
         }
         if let Some(root) = &result.persistent_install_root {
             let resolved_root = match fs::canonicalize(root) {

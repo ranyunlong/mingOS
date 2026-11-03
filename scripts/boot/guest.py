@@ -11,15 +11,154 @@ import time
 import traceback
 from pathlib import Path, PurePosixPath
 from bootlib import PERSISTENT_INSTALL_CATALOG, PERSISTENT_INSTALL_ROOT, persistent_boot_role, persistent_session_contract, strict_json
-from infra import STATE_PATH, validate_fault_injection, validate_state
+from infra import STATE_PATH, integer, state_ready, validate_fault_injection, validate_state
 from guest_platform import Platform
 from bounded_log import BoundedLog, LogLimitExceeded
-from wayland_receipt import PointerReceipt
+from wayland_receipt import PERSISTENT_INSTALL_PREFIX, PointerReceipt, check_line_size
 from worker_resources import process_table
 
 LOG = Path("/run/evidence")
 channel = None
 log_offsets = {}
+
+class PersistentDesktopReceipts:
+    """Relay bounded producer records without losing their raw stderr positions."""
+    def __init__(self, boot_id, desktop_pid):
+        self.boot_id, self.desktop_pid = boot_id, desktop_pid
+        self.session_id = None
+        self.buffer = b''
+        self.offset = self.count = 0
+        self.native_sequence = self.native_revision = self.launch_revision = self.commits = 0
+        self.press = self.app2_down = self.installed_content = None
+        self.launches = {}
+
+    @staticmethod
+    def fields(value, fields):
+        if not isinstance(value, dict) or set(value) != set(fields):
+            raise ValueError('persistent desktop receipt fields mismatch')
+
+    def anchor(self, anchor):
+        self.fields(anchor, ('state', 'history', 'traceCount', 'droppedTrace', 'droppedInputs'))
+        validate_state(anchor['state'], self.boot_id, self.session_id)
+        if (not isinstance(anchor['history'], list) or len(anchor['history']) > 128
+                or any(not isinstance(row, dict) or not integer(row.get('app'), 1, 65535) for row in anchor['history'])
+                or not integer(anchor['traceCount'], 0, 512)
+                or type(anchor['droppedTrace']) is not int or anchor['droppedTrace'] != 0
+                or type(anchor['droppedInputs']) is not int or anchor['droppedInputs'] != 0):
+            raise ValueError('invalid persistent native anchor')
+        return anchor['state']
+
+    def validate_record(self, record):
+        kind, receipt = record['kind'], record['receipt']
+        if kind == 'persistent-install-commit':
+            if self.commits or self.installed_content is not None or self.app2_down is not None:
+                raise ValueError('duplicate/out-of-order persistent commit')
+            self.commits += 1
+        elif kind == 'persistent-install-installed':
+            self.fields(receipt, ('schemaVersion', 'registryRoot', 'catalogPath', 'stateRevision', 'content'))
+            if (type(receipt['schemaVersion']) is not int or receipt['schemaVersion'] != 1
+                    or receipt['registryRoot'] != PERSISTENT_INSTALL_ROOT or receipt['catalogPath'] != PERSISTENT_INSTALL_CATALOG
+                    or not integer(receipt['stateRevision'], 1) or self.commits != 1
+                    or self.installed_content is not None or self.app2_down is not None):
+                raise ValueError('invalid/out-of-order installed snapshot')
+            self.installed_content = persistent_content(receipt['content'], False)
+        elif kind == 'native-input':
+            self.fields(receipt, ('schemaVersion', 'sequence', 'pressSequence', 'edge', 'x', 'y', 'action',
+                                  'targetApp', 'before', 'after', 'trace'))
+            if (type(receipt['schemaVersion']) is not int or receipt['schemaVersion'] != 1
+                    or not integer(receipt['sequence'], 1, 64) or receipt['sequence'] != self.native_sequence + 1
+                    or not integer(receipt['pressSequence'], 1, 64) or receipt['edge'] not in ('down', 'up')
+                    or any(value is not None and not integer(value, -(2**31), 2**31-1) for value in (receipt['x'], receipt['y']))
+                    or ((receipt['x'] is None) != (receipt['y'] is None))
+                    or receipt['action'] not in ('launch', 'other')
+                    or not isinstance(receipt['trace'], list) or len(receipt['trace']) > 512
+                    or any(not isinstance(row, dict) for row in receipt['trace'])):
+                raise ValueError('invalid native input sequence/schema')
+            down = receipt['edge'] == 'down'
+            if ((down and (self.press is not None or receipt['pressSequence'] != receipt['sequence']))
+                    or (not down and (self.press is None or receipt['pressSequence'] != self.press))
+                    or (receipt['action'] == 'launch' and (not down or not integer(receipt['targetApp'], 1, 65535)))
+                    or (receipt['action'] == 'other' and receipt['targetApp'] is not None)):
+                raise ValueError('native input press/action mismatch')
+            before, after = self.anchor(receipt['before']), self.anchor(receipt['after'])
+            if before['revision'] < max(self.native_revision, self.launch_revision) or after['revision'] <= before['revision']:
+                raise ValueError('native state revision order')
+            if self.app2_down is None and any(row.get('app') == 2 for row in before['apps'] + receipt['before']['history']):
+                raise ValueError('app2 existed before native Dock launch')
+            if receipt['action'] == 'launch' and receipt['targetApp'] == 2:
+                if self.app2_down is not None: raise ValueError('duplicate app2 Dock launch')
+                self.app2_down = receipt['sequence']
+            self.native_sequence, self.native_revision = receipt['sequence'], after['revision']
+            self.press = receipt['sequence'] if down else None
+        elif kind == 'native-launch':
+            self.fields(receipt, ('schemaVersion', 'downSequence', 'phase', 'app', 'generation', 'window', 'workerPid', 'anchor'))
+            if (type(receipt['schemaVersion']) is not int or receipt['schemaVersion'] != 1
+                    or not integer(receipt['downSequence'], 1, 64) or receipt['downSequence'] != self.app2_down
+                    or type(receipt['app']) is not int or receipt['app'] != 2
+                    or type(receipt['generation']) is not int or receipt['generation'] != 1
+                    or not integer(receipt['window'], 1) or not integer(receipt['workerPid'], 2)
+                    or receipt['phase'] not in ('worker-started', 'ready')):
+                raise ValueError('native launch identity/cause mismatch')
+            state = self.anchor(receipt['anchor'])
+            if state['revision'] < self.native_revision or state['revision'] <= self.launch_revision:
+                raise ValueError('native launch anchor revision order')
+            identity = tuple(receipt[key] for key in ('app', 'generation', 'window', 'workerPid'))
+            previous = self.launches.get(receipt['downSequence'])
+            if ((receipt['phase'] == 'worker-started' and previous is not None)
+                    or (receipt['phase'] == 'ready' and previous != ('worker-started', identity))):
+                raise ValueError('native launch phase order/identity mismatch')
+            for rows in (state['apps'], receipt['anchor']['history']):
+                matches = [row for row in rows if row.get('app') == 2]
+                if len(matches) != 1 or tuple(matches[0].get(key) for key in ('app', 'generation', 'window', 'workerPid')) != identity:
+                    raise ValueError('native launch anchor identity mismatch')
+            if receipt['phase'] == 'ready' and not state_ready(state, [2]):
+                raise ValueError('native launch ready anchor is not ready')
+            self.launches[receipt['downSequence']] = (receipt['phase'], identity)
+            self.launch_revision = state['revision']
+        else:
+            raise ValueError('unexpected/failed persistent desktop receipt')
+
+    def bind_state(self, state):
+        validate_state(state, self.boot_id, self.session_id)
+        self.session_id = state['sessionId']
+
+    def feed(self, data):
+        self.buffer += data
+        rows = []
+        while b'\n' in self.buffer:
+            raw, self.buffer = self.buffer.split(b'\n', 1)
+            persistent = check_line_size(raw)
+            start = self.offset
+            self.offset += len(raw) + 1
+            if not persistent: continue
+            record = parse_persistent_json(raw[len(PERSISTENT_INSTALL_PREFIX):])
+            if (not isinstance(record, dict) or set(record) != {'kind', 'bootId', 'sessionId', 'desktopPid', 'receipt'}
+                    or not isinstance(record['kind'], str) or not 1 <= len(record['kind']) <= 64
+                    or record['bootId'] != self.boot_id or type(record['desktopPid']) is not int
+                    or record['desktopPid'] != self.desktop_pid
+                    or not isinstance(record['sessionId'], str) or not record['sessionId']
+                    or (self.session_id is not None and record['sessionId'] != self.session_id)
+                    or not isinstance(record['receipt'], dict)):
+                raise ValueError('persistent desktop receipt schema/identity mismatch')
+            self.session_id = record['sessionId']
+            self.count += 1
+            if self.count > 128: raise ValueError('persistent desktop receipt count exceeds bound')
+            self.validate_record(record)
+            rows.append({'logStartOffset': start, 'logEndOffset': self.offset, 'record': record})
+        check_line_size(self.buffer)
+        return rows
+
+    def finish(self):
+        if self.buffer and (self.buffer.startswith(PERSISTENT_INSTALL_PREFIX) or PERSISTENT_INSTALL_PREFIX.startswith(self.buffer)):
+            raise ValueError('truncated persistent desktop receipt')
+
+    def complete(self, boot_number):
+        self.finish()
+        if (type(boot_number) is not int or boot_number not in (1, 2) or self.commits != int(boot_number == 1)
+                or (self.installed_content is not None) != (boot_number == 1)
+                or self.press is not None or self.app2_down is None
+                or self.launches.get(self.app2_down, (None,))[0] != 'ready'):
+            raise ValueError('missing/out-of-role persistent native/install evidence')
 
 def persistent_context(session, platform, command_line):
     persistent_session_contract(session)
@@ -80,7 +219,7 @@ def read_persistent_receipt(path):
     finally:
         os.close(fd)
 
-def persistent_snapshot(receipt, context, phase, session_id):
+def persistent_content(content, initialize):
     def exact(value, keys):
         if not isinstance(value, dict) or set(value) != set(keys): raise ValueError("persistent receipt schema mismatch")
     def digest(value):
@@ -89,21 +228,6 @@ def persistent_snapshot(receipt, context, phase, session_id):
         if (not isinstance(value, str) or not value or len(value) > 768 or "\\" in value or ":" in value or "\0" in value
                 or PurePosixPath(value).is_absolute() or any(part in ("", ".", "..") for part in value.split("/"))):
             raise ValueError("unsafe persistent relative content path")
-    exact(receipt, ("schemaVersion", "status", "actions", "content"))
-    if type(receipt["schemaVersion"]) is not int or receipt["schemaVersion"] != 1:
-        raise ValueError("unsupported persistent helper receipt version")
-    if phase not in ("pre-desktop", "post-desktop") or context.get("role") != persistent_boot_role(context.get("bootNumber")):
-        raise ValueError("invalid persistent snapshot phase/role")
-    if (phase == "pre-desktop" and session_id is not None) or (phase == "post-desktop" and (not isinstance(session_id, str) or not session_id)):
-        raise ValueError("persistent snapshot session mismatch")
-    initialize = context["bootNumber"] == 1 and phase == "pre-desktop"
-    if receipt["status"] != ("initialized-first" if initialize else "opened-existing"):
-        raise ValueError("persistent helper status mismatch")
-    actions = receipt["actions"]
-    exact(actions, ("initializedRoots", "packagesInstalled", "trustStoresProvisioned", "catalogsCreated", "sourcesCreated"))
-    if any(type(value) is not int or value != int(initialize) for value in actions.values()):
-        raise ValueError("persistent helper writes do not match role")
-    content = receipt["content"]
     exact(content, ("catalogSha256", "registrySha256", "trustSha256", "bootstrapSha256", "apps", "files"))
     for field in ("catalogSha256", "registrySha256", "trustSha256", "bootstrapSha256"): digest(content[field])
     apps, files = content["apps"], content["files"]
@@ -150,6 +274,26 @@ def persistent_snapshot(receipt, context, phase, session_id):
             bindings[path] = expected_hash
     if any(file_hashes.get(path) != expected_hash for path, expected_hash in bindings.items()):
         raise ValueError("persistent file hashes disagree with content identities")
+    return content
+
+def persistent_snapshot(receipt, context, phase, session_id):
+    def exact(value, keys):
+        if not isinstance(value, dict) or set(value) != set(keys): raise ValueError("persistent receipt schema mismatch")
+    exact(receipt, ("schemaVersion", "status", "actions", "content"))
+    if type(receipt["schemaVersion"]) is not int or receipt["schemaVersion"] != 1:
+        raise ValueError("unsupported persistent helper receipt version")
+    if phase not in ("pre-desktop", "post-desktop") or context.get("role") != persistent_boot_role(context.get("bootNumber")):
+        raise ValueError("invalid persistent snapshot phase/role")
+    if (phase == "pre-desktop" and session_id is not None) or (phase == "post-desktop" and (not isinstance(session_id, str) or not session_id)):
+        raise ValueError("persistent snapshot session mismatch")
+    initialize = context["bootNumber"] == 1 and phase == "pre-desktop"
+    if receipt["status"] != ("initialized-first" if initialize else "opened-existing"):
+        raise ValueError("persistent helper status mismatch")
+    actions = receipt["actions"]
+    exact(actions, ("initializedRoots", "packagesInstalled", "trustStoresProvisioned", "catalogsCreated", "sourcesCreated"))
+    if any(type(value) is not int or value != int(initialize) for value in actions.values()):
+        raise ValueError("persistent helper writes do not match role")
+    content = persistent_content(receipt['content'], initialize)
     envelope = dict(context, sessionId=session_id, phase=phase, status=receipt["status"], actions=actions)
     return {"envelope": envelope, "content": content}
 
@@ -228,7 +372,7 @@ def main():
     fault_config = fault_receipt = None
     fault_receipt_path = LOG / "fault-injection.json"
     ready_capture_deadline = None
-    pointer_parser = None
+    pointer_parser = persistent_parser = None
     def relay_state():
         nonlocal state, state_bytes
         path = Path(STATE_PATH)
@@ -240,6 +384,7 @@ def main():
             value = json.loads(raw)
             validate_state(value, platform.boot_id, state["sessionId"] if state else None, state["revision"] if state else None)
             if state and value["revision"] == state["revision"] and value != state: raise ValueError("same revision changed state")
+            if persistent_parser: persistent_parser.bind_state(value)
         except (ValueError, TypeError, KeyError) as error:
             emit("desktop-state-rejected", error=repr(error), rawBase64=base64.b64encode(raw).decode("ascii"))
             raise
@@ -254,6 +399,11 @@ def main():
             if not data: return
             try:
                 stderr_capture.append(data)
+                if persistent_parser:
+                    for row in persistent_parser.feed(data):
+                        record = row['record']
+                        emit("desktop-persistent-receipt", bootId=platform.boot_id, sessionId=record['sessionId'],
+                             desktopPid=desktop.pid, **row)
                 if pointer_parser:
                     for receipt in pointer_parser.feed(data):
                         emit("desktop-pointer-receipt", bootId=platform.boot_id, sessionId=state["sessionId"] if state else None, desktopPid=desktop.pid, receipt=receipt)
@@ -400,6 +550,9 @@ def main():
                 raise RuntimeError("reviewed install event hash mismatch")
             argv += ["--events", str(events)]
         desktop = launch(argv, "desktop", desktop_debug=True)
+        if persistent:
+            if stderr_capture is None: raise RuntimeError("persistent desktop requires captured diagnostic stderr")
+            persistent_parser = PersistentDesktopReceipts(platform.boot_id, desktop.pid)
         if fault_config:
             fault_injector = launch(["python3", "-B", "/etc/mingos/fault_injector.py", "--config",
                                      str(fault_config_path), "--state-file", STATE_PATH, "--receipt",
@@ -423,6 +576,7 @@ def main():
             if weston.poll() is not None: raise RuntimeError("Weston exited during desktop")
             time.sleep(0.1)
         drain_stderr()
+        if persistent_parser: persistent_parser.finish()
         desktop_code = desktop.returncode
         relay_state()
         emit("desktop-exit", code=desktop_code)
@@ -433,7 +587,10 @@ def main():
         if active: raise RuntimeError("Kotlin workers still active; resource probe forbidden")
         if persistent:
             if not state: raise RuntimeError("persistent desktop ended without session state")
+            persistent_parser.complete(persistent['bootNumber'])
             after = prepare_persistent_snapshot(session, persistent, "post-desktop", state["sessionId"])
+            if persistent_parser.installed_content is not None and after['content'] != persistent_parser.installed_content:
+                raise RuntimeError("persistent post-desktop content disagrees with installed snapshot")
             if persistent["bootNumber"] == 2 and after["content"] != persistent_before["content"]:
                 raise RuntimeError("persistent content changed during reopen-only second boot")
         stop(weston, "weston"); stop(seat, "seatd"); stop(observer, "input-observer")
