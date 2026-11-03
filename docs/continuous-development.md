@@ -201,3 +201,7 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 输入证据审计准备：为安装 profile 限定专用 pointer-ready qualification，保留原有 policy、诊断开关和资源限制的严格校验；Python boot 相关回归 `76/76` 通过。新增的原始握手证据审计以合成正反例验证 `17/17`，并拒绝历史失败记录；独立复核指出的慢 QMP 回复导致超时窗口误判已修正。审计器尚无真实成功 cold-pair 可验证，其通过不等于 QEMU 验收通过。
 
 2026-11-03 首次 INSTALL 输入被动诊断：在独立 bundle 和新数据盘上运行一次 15 秒诊断，不启用 pointer 握手。QMP 与 QEMU trace 记录 ABS、按下、释放，guest evdev 同样记录双沿；完整 Wayland 客户端日志显示首次 pointer 建立后仅收到释放，没有按下，所有状态均无安装提示。独立复核确认日志 offset 连续、客户端日志完整。证据支持首次 pointer 建立时序存在竞态，但不能定位 evdev 观察点之后的具体丢失位置。观察器在诊断窗口结束时被终止，此次不是安装验收。原始记录与摘要见 `artifacts/install-entry-passive-diagnostic-20261103-181513/`；下一步以现有 pointer-ready 握手执行完整双冷启动，`finalSystemAccepted=false`。
+
+2026-11-03 桌面安装入口 pointer-ready 双冷启动：使用新签名 fixture、新 bundle `c3d2b7191868c0f2eacb124f4091d57542d98d7f0368e65c886c6f630e89255e` 和新数据盘，连续运行两次 fresh QEMU。两轮均证明 mode 16 安装提示已呈现、确认输入经过 pointer-ready 握手、安装 catalog 提交后新应用启动和 ready、worker 回收、数据同步卸载及 kernel PowerDown；同盘 marker `1 -> 2`，boot/session 不同。冻结原始证据审计通过，并经独立复核重放；35 个源码文件运行前后哈希一致。完整证据见 `artifacts/install-entry-pointer-ready-20261103-qual1/`。
+
+该资格使用 TCG、虚拟图形/输入、Wayland 诊断和 pointer-ready 握手；新应用由预审脚本的 30 秒 ready 计时动作启动，实际 trace 显示安装提交先于启动，但该计时不是安装完成依赖。每轮 install-root 在 RAM 重新建立，不证明安装登记跨启动持久化。无仪表输入、物理显示/输入、Linux 硬件 GPU、多用户及完整日常系统验收仍待独立证明，`finalSystemAccepted=false`。
