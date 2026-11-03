@@ -447,6 +447,8 @@ pub struct DesktopOptions {
     pub install_root: Option<PathBuf>,
     pub persistent_install_root: Option<PathBuf>,
     pub persistent_install_receipts: bool,
+    pub persistent_uninstall_receipts: bool,
+    pub(crate) data_root_path: Option<PathBuf>,
     /// A trusted parent-selected package source for the native install Dock
     /// action. Guest applications cannot modify this value.
     pub install_source: Option<PathBuf>,
@@ -497,6 +499,8 @@ impl DesktopOptions {
             install_root: None,
             persistent_install_root: None,
             persistent_install_receipts: false,
+            persistent_uninstall_receipts: false,
+            data_root_path: None,
             install_source: None,
             #[cfg(target_os = "linux")]
             install_registry: None,
@@ -523,6 +527,7 @@ impl DesktopOptions {
             match flag {
                 "--data-root" => {
                     result.app_data.root = Some(crate::app_data::AppDataRoot::open(Path::new(&value)).context("DESKTOP_DATA_ROOT")?);
+                    result.data_root_path = Some(PathBuf::from(&value));
                     data_root_path = Some(PathBuf::from(value));
                 }
                 "--install-root" => {
@@ -539,8 +544,11 @@ impl DesktopOptions {
                     result.persistent_install_root = Some(root);
                 }
                 "--qualification-receipts" => {
-                    if text != "persistent-install-pointer-ready-v1" { bail!("DESKTOP_QUALIFICATION_RECEIPTS"); }
-                    result.persistent_install_receipts = true;
+                    match text {
+                        "persistent-install-pointer-ready-v1" => result.persistent_install_receipts = true,
+                        "persistent-uninstall-pointer-ready-v1" => result.persistent_uninstall_receipts = true,
+                        _ => bail!("DESKTOP_QUALIFICATION_RECEIPTS"),
+                    }
                 }
                 "--install-source" => {
                     let source = PathBuf::from(value);
@@ -583,7 +591,7 @@ impl DesktopOptions {
                 _ => bail!("DESKTOP_UNKNOWN_OPTION: {flag}"),
             }
         }
-        if result.persistent_install_receipts && (result.persistent_install_root.is_none()
+        if (result.persistent_install_receipts || result.persistent_uninstall_receipts) && (result.persistent_install_root.is_none()
             || result.offscreen || result.state_file.is_none()) {
             bail!("DESKTOP_QUALIFICATION_RECEIPTS_REQUIRES_PERSISTENT_NATIVE_STATE");
         }

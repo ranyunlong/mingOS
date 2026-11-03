@@ -145,6 +145,20 @@ struct Drag {
     anchor: (i32, i32),
     resize: bool,
 }
+#[cfg(target_os = "linux")]
+struct StoragePromptPress {
+    allow: bool,
+    presented: u64,
+    binding: serde_json::Value,
+}
+#[cfg(target_os = "linux")]
+struct UninstallDockPress {
+    app: u16,
+    presented: u64,
+    package_id: String,
+    package_fingerprint: [u8; 32],
+    manifest_path: std::path::PathBuf,
+}
 struct NativeDesktop {
     #[cfg(feature = "gpu")]
     presenter: Option<crate::graphics::GpuPresenter>,
@@ -159,11 +173,11 @@ struct NativeDesktop {
     mouse: Option<(i32, i32)>,
     left: bool,
     #[cfg(target_os = "linux")]
-    storage_press: Option<(bool, u64)>,
+    storage_press: Option<StoragePromptPress>,
     #[cfg(target_os = "linux")]
     storage_dock_press: Option<(u16, u64)>,
     #[cfg(target_os = "linux")]
-    uninstall_dock_press: Option<(u16, u64)>,
+    uninstall_dock_press: Option<UninstallDockPress>,
     #[cfg(target_os = "linux")]
     purge_dock_press: Option<(u16, u64)>,
     #[cfg(target_os = "linux")]
@@ -386,7 +400,9 @@ impl NativeDesktop {
         let session = self.session.as_mut().context("DESKTOP_SESSION")?;
         #[cfg(target_os = "linux")]
         if session.storage_prompt().is_some() {
-            self.storage_press = session.storage_prompt_target(x, y);
+            self.storage_press = session.storage_prompt_target(x, y)
+                .zip(session.storage_prompt_native_binding())
+                .map(|((allow, presented), binding)| StoragePromptPress { allow, presented, binding });
             self.drag = None;
             return Ok(());
         }
@@ -423,7 +439,13 @@ impl NativeDesktop {
                 }
                 #[cfg(target_os = "linux")]
                 if dock_uninstall_cell(session.options.width, session.options.height, index, apps.len()).contains(x, y) {
-                    self.uninstall_dock_press = Some((app.id, session.frames_presented));
+                    self.uninstall_dock_press = Some(UninstallDockPress {
+                        app: app.id,
+                        presented: session.frames_presented,
+                        package_id: app.package_id.clone(),
+                        package_fingerprint: app.package_fingerprint,
+                        manifest_path: app.manifest_path.clone(),
+                    });
                     return Ok(());
                 }
                 #[cfg(target_os = "linux")]
@@ -503,13 +525,18 @@ impl NativeDesktop {
     }
     #[cfg(target_os = "linux")]
     fn uninstall_dock_release(&mut self) -> Result<bool> {
-        let Some((id, presented)) = self.uninstall_dock_press.take() else { return Ok(false); };
+        let Some(pressed) = self.uninstall_dock_press.take() else { return Ok(false); };
+        let id = pressed.app;
         let session = self.session.as_mut().context("DESKTOP_SESSION")?;
-        if session.pointer_sink_ready() && session.frames_presented == presented && session.storage_prompt().is_none()
+        if session.pointer_sink_ready() && session.frames_presented == pressed.presented && session.storage_prompt().is_none()
             && let Some((x, y)) = self.mouse
             && let Some(index) = session.catalog.apps.iter().position(|app| app.id == id)
+            && session.catalog.apps[index].package_id == pressed.package_id
+            && session.catalog.apps[index].package_fingerprint == pressed.package_fingerprint
+            && session.catalog.apps[index].manifest_path == pressed.manifest_path
             && dock_uninstall_cell(session.options.width, session.options.height, index, session.catalog.apps.len()).contains(x, y) {
-            let _ = session.begin_uninstall(id);
+            let result = session.begin_uninstall_from_native(id);
+            if session.options.persistent_uninstall_receipts { result?; }
         }
         Ok(true)
     }
@@ -547,9 +574,10 @@ impl NativeDesktop {
         if !self.session.as_ref().is_some_and(|session| session.storage_prompt().is_some()) { return Ok(false); }
         let pressed = self.storage_press.take();
         let session = self.session.as_mut().context("DESKTOP_SESSION")?;
-        if let (Some((pressed, sequence)), Some((x, y))) = (pressed, self.mouse)
-            && session.storage_prompt_target(x, y) == Some((pressed, sequence)) {
-            session.respond_storage_prompt(pressed)?;
+        if let (Some(pressed), Some((x, y))) = (pressed, self.mouse)
+            && session.storage_prompt_target(x, y) == Some((pressed.allow, pressed.presented))
+            && session.storage_prompt_native_binding().as_ref() == Some(&pressed.binding) {
+            session.respond_storage_prompt_from_native(pressed.allow)?;
         }
         Ok(true)
     }
@@ -871,6 +899,303 @@ fn window_error(error: softbuffer::SoftBufferError) -> anyhow::Error {
 #[cfg(test)]
 mod input_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    fn uninstall_native_app(qualification: Option<&str>) -> (tempfile::TempDir, NativeDesktop, DesktopShell) {
+        uninstall_native_app_with_wasm(qualification, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn uninstall_native_app_with_wasm(qualification: Option<&str>, wasm: Option<Vec<u8>>) -> (tempfile::TempDir, NativeDesktop, DesktopShell) {
+        let (temp, opened, mut package) = crate::persistent_install::transaction_tests::fixture();
+        let seed_private = wasm.is_none();
+        if let Some(wasm) = wasm {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            use ed25519_dalek::{Signer, SigningKey};
+            package.bytes = wasm;
+            package.manifest.publisher_signature = None;
+            package.manifest.publisher_signature = Some(STANDARD.encode(SigningKey::from_bytes(&[7;32])
+                .sign(&package.signature_message("mingos-dev-2026").unwrap()).to_bytes()));
+        }
+        let committed = crate::persistent_install::install_new(&opened.registry, &package).unwrap();
+        let root = opened.registry.root_path().to_path_buf();
+        let mut args = vec![root.join("catalog.json").into_os_string(), "--renderer".into(), "cpu".into(),
+            "--state-file".into(), temp.path().join("state.json").into_os_string()];
+        if let Some(qualification) = qualification {
+            args.extend(["--persistent-install-state".into(), root.into_os_string(),
+                "--qualification-receipts".into(), qualification.into()]);
+            let data = temp.path().join("data");
+            std::fs::create_dir(&data).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if seed_private {
+                let authority = Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(
+                    crate::app_data::AppDataRoot::open(&data).unwrap()).unwrap());
+                let files = authority.default_private_session(&package.manifest.id, package.storage_fingerprint()).unwrap();
+                assert!(files.write_file("note.txt", b"alpha").unwrap().directory_synced);
+            }
+            args.extend(["--data-root".into(), data.into_os_string()]);
+        }
+        let mut options = DesktopOptions::parse(args).unwrap();
+        options.install_registry = Some(opened.registry);
+        let mut app = NativeDesktop::new(options, committed.catalog);
+        let (options, catalog) = app.pending.take().unwrap();
+        app.session = Some(Session::new(options, catalog, #[cfg(feature = "gpu")] None).unwrap());
+        let mut shell = DesktopShell::cpu();
+        present_native(&mut app, &mut shell);
+        (temp, app, shell)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn present_native(app: &mut NativeDesktop, shell: &mut DesktopShell) {
+        let session = app.session.as_mut().unwrap();
+        let frame = render(session, shell).unwrap();
+        session.accepted(frame.sequence, false).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_native_release_cannot_cross_a_catalog_identity_rebinding() {
+        for replacement in ["package-id", "fingerprint", "manifest-path"] {
+            let (_temp, mut app, _shell) = uninstall_native_app(None);
+            let control = dock_uninstall_cell(1280, 800, 1, 2);
+            app.mouse = Some((control.x + 1, control.y + 1));
+            app.mouse_button(true).unwrap();
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+            let entry = &mut app.session.as_mut().unwrap().catalog.apps[1];
+            match replacement {
+                "package-id" => entry.package_id = "dev.example.rebound".into(),
+                "fingerprint" => entry.package_fingerprint = [19; 32],
+                "manifest-path" => {
+                    let duplicate = entry.manifest_path.with_file_name("rebound.json");
+                    std::fs::copy(&entry.manifest_path, &duplicate).unwrap();
+                    entry.manifest_path = duplicate;
+                }
+                _ => unreachable!(),
+            }
+            app.mouse_button(false).unwrap();
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_none(), "stale release crossed {replacement} binding");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_native_requires_matching_down_up_on_the_presented_u_control() {
+        for invalid in ["up-only", "different-control", "different-frame", "unpresented-change"] {
+            let (_temp, mut app, mut shell) = uninstall_native_app(None);
+            let control = dock_uninstall_cell(1280, 800, 1, 2);
+            app.mouse = Some((control.x + 1, control.y + 1));
+            if invalid != "up-only" {
+                app.mouse_button(true).unwrap();
+                assert!(app.session.as_ref().unwrap().storage_prompt().is_none(), "down must not request uninstall");
+            }
+            match invalid {
+                "different-control" => {
+                    let other = dock_uninstall_cell(1280, 800, 0, 2);
+                    app.mouse = Some((other.x + 1, other.y + 1));
+                }
+                "different-frame" => present_native(&mut app, &mut shell),
+                "unpresented-change" => app.session.as_mut().unwrap().changed(),
+                _ => (),
+            }
+            app.mouse_button(false).unwrap();
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_none(), "invalid {invalid} requested uninstall");
+            assert_eq!(app.session.as_ref().unwrap().catalog.apps.len(), 2);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_native_two_app_controls_target_their_own_package_and_cancel() {
+        for index in 0..2 {
+            let (_temp, mut app, mut shell) = uninstall_native_app(None);
+            let expected = app.session.as_ref().unwrap().catalog.apps[index].package_id.clone();
+            let control = dock_uninstall_cell(1280, 800, index, 2);
+            app.mouse = Some((control.x + 1, control.y + 1));
+            app.mouse_button(true).unwrap();
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+            app.mouse_button(false).unwrap();
+            let prompt = app.session.as_ref().unwrap().storage_prompt().unwrap().state_value();
+            assert_eq!(prompt["packageId"], expected);
+            assert_eq!(app.session.as_ref().unwrap().catalog.apps.len(), 2);
+            present_native(&mut app, &mut shell);
+            let cancel = crate::graphics::desktop_shell::storage_prompt_geometry(1280, 800, false).unwrap().deny;
+            app.mouse = Some((cancel.x + 1, cancel.y + 1));
+            app.mouse_button(true).unwrap();
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_some(), "down must not confirm");
+            app.mouse_button(false).unwrap();
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+            app.mouse_button(false).unwrap();
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_none(), "duplicate up must not reopen a prompt");
+            assert_eq!(app.session.as_ref().unwrap().catalog.apps.len(), 2);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_native_confirmation_rejects_wrong_region_or_stale_frame() {
+        for invalid in ["up-only", "different-control", "different-frame"] {
+            let (_temp, mut app, mut shell) = uninstall_native_app(None);
+            let control = dock_uninstall_cell(1280, 800, 1, 2);
+            app.mouse = Some((control.x + 1, control.y + 1));
+            app.mouse_button(true).unwrap();
+            app.mouse_button(false).unwrap();
+            present_native(&mut app, &mut shell);
+            let geometry = crate::graphics::desktop_shell::storage_prompt_geometry(1280, 800, false).unwrap();
+            let allow = geometry.allow.unwrap();
+            app.mouse = Some((allow.x + 1, allow.y + 1));
+            if invalid != "up-only" { app.mouse_button(true).unwrap(); }
+            match invalid {
+                "different-control" => app.mouse = Some((geometry.deny.x + 1, geometry.deny.y + 1)),
+                "different-frame" => {
+                    app.session.as_mut().unwrap().changed();
+                    present_native(&mut app, &mut shell);
+                }
+                _ => (),
+            }
+            app.mouse_button(false).unwrap();
+            assert!(app.session.as_ref().unwrap().storage_prompt().is_some(), "invalid {invalid} authorized a response");
+            assert_eq!(app.session.as_ref().unwrap().catalog.apps.len(), 2);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_uninstall_native_matching_release_records_request_confirm_and_commit() {
+        let (temp, mut app, mut shell) = uninstall_native_app(Some("persistent-uninstall-pointer-ready-v1"));
+        let control = dock_uninstall_cell(1280, 800, 1, 2);
+        app.mouse = Some((control.x + 1, control.y + 1));
+        app.mouse_button(true).unwrap();
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_none());
+        app.mouse_button(false).unwrap();
+        assert!(app.session.as_ref().unwrap().storage_prompt().is_some());
+        assert_eq!(app.session.as_ref().unwrap().catalog.apps.len(), 2);
+        present_native(&mut app, &mut shell);
+        let allow = crate::graphics::desktop_shell::storage_prompt_geometry(1280, 800, false).unwrap().allow.unwrap();
+        app.mouse = Some((allow.x + 1, allow.y + 1));
+        app.mouse_button(true).unwrap();
+        assert_eq!(app.session.as_ref().unwrap().catalog.apps.len(), 2);
+        app.mouse_button(false).unwrap();
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(session.catalog.apps.iter().map(|e| e.id).collect::<Vec<_>>(), [1]);
+        assert!(session.storage_prompt().is_none());
+        let request = &session.test_native_receipts.iter().find(|e| e["kind"] == "uninstall-request").unwrap()["receipt"];
+        let confirm = &session.test_native_receipts.iter().find(|e| e["kind"] == "uninstall-confirm").unwrap()["receipt"];
+        for (receipt, press, release) in [(request, 1, 2), (confirm, 3, 4)] {
+            assert_eq!(receipt["app"], 2);
+            assert_eq!(receipt["packageId"], "dev.ming.install-demo");
+            assert_eq!(receipt["version"], "1.0.0");
+            assert_eq!(receipt["pressSequence"], press);
+            assert_eq!(receipt["releaseSequence"], release);
+            assert!(receipt["presentedSequence"].as_u64().unwrap() > 0);
+            assert!(receipt["promptRevision"].as_u64().is_some());
+            assert!(receipt["before"].is_object() && receipt["after"].is_object());
+        }
+        let commit = &session.test_native_receipts.iter().find(|e|e["kind"] == "persistent-uninstall-commit").unwrap()["receipt"];
+        for field in ["app", "packageId", "version", "fingerprint", "pressSequence", "releaseSequence", "presentedSequence", "promptRevision"] {
+            assert_eq!(commit["cause"][field], confirm[field], "commit cause mismatch: {field}");
+        }
+        assert_eq!(commit["privateBefore"], commit["privateAfter"]);
+        assert_eq!(commit["privateAfter"]["files"][0]["sha256"], "8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8");
+        let snapshot = crate::app_data::snapshot_private_read_only(&temp.path().join("data"), "dev.ming.install-demo").unwrap();
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].path, "note.txt");
+        assert_eq!(snapshot.files[0].size, 5);
+        assert!(app.mouse_button(false).is_err(), "qualification must reject duplicate up");
+        let events = &app.session.as_ref().unwrap().test_native_receipts;
+        assert_eq!(events.iter().filter(|e|e["kind"] == "uninstall-request").count(), 1);
+        assert_eq!(events.iter().filter(|e|e["kind"] == "uninstall-confirm").count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_uninstall_native_cancel_records_release_without_committing() {
+        let (_temp, mut app, mut shell) = uninstall_native_app(Some("persistent-uninstall-pointer-ready-v1"));
+        let before = crate::persistent_install::snapshot(app.session.as_ref().unwrap().options.install_registry.as_ref().unwrap()).unwrap();
+        let control = dock_uninstall_cell(1280, 800, 1, 2);
+        app.mouse = Some((control.x + 1, control.y + 1));
+        app.mouse_button(true).unwrap();
+        app.mouse_button(false).unwrap();
+        present_native(&mut app, &mut shell);
+        let cancel = crate::graphics::desktop_shell::storage_prompt_geometry(1280, 800, false).unwrap().deny;
+        app.mouse = Some((cancel.x + 1, cancel.y + 1));
+        app.mouse_button(true).unwrap();
+        app.mouse_button(false).unwrap();
+        let session = app.session.as_ref().unwrap();
+        assert!(session.storage_prompt().is_none());
+        assert_eq!(crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap(), before);
+        let confirm = &session.test_native_receipts.iter().find(|e|e["kind"] == "uninstall-confirm").unwrap()["receipt"];
+        assert_eq!(confirm["allow"], false);
+        assert_eq!(confirm["pressSequence"], 3);
+        assert_eq!(confirm["releaseSequence"], 4);
+        assert!(!session.test_native_receipts.iter().any(|e|e["kind"] == "persistent-uninstall-commit"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires packaged persistent-uninstall-demo Wasm and real release Host worker"]
+    fn persistent_uninstall_native_real_fixture_ready_close_reap_and_uninstall() {
+        let wasm = std::path::PathBuf::from(std::env::var_os("MING_UNINSTALL_FIXTURE_WASM").expect("packaged fixture path required"));
+        let worker = std::path::PathBuf::from(std::env::var_os("MING_TEST_PRIVATE_WORKER").expect("real release Host worker path required"));
+        assert!(wasm.is_absolute() && worker.is_absolute() && worker.is_file());
+        let (temp, mut app, mut shell) = uninstall_native_app_with_wasm(
+            Some("persistent-uninstall-pointer-ready-v1"), Some(std::fs::read(wasm).unwrap()));
+        let dock = dock_cell(1280, 800, 1, 2);
+        app.mouse = Some((dock.x + 32, dock.y + 30));
+        app.mouse_button(true).unwrap();
+        app.mouse_button(false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut requested_close = false;
+        while Instant::now() < deadline {
+            app.session.as_mut().unwrap().tick().unwrap();
+            if app.session.as_ref().unwrap().dirty { present_native(&mut app, &mut shell); }
+            let session = app.session.as_ref().unwrap();
+            let ready = session.test_native_receipts.iter().any(|e| e["kind"] == "native-launch" && e["receipt"]["phase"] == "ready");
+            if !requested_close && ready
+                && let Some(view) = session.views().into_iter().find(|v| v.app == 2 && v.input_ready && v.presented_sequence != 0)
+            {
+                let private = crate::app_data::snapshot_private_read_only(&temp.path().join("data"), "dev.ming.install-demo").unwrap();
+                assert_eq!(private.files.len(), 1);
+                assert_eq!(private.files[0].sha256, "8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8");
+                app.mouse = Some((view.outer.x + 16, view.outer.y + 16));
+                app.mouse_button(true).unwrap();
+                app.mouse_button(false).unwrap();
+                requested_close = true;
+            }
+            if requested_close && app.session.as_ref().unwrap().app_status(2) == "closed" { break; }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(requested_close, "fixture did not reach presented Ready");
+        assert_eq!(app.session.as_ref().unwrap().app_status(2), "closed");
+        present_native(&mut app, &mut shell);
+        let control = dock_uninstall_cell(1280, 800, 1, 2);
+        app.mouse = Some((control.x + 1, control.y + 1));
+        app.mouse_button(true).unwrap();
+        app.mouse_button(false).unwrap();
+        assert!(app.session.as_ref().unwrap().storage_prompt().unwrap().has_allow(), "reaped target must allow uninstall");
+        present_native(&mut app, &mut shell);
+        let allow = crate::graphics::desktop_shell::storage_prompt_geometry(1280, 800, false).unwrap().allow.unwrap();
+        app.mouse = Some((allow.x + 1, allow.y + 1));
+        app.mouse_button(true).unwrap();
+        app.mouse_button(false).unwrap();
+        let session = app.session.as_mut().unwrap();
+        assert_eq!(session.catalog.apps.iter().map(|entry| entry.id).collect::<Vec<_>>(), [1]);
+        let confirm = &session.test_native_receipts.iter().find(|e|e["kind"] == "uninstall-confirm").unwrap()["receipt"];
+        assert_eq!(confirm["pressSequence"], 7);
+        assert_eq!(confirm["releaseSequence"], 8);
+        let history = confirm["before"]["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["app"], 2);
+        assert_eq!(history[0]["status"], "closed");
+        assert_eq!(history[0]["completed"], true);
+        assert_eq!(history[0]["error"], serde_json::Value::Null);
+        assert!(history[0]["workerPid"].as_u64().unwrap() > 0);
+        let commit = &session.test_native_receipts.iter().find(|e|e["kind"] == "persistent-uninstall-commit").unwrap()["receipt"];
+        assert_eq!(commit["privateBefore"], commit["privateAfter"]);
+        assert_eq!(commit["privateAfter"]["files"][0]["size"], 5);
+        eprintln!("native Ready→Close→reap→U→UNINSTALL: {}", serde_json::to_string(&session.test_native_receipts).unwrap());
+        session.finish().unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn persistent_native_dock_down_records_new_launch_and_up_does_not_repeat_it() {

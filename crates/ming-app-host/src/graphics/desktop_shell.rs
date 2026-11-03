@@ -77,6 +77,10 @@ impl StoragePrompt {
         if !crate::app_data::valid_package_id(id) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
         Ok(Self { id: id.into(), version: String::new(), fingerprint: String::new(), replacement: true, mode: 12 })
     }
+    pub fn uninstall_protected(id: &str) -> Result<Self> {
+        if !crate::app_data::valid_package_id(id) { bail!("DESKTOP_STORAGE_PROMPT_INVALID"); }
+        Ok(Self { id: id.into(), version: String::new(), fingerprint: String::new(), replacement: true, mode: 23 })
+    }
     #[cfg(target_os = "linux")]
     pub fn purge(id: &str, version: &str, fingerprint: &str, retry: bool) -> Result<Self> {
         if !crate::app_data::valid_package_id(id) || version.is_empty() || version.len() > 16_384
@@ -111,7 +115,7 @@ impl StoragePrompt {
     }
     pub(super) fn buttons(&self) -> (&'static [u8], Option<&'static [u8]>) {
         match self.mode {
-            1 | 4 | 5 | 12 | 15 | 21 | 22 => (b"CLOSE", None),
+            1 | 4 | 5 | 12 | 15 | 21 | 22 | 23 => (b"CLOSE", None),
             2 | 8 => (b"CANCEL", Some(b"REVOKE")),
             3 | 7 | 9 | 11 | 14 | 18 | 19 => (b"CANCEL", Some(b"RETRY")),
             10 => (b"CANCEL", Some(b"UNINSTALL")),
@@ -132,6 +136,10 @@ impl StoragePrompt {
     }
     pub(crate) fn lines(&self, width: i32) -> Vec<Vec<u8>> {
         let capacity = ((width - 24) / 6) as usize;
+        if self.mode == 23 {
+            return vec![b"UNINSTALL APP".to_vec(), format!("APP ID: {}", self.id).into_bytes(),
+                b"SYSTEM APP CANNOT BE UNINSTALLED".to_vec()];
+        }
         if self.mode == 22 {
             return vec![
                 b"INSTALL NOT STARTED".to_vec(),
