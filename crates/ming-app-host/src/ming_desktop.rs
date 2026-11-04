@@ -5339,3 +5339,261 @@ mod startup_policy_tests {
         let (mut s,_tx)=session();s.options.duration_ms=60000;assert_eq!(s.take_pending_autostart(),Some(2));
     }
 }
+
+#[cfg(all(test,target_os="linux"))]
+mod persistent_update_runtime {
+    use super::*;
+    use crate::{package::{Manifest,Package,DataMigration,MigrationStep},persistent_install,persistent_update::{self,UpdateFixtureLayout}};
+    use base64::{Engine as _,engine::general_purpose::STANDARD};
+    use ed25519_dalek::{Signer,SigningKey};
+    use std::{fs,os::unix::fs::PermissionsExt,path::Path};
+    const ID:&str="dev.ming.persistent-update-demo";
+    struct TestSession(Session);
+    impl std::ops::Deref for TestSession { type Target=Session; fn deref(&self)->&Session { &self.0 } }
+    impl std::ops::DerefMut for TestSession { fn deref_mut(&mut self)->&mut Session { &mut self.0 } }
+    impl Drop for TestSession { fn drop(&mut self) { let _=self.0.finish(); } }
+    fn wasm(name:&str)->Vec<u8> {
+        let path=PathBuf::from(std::env::var_os(name).unwrap_or_else(||panic!("{name} explicit packaged Wasm required")));
+        assert!(path.is_absolute()&&path.is_file());fs::read(path).unwrap()
+    }
+    fn sign(id:&str,version:&str,bytes:Vec<u8>,migration:Option<DataMigration>)->Package {
+        let key=SigningKey::from_bytes(&[7;32]);
+        let mut p=Package{manifest:Manifest{schema_version:1,id:id.into(),version:version.into(),sdk_version:6,entry:"main.wasm".into(),
+            private_storage:false,public_storage:false,data_migration:migration,publisher_key_id:Some("mingos-dev-2026".into()),publisher_signature:None},bytes};
+        p.manifest.publisher_signature=Some(STANDARD.encode(key.sign(&p.signature_message("mingos-dev-2026").unwrap()).to_bytes()));p
+    }
+    fn setup_at(parent:&Path,layout:UpdateFixtureLayout,trap:bool)->(TestSession,PathBuf,PathBuf,PathBuf) {
+        let worker=PathBuf::from(std::env::var_os("MING_TEST_PRIVATE_WORKER").expect("real release Host required"));assert!(worker.is_absolute()&&worker.is_file());
+        let data=parent.join("data");fs::create_dir(&data).unwrap();fs::set_permissions(&data,fs::Permissions::from_mode(0o700)).unwrap();let root=data.join("install-root");
+        let bootstrap=sign("dev.ming.text-entry-demo","0.1.0",wasm("MING_UPDATE_BOOTSTRAP_WASM"),None);
+        let old=sign(ID,"0.1.0",wasm("MING_UPDATE_OLD_WASM"),None);
+        let new_bytes=if layout==UpdateFixtureLayout::NoteAlpha {wasm("MING_UPDATE_NEW_WASM")}else{wasm("MING_UPDATE_ABSENT_WASM")};
+        let new_bytes=if trap {trap_after_private_write()}else{new_bytes};
+        let migration=(layout==UpdateFixtureLayout::NoteAlpha).then(||DataMigration{from_version:"0.1.0".into(),steps:vec![
+            MigrationStep::EnsureDir{path:"state".into()},MigrationStep::RenameFile{from:"note.txt".into(),to:"state/note.txt".into()}]});
+        let new=sign(ID,"0.2.0",new_bytes,migration);
+        let catalog=br#"{"schemaVersion":3,"apps":[{"id":1,"title":"Text Lab","packageId":"dev.ming.text-entry-demo"}],"autostart":[1]}"#;
+        persistent_update::initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",SigningKey::from_bytes(&[7;32]).verifying_key().as_bytes(),catalog,layout).unwrap();
+        let source=parent.join("source");fs::create_dir(&source).unwrap();fs::write(source.join("main.wasm"),&new.bytes).unwrap();
+        let manifest=source.join("app.json");fs::write(&manifest,serde_json::to_vec(&new.manifest).unwrap()).unwrap();
+        let opened=persistent_install::open_existing(&root).unwrap();let (catalog,_)=crate::desktop_catalog::load_catalog_with_install_registry(&root.join("catalog.json"),&opened.registry).unwrap();
+        let mut options=DesktopOptions::parse([root.join("catalog.json").into_os_string(),"--renderer".into(),"cpu".into(),
+            "--persistent-install-state".into(),root.clone().into_os_string(),"--data-root".into(),data.clone().into_os_string(),
+            "--state-file".into(),parent.join("state.json").into_os_string(),"--qualification-receipts".into(),"persistent-update-pointer-ready-v1".into()]).unwrap();
+        options.install_registry=Some(opened.registry);
+        let session=Session::new(options,catalog,#[cfg(feature="gpu")]None).unwrap();
+        (TestSession(session),root,data,manifest)
+    }
+    fn fixture(layout:UpdateFixtureLayout,trap:bool)->(tempfile::TempDir,TestSession,PathBuf,PathBuf,PathBuf) {
+        let temp=tempfile::tempdir().unwrap();fs::set_permissions(temp.path(),fs::Permissions::from_mode(0o700)).unwrap();
+        let (session,root,data,source)=setup_at(temp.path(),layout,trap);(temp,session,root,data,source)
+    }
+    fn present(session:&mut Session) {
+        let frame=session.compose().unwrap();if session.storage_prompt().is_some(){session.storage_prompt_composed(frame.sequence);}
+        session.accepted(frame.sequence,false).unwrap();
+    }
+    fn begin_trial(session:&mut Session,source:&Path) {
+        session.begin_install(source).unwrap();present(session);
+        session.begin_native_input(true,None).unwrap();session.end_native_input().unwrap();
+        session.begin_native_input(false,None).unwrap();session.respond_storage_prompt_from_native(true).unwrap();session.end_native_input().unwrap();
+        assert!(session.persistent_update.is_some());assert!(session.instances.is_empty());
+        session.begin_native_input(true,None).unwrap();session.launch_from_native_dock(2).unwrap();session.end_native_input().unwrap();
+        session.begin_native_input(false,None).unwrap();session.end_native_input().unwrap();
+        assert_eq!(session.instances.len(),1,"native Dock must create exactly one real runtime");
+    }
+    fn wait_ready(session:&mut Session) {
+        let deadline=Instant::now()+Duration::from_secs(90);
+        while Instant::now()<deadline {
+            session.tick().unwrap();if session.dirty{present(session);}
+            if session.current_record(2).is_some_and(|r|r.first_ready_ms.is_some()&&r.presented_source_sequence>0)
+                &&session.views().iter().any(|v|v.input_ready&&v.presented_sequence>0){return;}
+            assert!(!session.instances.is_empty(),"worker ended before presented Ready: {:?}",session.records);
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("real worker did not become presented Ready: {:?}",session.records);
+    }
+    fn drain(session:&mut Session) {
+        let deadline=Instant::now()+Duration::from_secs(90);
+        while Instant::now()<deadline&&!session.instances.is_empty(){session.tick().unwrap();if session.dirty{present(session);}thread::sleep(Duration::from_millis(2));}
+        assert!(session.instances.is_empty(),"real supervisor did not finish/reap: {:?}",session.records);
+    }
+    fn assert_reaped(session:&Session,success:bool) {
+        let record=session.records.iter().rev().find(|r|r.app==2).unwrap();assert!(record.completed&&record.worker_pid>0);
+        assert_eq!(record.error.is_none(),success,"{:?}",record.error);
+        assert!(session.trace.iter().any(|e|e.app==2&&e.generation==record.generation&&e.kind=="worker-reaped"));
+        if success {
+            assert!(record.first_ready_ms.is_some()&&record.presented_source_sequence>0&&record.frames_submitted.unwrap_or(0)>0);
+            assert!(session.trace.iter().any(|e|e.app==2&&e.generation==record.generation&&e.kind=="result-accepted"));
+        }
+        assert_eq!(unsafe{libc::kill(record.worker_pid as i32,0)},-1,"worker PID still exists after reap");
+        eprintln!("REAL_UPDATE_RECORD {}",serde_json::to_string(record).unwrap());
+    }
+    fn assert_alpha(data:&Path,path:&str) {
+        assert_eq!(fs::read(data.join(crate::app_data::package_directory_name(ID)).join("files").join(path)).unwrap(),b"alpha");
+    }
+    #[test]
+    #[ignore="requires three packaged Kotlin fixtures and a real release Host"]
+    fn migrated_and_absent_write_commit_only_after_real_ready_close_reap() {
+        for layout in [UpdateFixtureLayout::NoteAlpha,UpdateFixtureLayout::Absent] {
+            let (_temp,mut session,root,data,source)=fixture(layout,false);
+            let before=persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap();let catalog=fs::read(root.join("catalog.json")).unwrap();
+            begin_trial(&mut session,&source);wait_ready(&mut session);
+            assert!(root.join(persistent_update::UPDATE_PENDING_NAME).exists());
+            assert_eq!(session.state_snapshot(session.state_revision)["persistentUpdate"]["status"],"trial");
+            assert_alpha(&data,if layout==UpdateFixtureLayout::NoteAlpha{"state/note.txt"}else{"note.txt"});
+            session.perform(&DesktopAction::Close{app:2}).unwrap();drain(&mut session);assert_reaped(&session,true);
+            assert_eq!(session.state_snapshot(session.state_revision)["persistentUpdate"]["status"],"committed");assert!(!root.join(persistent_update::UPDATE_PENDING_NAME).exists());
+            assert!(session.test_native_receipts.iter().any(|r|r["kind"]=="persistent-update-commit"));
+            session.finish().unwrap();drop(session);
+            let helper=std::env::var_os("MING_UPDATE_FIXTURE_HELPER").expect("explicit release helper required");
+            let observed=std::process::Command::new(helper).arg("open-existing").arg(&root).arg(&data).arg(_temp.path().join("committed-open.json")).output().unwrap();
+            assert!(observed.status.success(),"{}",String::from_utf8_lossy(&observed.stderr));
+            let observed:serde_json::Value=serde_json::from_slice(&observed.stdout).unwrap();
+            assert!(observed["actions"].as_object().unwrap().values().all(|v|v==0));
+            let opened=persistent_install::open_existing(&root).unwrap();assert_eq!(fs::read(root.join("catalog.json")).unwrap(),catalog);
+            assert!(opened.content.apps.iter().any(|a|a.app==2&&a.version=="0.2.0"));assert!(before.files.iter().filter(|f|f.path!="installed-packages-v1").all(|f|opened.content.files.contains(f)));
+            assert_eq!(before.apps.iter().find(|a|a.app==1),opened.content.apps.iter().find(|a|a.app==1));
+            drop(opened);run_independent_stable_host(_temp.path(),&root,&data,"new-0.2.0");
+        }
+    }
+    fn trap_after_private_write()->Vec<u8> {
+        let request=|path:&str,bytes:&[u8]| {
+            let mut out=vec![2];out.extend_from_slice(&(path.len() as u32).to_le_bytes());out.extend_from_slice(path.as_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());out.extend_from_slice(bytes);out
+        };
+        let first=request("note.txt",b"alpha");let second=request("synced.txt",b"1");
+        let encode=|bytes:&[u8]|bytes.iter().map(|b|format!("\\{b:02x}")).collect::<String>();
+        wat::parse_str(format!(r#"(module
+            (import "ming_private_files_v2" "call" (func $call (param i32 i32 i32 i32) (result i32)))
+            (import "ming_v2" "event_next" (func $next (param i32 i32) (result i32)))
+            (memory (export "memory") 2)
+            (data (i32.const 0) "{}") (data (i32.const 128) "{}")
+            (func $trap_after_synced_write unreachable)
+            (func (export "_start")
+                (if (i32.ne (call $call (i32.const 0) (i32.const {}) (i32.const 1024) (i32.const 65536)) (i32.const 5)) (then unreachable))
+                (if (i32.ne (i32.load8_u (i32.const 1024)) (i32.const 1)) (then unreachable))
+                (if (i32.ne (call $call (i32.const 128) (i32.const {}) (i32.const 1024) (i32.const 65536)) (i32.const 1)) (then unreachable))
+                (if (i32.ne (i32.load8_u (i32.const 1024)) (i32.const 1)) (then unreachable))
+                (loop $wait (drop (call $next (i32.const 2048) (i32.const 16))) (if (i32.eqz (i32.load (i32.const 2048))) (then (call $trap_after_synced_write))) (br $wait))))"#,
+                encode(&first),encode(&second),first.len(),second.len())).unwrap()
+    }
+    fn wait_synced_files(session:&mut Session,data:&Path) {
+        let deadline=Instant::now()+Duration::from_secs(30);
+        let files=data.join(crate::app_data::package_directory_name(ID)).join("files");
+        while Instant::now()<deadline {
+            session.tick().unwrap();if session.dirty{present(session);}
+            if fs::read(files.join("synced.txt")).is_ok_and(|bytes|bytes==b"1") {
+                assert_alpha(data,"note.txt");assert!(!session.instances.is_empty());return;
+            }
+            assert!(!session.instances.is_empty(),"trap fixture failed before synced writes: {:?}",session.records);
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("trap fixture did not finish real synced writes");
+    }
+    #[test]
+    #[ignore="requires packaged old fixture and real release Host"]
+    fn absent_nonempty_runtime_failure_rolls_back_original_missing_namespace() {
+        let (_temp,mut session,root,data,source)=fixture(UpdateFixtureLayout::Absent,true);
+        let before=crate::app_data::observe_private_update_read_only(&data,ID).unwrap();assert!(!before.namespace_exists);
+        begin_trial(&mut session,&source);wait_synced_files(&mut session,&data);
+        session.perform(&DesktopAction::Close{app:2}).unwrap();drain(&mut session);assert_reaped(&session,false);
+        assert!(session.records.last().unwrap().error.as_deref().unwrap().contains("unreachable"));
+        assert_eq!(session.state_snapshot(session.state_revision)["persistentUpdate"]["status"],"rolled-back");assert_eq!(crate::app_data::observe_private_update_read_only(&data,ID).unwrap(),before);
+        session.finish().unwrap();drop(session);assert!(persistent_install::open_existing(&root).unwrap().content.apps.iter().any(|a|a.app==2&&a.version=="0.1.0"));
+    }
+    #[test]
+    #[ignore="subprocess entry only; launched by killed_host_recovers_in_independent_process"]
+    fn killed_host_child_entry() {
+        let Some(parent)=std::env::var_os("MING_UPDATE_KILL_CHILD_ROOT") else {return};
+        let parent=PathBuf::from(parent);
+        let layout=if std::env::var_os("MING_UPDATE_KILL_LAYOUT").as_deref()==Some(std::ffi::OsStr::new("seed")){UpdateFixtureLayout::NoteAlpha}else{UpdateFixtureLayout::Absent};
+        let (mut session,root,data,source)=setup_at(&parent,layout,false);
+        let before=crate::app_data::observe_private_update_read_only(&data,ID).unwrap();
+        assert_eq!(before.namespace_exists,layout==UpdateFixtureLayout::NoteAlpha);
+        begin_trial(&mut session,&source);wait_ready(&mut session);assert_alpha(&data,if layout==UpdateFixtureLayout::NoteAlpha{"state/note.txt"}else{"note.txt"});
+        session.perform(&DesktopAction::Close{app:2}).unwrap();
+        // Intentionally stop controller polling after Close. The real supervisor
+        // consumes Result and wait/reaps the worker while Prepared stays durable.
+        let deadline=Instant::now()+Duration::from_secs(90);
+        loop {
+            let lifecycle=session.instances[0].bridge.worker_lifecycle();
+            if lifecycle.result_accepted.is_some()&&lifecycle.reaped.is_some(){break;}
+            assert!(Instant::now()<deadline,"real supervisor did not accept Result and reap");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let instance=&mut session.instances[0];
+        let pid=instance.pid.load(Ordering::SeqCst);
+        instance.worker.take().unwrap().join().unwrap();
+        assert!(pid>0);assert_eq!(unsafe{libc::kill(pid as i32,0)},-1);
+        let record=persistent_update::parse_update_record(&fs::read(root.join(persistent_update::UPDATE_PENDING_NAME)).unwrap()).unwrap();
+        assert_eq!(record.decision,persistent_update::UpdateDecision::Prepared);
+        assert_alpha(&data,if layout==UpdateFixtureLayout::NoteAlpha{"state/note.txt"}else{"note.txt"});
+        let receipt=serde_json::json!({"workerPid":pid,"resultAccepted":true,"reaped":true,"before":before});
+        let mut ready=fs::OpenOptions::new().create_new(true).write(true).open(parent.join("child-ready.json")).unwrap();
+        std::io::Write::write_all(&mut ready,serde_json::to_string(&receipt).unwrap().as_bytes()).unwrap();ready.sync_all().unwrap();
+        loop {thread::park();}
+    }
+    fn run_independent_stable_host(parent:&Path,root:&Path,data:&Path,label:&str) {
+        let events=parent.join(format!("{label}-events.json"));
+        fs::write(&events,br#"[{"afterMs":0,"action":{"op":"close","app":1}},{"afterMs":0,"action":{"op":"launch","app":2}},{"afterMs":1,"action":{"op":"close","app":2}}]"#).unwrap();
+        let stdout=parent.join(format!("{label}-host.stdout"));let stderr=parent.join(format!("{label}-host.stderr"));
+        let mut host=ChildGuard(std::process::Command::new(std::env::var_os("MING_TEST_PRIVATE_WORKER").unwrap())
+            .arg("desktop").arg(root.join("catalog.json")).args(["--backend","offscreen","--renderer","cpu","--duration-ms","100","--persistent-install-state"])
+            .arg(root).arg("--data-root").arg(data).arg("--events").arg(events)
+            .stdout(fs::File::create(&stdout).unwrap()).stderr(fs::File::create(&stderr).unwrap()).spawn().unwrap());
+        let deadline=Instant::now()+Duration::from_secs(120);
+        let status=loop {if let Some(status)=host.0.try_wait().unwrap(){break status;}assert!(Instant::now()<deadline,"{label} independent Host timeout");thread::sleep(Duration::from_millis(5));};
+        assert!(status.success(),"{label}: {}",fs::read_to_string(stderr).unwrap());assert!(fs::metadata(&stdout).unwrap().len()<2*1024*1024);
+        let outcome:serde_json::Value=serde_json::from_slice(&fs::read(stdout).unwrap()).unwrap();assert_eq!(outcome["activeWorkersAfterShutdown"],0);
+        let record=outcome["instances"].as_array().unwrap().iter().find(|r|r["app"]==2).unwrap();
+        assert_eq!(record["completed"],true);assert!(record["error"].is_null());assert!(record["firstReadyMs"].is_number());
+        assert!(record["presentedSourceSequence"].as_u64().unwrap()>0&&record["framesSubmitted"].as_u64().unwrap()>0);
+        let pid=record["workerPid"].as_u64().unwrap() as i32;assert!(pid>0);assert_eq!(unsafe{libc::kill(pid,0)},-1);
+        let events=record["events"].as_array().unwrap();
+        for code in [9500,9510] {assert!(events.iter().any(|e|e["code"]==code&&e["value"]==0),"{label}: {record}");}
+        assert!(events.iter().any(|e|e["code"]==9511&&e["value"].as_i64().unwrap()>0));
+        for kind in ["result-accepted","worker-reaped"] {assert!(outcome["trace"].as_array().unwrap().iter().any(|e|e["app"]==2&&e["kind"]==kind));}
+        eprintln!("REAL_INDEPENDENT_HOST_RECORD {} {}",label,record);
+    }
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    #[test]
+    #[ignore="requires packaged fixtures, release Host and fixture helper"]
+    fn killed_host_recovers_in_independent_process() {
+        use std::os::unix::process::ExitStatusExt;
+        for layout in ["seed","absent"] {
+        let temp=tempfile::tempdir().unwrap();fs::set_permissions(temp.path(),fs::Permissions::from_mode(0o700)).unwrap();
+        let output=fs::File::create(temp.path().join("child.stdout.log")).unwrap();
+        let errors=fs::File::create(temp.path().join("child.stderr.log")).unwrap();
+        let mut child=ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","ming_desktop::persistent_update_runtime::killed_host_child_entry","--ignored","--nocapture"])
+            .env("MING_UPDATE_KILL_CHILD_ROOT",temp.path()).env("MING_UPDATE_KILL_LAYOUT",layout).stdout(output).stderr(errors).spawn().unwrap());
+        let deadline=Instant::now()+Duration::from_secs(120);
+        let ready=loop {
+            if let Ok(bytes)=fs::read(temp.path().join("child-ready.json")) {
+                assert!(bytes.len()<16*1024);
+                if let Ok(value)=serde_json::from_slice::<serde_json::Value>(&bytes){break value;}
+            }
+            assert!(child.0.try_wait().unwrap().is_none(),"child exited before kill barrier: {}",fs::read_to_string(temp.path().join("child.stderr.log")).unwrap());
+            assert!(Instant::now()<deadline,"child did not reach real write/Result/reap barrier");thread::sleep(Duration::from_millis(5));
+        };
+        let pid=ready["workerPid"].as_u64().unwrap() as i32;
+        assert!(pid>0&&ready["resultAccepted"]==true&&ready["reaped"]==true);assert_eq!(unsafe{libc::kill(pid,0)},-1);
+        let root=temp.path().join("data/install-root");let data=temp.path().join("data");assert_alpha(&data,if layout=="seed"{"state/note.txt"}else{"note.txt"});
+        child.0.kill().unwrap();let status=child.0.wait().unwrap();assert_eq!(status.signal(),Some(libc::SIGKILL));
+        let helper=PathBuf::from(std::env::var_os("MING_UPDATE_FIXTURE_HELPER").expect("explicit release fixture helper required"));
+        let recovered=std::process::Command::new(&helper).arg("recover-update").arg(&root).arg(&data).arg(temp.path().join("recovered.json")).output().unwrap();
+        assert!(recovered.status.success(),"{}",String::from_utf8_lossy(&recovered.stderr));
+        let recovery:serde_json::Value=serde_json::from_slice(&recovered.stdout).unwrap();assert_eq!(recovery["status"],"recovered-rolled-back");
+        assert_eq!(recovery["privateContent"],ready["before"]);assert!(!root.join(persistent_update::UPDATE_PENDING_NAME).exists());
+        let reopened=std::process::Command::new(helper).arg("open-existing").arg(&root).arg(&data).arg(temp.path().join("reopened.json")).output().unwrap();
+        assert!(reopened.status.success(),"{}",String::from_utf8_lossy(&reopened.stderr));
+        let reopened:serde_json::Value=serde_json::from_slice(&reopened.stdout).unwrap();
+        assert_eq!(reopened["privateContent"],ready["before"]);assert!(reopened["actions"].as_object().unwrap().values().all(|v|v==0));
+        assert!(reopened["content"]["apps"].as_array().unwrap().iter().any(|a|a["app"]==2&&a["version"]=="0.1.0"));
+        if layout=="seed" {assert_alpha(&data,"note.txt");run_independent_stable_host(temp.path(),&root,&data,"old-0.1.0-after-rollback");}
+        eprintln!("REAL_KILLED_HOST_RECOVERY {} {}",layout,recovery);
+        }
+    }
+
+}

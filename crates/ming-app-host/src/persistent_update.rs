@@ -15,6 +15,217 @@ pub const UPDATE_PENDING_NAME: &str = crate::package_install::COORDINATED_UPDATE
 pub(crate) const INNER_JOURNAL_NAME: &str = "update-journal-v1";
 pub const MAX_UPDATE_RECORD_BYTES: usize = 4096;
 
+/// Only the two fresh-disk layouts used by the persistent-update fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateFixtureLayout { NoteAlpha, Absent }
+
+/// Explicit first initialization, never a fallback for an existing or damaged root.
+pub fn initialize_update_fixture_first(root: &Path, data_root: &Path, bootstrap: &Package,
+    old_target: &Package, key_id: &str, public_key: &[u8; 32], initial_catalog: &[u8],
+    layout: UpdateFixtureLayout) -> Result<ContentSnapshot> {
+    initialize_update_fixture(root,data_root,bootstrap,old_target,key_id,public_key,initial_catalog,layout, |_| Ok(()))
+}
+
+fn fixture_path(path:&Path) -> Result<()> {
+    use std::path::Component;
+    ensure!(path.is_absolute()&&path.file_name().is_some(),"UPDATE_FIXTURE_ABSOLUTE");
+    ensure!(!path.as_os_str().as_bytes().split(|b|*b==b'/').any(|c|c==b"."||c==b".."),"UPDATE_FIXTURE_PATH_ALIAS");
+    let mut cursor=PathBuf::new();
+    for component in path.components() {
+        ensure!(matches!(component,Component::RootDir|Component::Normal(_)),"UPDATE_FIXTURE_PATH_ALIAS");
+        cursor.push(component);
+        if cursor!=path { let info=fs::symlink_metadata(&cursor)?;ensure!(info.is_dir()&&!info.file_type().is_symlink(),"UPDATE_FIXTURE_ANCESTOR"); }
+    }
+    Ok(())
+}
+fn fixture_private_directory(path:&Path) -> Result<()> {
+    let info=fs::symlink_metadata(path)?;
+    ensure!(info.is_dir()&&!info.file_type().is_symlink()&&info.uid()==unsafe{libc::geteuid()}&&info.mode()&0o7777==0o700,"UPDATE_FIXTURE_DIRECTORY");Ok(())
+}
+fn fixture_absent(path:&Path) -> Result<()> {
+    ensure!(fs::symlink_metadata(path).is_err_and(|e|e.kind()==std::io::ErrorKind::NotFound),"UPDATE_FIXTURE_ALREADY_EXISTS");Ok(())
+}
+fn fixture_sync_tree(path:&Path) -> Result<()> {
+    let info=fs::symlink_metadata(path)?;
+    ensure!(!info.file_type().is_symlink()&&(info.is_file()||info.is_dir()),"UPDATE_FIXTURE_FILE_TYPE");
+    if info.is_dir() { for entry in fs::read_dir(path)? {fixture_sync_tree(&entry?.path())?;} }
+    File::open(path)?.sync_all()?;Ok(())
+}
+fn initialize_update_fixture(root:&Path,data_root:&Path,bootstrap:&Package,old_target:&Package,key_id:&str,
+    public_key:&[u8;32],initial_catalog:&[u8],layout:UpdateFixtureLayout,mut checkpoint:impl FnMut(&str)->Result<()>) -> Result<ContentSnapshot> {
+    use base64::{Engine as _,engine::general_purpose::STANDARD};
+    use ed25519_dalek::{Signature,Verifier,VerifyingKey};
+    use std::{os::unix::fs::DirBuilderExt,sync::Arc};
+    fixture_path(root)?;fixture_path(data_root)?;
+    ensure!(!data_root.starts_with(root)&&(!root.starts_with(data_root)||root.parent()==Some(data_root)),"UPDATE_FIXTURE_ROOT_OVERLAP");
+    let parent=root.parent().context("UPDATE_FIXTURE_PARENT")?;fixture_private_directory(parent)?;
+    let name=root.file_name().and_then(|n|n.to_str()).context("UPDATE_FIXTURE_NAME")?;
+    let guard=parent.join(format!(".{name}.update-fixture-initializing"));
+    ensure!(!data_root.starts_with(&guard),"UPDATE_FIXTURE_GUARD_OVERLAP");
+    fixture_absent(root)?;fixture_absent(&guard)?;fixture_private_directory(data_root)?;
+    ensure!(fs::read_dir(data_root)?.next().is_none(),"UPDATE_FIXTURE_DATA_NOT_EMPTY");
+    ensure!(initial_catalog.len()<=16*1024,"UPDATE_FIXTURE_CATALOG_LIMIT");
+    #[derive(Deserialize)]
+    #[serde(rename_all="camelCase",deny_unknown_fields)]
+    struct InitialCatalog {schema_version:u32,apps:Vec<InitialApp>,autostart:Vec<u16>}
+    #[derive(Deserialize)]
+    #[serde(rename_all="camelCase",deny_unknown_fields)]
+    struct InitialApp {id:u16,title:String,package_id:String}
+    let catalog:InitialCatalog=serde_json::from_slice(initial_catalog)?;
+    ensure!(catalog.schema_version==3&&catalog.autostart==[1]&&catalog.apps.len()==1&&catalog.apps[0].id==1
+        &&catalog.apps[0].title=="Text Lab"&&catalog.apps[0].package_id=="dev.ming.text-entry-demo","UPDATE_FIXTURE_CATALOG");
+    let key=VerifyingKey::from_bytes(public_key)?;
+    for (package,id) in [(bootstrap,"dev.ming.text-entry-demo"),(old_target,"dev.ming.persistent-update-demo")] {
+        let manifest=&package.manifest;
+        ensure!(manifest.schema_version==1&&manifest.id==id&&manifest.version=="0.1.0"&&manifest.sdk_version==6
+            &&manifest.entry=="main.wasm"&&!manifest.public_storage&&manifest.data_migration.is_none()
+            &&manifest.publisher_key_id.as_deref()==Some(key_id)&&package.bytes.len()<=crate::package::MAX_MODULE_BYTES,"UPDATE_FIXTURE_PACKAGE");
+        let signature=Signature::from_slice(&STANDARD.decode(manifest.publisher_signature.as_deref().context("UPDATE_FIXTURE_SIGNATURE")?)?)?;
+        key.verify(&package.signature_message(key_id)?,&signature)?;
+    }
+    // Atomic claim precedes every data mutation. On any error this private
+    // container is deliberately retained; initialization never repairs/replays it.
+    fs::DirBuilder::new().mode(0o700).create(&guard)?;File::open(parent)?.sync_all()?;
+    checkpoint("claimed")?;
+    let staging=guard.join("install");
+    persistent_install::initialize_first(&staging,bootstrap,key_id,public_key,initial_catalog)?;
+    let opened=persistent_install::open_existing(&staging)?;
+    persistent_install::install_new(&opened.registry,old_target).map_err(|e|anyhow::anyhow!("UPDATE_FIXTURE_INSTALL {}: {}",e.stage,e.error))?;
+    let content=persistent_install::snapshot(&opened.registry)?;
+    ensure!(content.apps.len()==2&&content.apps.iter().any(|app|app.app==1&&app.package_id==bootstrap.manifest.id)
+        &&content.apps.iter().any(|app|app.app==2&&app.package_id==old_target.manifest.id
+            &&app.fingerprint==old_target.storage_fingerprint().iter().map(|byte|format!("{byte:02x}")).collect::<String>()),"UPDATE_FIXTURE_DOUBLE_PACKAGE");
+    let (catalog,grants)=load_catalog_with_install_registry(&staging.join(persistent_install::CATALOG_NAME),&opened.registry)?;
+    ensure!(catalog.autostart==[1]&&grants.is_empty(),"UPDATE_FIXTURE_AUTOSTART");
+    checkpoint("before-seed")?;
+    let authority=Arc::new(PackageStorageAuthority::open_default_private(crate::app_data::AppDataRoot::open(data_root)?)?);
+    if layout==UpdateFixtureLayout::NoteAlpha {
+        let private=authority.default_private_session_for_package(old_target)?;
+        ensure!(private.write_file("note.txt",b"alpha")?.directory_synced,"UPDATE_FIXTURE_SEED_SYNC");
+    }
+    drop(authority);fixture_sync_tree(data_root)?;
+    checkpoint("after-seed")?;
+    ensure!(persistent_install::snapshot(&opened.registry)?==content,"UPDATE_FIXTURE_CONTENT_DRIFT");
+    fixture_sync_tree(&staging)?;drop(opened);
+    checkpoint("before-publish")?;
+    let source=CString::new(staging.as_os_str().as_bytes())?;let destination=CString::new(root.as_os_str().as_bytes())?;
+    ensure!(unsafe{libc::renameat2(libc::AT_FDCWD,source.as_ptr(),libc::AT_FDCWD,destination.as_ptr(),libc::RENAME_NOREPLACE)}==0,
+        "UPDATE_FIXTURE_PUBLISH {}",std::io::Error::last_os_error());
+    checkpoint("published")?;File::open(parent)?.sync_all()?;checkpoint("parent-synced")?;
+    ensure!(persistent_install::open_existing(root)?.content==content,"UPDATE_FIXTURE_FINAL_READBACK");
+    fs::remove_dir(&guard)?;File::open(parent)?.sync_all()?;
+    Ok(content)
+}
+
+#[cfg(test)]
+mod fixture_initialization_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::os::unix::fs::PermissionsExt;
+    fn input() -> (tempfile::TempDir, PathBuf, PathBuf, Package, Package, SigningKey, Vec<u8>) {
+        let temp=tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(),fs::Permissions::from_mode(0o700)).unwrap();
+        let root=temp.path().join("install");let data=temp.path().join("data");
+        fs::create_dir(&data).unwrap();fs::set_permissions(&data,fs::Permissions::from_mode(0o700)).unwrap();
+        let key=SigningKey::from_bytes(&[7;32]);
+        let signed=|id:&str| {
+            let mut package=Package {manifest:crate::package::Manifest {schema_version:1,id:id.into(),version:"0.1.0".into(),sdk_version:6,
+                entry:"main.wasm".into(),private_storage:false,public_storage:false,data_migration:None,
+                publisher_key_id:Some("mingos-dev-2026".into()),publisher_signature:None},bytes:b"\0asm\x01\0\0\0".to_vec()};
+            package.manifest.publisher_signature=Some(STANDARD.encode(key.sign(&package.signature_message("mingos-dev-2026").unwrap()).to_bytes()));package
+        };
+        let bootstrap=signed("dev.ming.text-entry-demo");let old=signed("dev.ming.persistent-update-demo");
+        let catalog=br#"{"schemaVersion":3,"apps":[{"id":1,"title":"Text Lab","packageId":"dev.ming.text-entry-demo"}],"autostart":[1]}"#.to_vec();
+        (temp,root,data,bootstrap,old,key,catalog)
+    }
+    #[test]
+    fn fixture_initialization_publishes_two_packages_and_seed_together() {
+        let (_temp,root,data,bootstrap,old,key,catalog)=input();
+        let content=initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::NoteAlpha).unwrap();
+        assert_eq!(content.apps.len(),2,"formal root must contain both packages on first publication");
+        assert_eq!(content.apps.iter().map(|app|(app.app,(app.package_id.as_str(),app.version.as_str()))).collect::<BTreeMap<_,_>>(),
+            BTreeMap::from([(1,("dev.ming.text-entry-demo","0.1.0")),(2,("dev.ming.persistent-update-demo","0.1.0"))]));
+        assert_eq!(persistent_install::open_existing(&root).unwrap().content,content);
+        let private=crate::app_data::snapshot_private_read_only(&data,&old.manifest.id).unwrap();
+        assert_eq!(private.files.len(),1);assert_eq!(private.files[0].path,"note.txt");assert_eq!(private.files[0].size,5);
+        assert_eq!(private.files[0].sha256,sha256(b"alpha"));
+    }
+    fn guard(root:&Path)->PathBuf {root.parent().unwrap().join(".install.update-fixture-initializing")}
+    fn tree(root:&Path)->BTreeMap<PathBuf,(u64,u32,Vec<u8>)> {
+        fn walk(root:&Path,path:&Path,out:&mut BTreeMap<PathBuf,(u64,u32,Vec<u8>)>) {
+            let info=fs::symlink_metadata(path).unwrap();
+            out.insert(path.strip_prefix(root).unwrap().into(),(info.ino(),info.mode(),if info.is_file(){fs::read(path).unwrap()}else{Vec::new()}));
+            if info.is_dir(){for entry in fs::read_dir(path).unwrap(){walk(root,&entry.unwrap().path(),out);}}
+        }
+        let mut out=BTreeMap::new();walk(root,root,&mut out);out
+    }
+    #[test]
+    fn fixture_absent_layout_creates_recovery_locks_but_no_target_namespace() {
+        let (_temp,root,data,bootstrap,old,key,catalog)=input();
+        initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::Absent).unwrap();
+        let baseline=crate::app_data::observe_private_update_read_only(&data,&old.manifest.id).unwrap();
+        assert!(!baseline.namespace_exists);assert!(baseline.files.is_none());assert!(!guard(&root).exists());
+        drop(PackageStorageAuthority::open_update_recovery_existing(&data).unwrap());
+    }
+    #[test]
+    fn fixture_supports_install_root_directly_inside_data_root() {
+        let (_temp,_root,data,bootstrap,old,key,catalog)=input();let root=data.join("install-root");
+        let content=initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::NoteAlpha).unwrap();
+        assert_eq!(content.apps.len(),2);assert_eq!(persistent_install::open_existing(&root).unwrap().content,content);
+        assert_eq!(crate::app_data::snapshot_private_read_only(&data,&old.manifest.id).unwrap().files[0].sha256,sha256(b"alpha"));
+        assert!(!data.join(".install-root.update-fixture-initializing").exists());
+    }
+    #[test]
+    fn fixture_preflight_rejects_existing_or_invalid_inputs_before_claim_or_data_writes() {
+        for case in 0..7 {
+            let (_temp,root,data,mut bootstrap,old,key,mut catalog)=input();
+            match case {
+                0=>{fs::create_dir(&root).unwrap();},
+                1=>{fs::write(data.join("keep"),b"sentinel").unwrap();},
+                2=>bootstrap.manifest.publisher_signature=Some(STANDARD.encode([0;64])),
+                3=>catalog.extend_from_slice(b"bad"),
+                4=>bootstrap.manifest.id="dev.ming.wrong".into(),
+                5=>{fs::remove_dir(&data).unwrap();std::os::unix::fs::symlink(root.parent().unwrap(),&data).unwrap();},
+                _=>{fs::set_permissions(&data,fs::Permissions::from_mode(0o755)).unwrap();},
+            }
+            let before=tree(root.parent().unwrap());
+            assert!(initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::NoteAlpha).is_err(),"case {case}");
+            assert!(!guard(&root).exists());assert_eq!(tree(root.parent().unwrap()),before,"case {case}");
+        }
+    }
+    #[test]
+    fn fixture_failure_retains_claim_and_never_replays_partial_data() {
+        for point in ["claimed","before-seed","after-seed","published","parent-synced"] {
+            let (_temp,root,data,bootstrap,old,key,catalog)=input();
+            let error=initialize_update_fixture(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::NoteAlpha,
+                |stage| {if stage==point {anyhow::bail!("injected {stage}");}Ok(())}).unwrap_err();
+            assert!(error.to_string().contains("injected"));assert!(guard(&root).is_dir());
+            assert_eq!(root.exists(),matches!(point,"published"|"parent-synced"));
+            if root.exists(){assert_eq!(persistent_install::open_existing(&root).unwrap().content.apps.len(),2);}
+            let before=tree(root.parent().unwrap());
+            assert!(initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::NoteAlpha).is_err());
+            assert_eq!(tree(root.parent().unwrap()),before);
+        }
+    }
+    #[test]
+    fn fixture_publication_is_complete_and_never_clobbers_racing_root() {
+        let (_temp,root,data,bootstrap,old,key,catalog)=input();
+        assert!(initialize_update_fixture(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::NoteAlpha,|stage| {
+            if stage=="before-publish" {
+                assert!(!root.exists());assert_eq!(persistent_install::open_existing(&guard(&root).join("install")).unwrap().content.apps.len(),2);
+                assert_eq!(crate::app_data::snapshot_private_read_only(&data,&old.manifest.id).unwrap().files[0].sha256,sha256(b"alpha"));
+                fs::create_dir(&root)?;fs::write(root.join("sentinel"),b"racing target")?;
+            }Ok(())
+        }).is_err());
+        assert_eq!(fs::read(root.join("sentinel")).unwrap(),b"racing target");assert!(!root.join("catalog.json").exists());
+        assert!(guard(&root).exists());
+        let before=tree(root.parent().unwrap());
+        assert!(initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::NoteAlpha).is_err());
+        assert_eq!(tree(root.parent().unwrap()),before);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UpdateDecision {
     #[serde(rename = "prepared")] Prepared,

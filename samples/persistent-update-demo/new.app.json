@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "dev.ming.persistent-update-demo",
+  "version": "0.2.0",
+  "sdkVersion": 6,
+  "entry": "main.wasm",
+  "dataMigration": {
+    "fromVersion": "0.1.0",
+    "steps": [
+      { "op": "ensureDir", "path": "state" },
+      { "op": "renameFile", "from": "note.txt", "to": "state/note.txt" }
+    ]
+  }
+}

@@ -268,10 +268,15 @@ pub(crate) fn recover_loaded_update(registry: &PackageInstallRegistry,
 新fixture初始化窄public入口定义于persistent_update，供example调用；普通事务/data/registry mutation保持crate内部。
 
 ```rust
-pub fn initialize_update_fixture_first(root: &Path, bootstrap: &Package,
-    old_target: &Package, key_id: &str, public_key: &[u8; 32],
-    initial_catalog: &[u8]) -> anyhow::Result<ContentSnapshot>;
+pub enum UpdateFixtureLayout { NoteAlpha, Absent }
+
+pub fn initialize_update_fixture_first(root: &Path, data_root: &Path,
+    bootstrap: &Package, old_target: &Package, key_id: &str,
+    public_key: &[u8; 32], initial_catalog: &[u8],
+    layout: UpdateFixtureLayout) -> anyhow::Result<ContentSnapshot>;
 ```
+
+显式可信 `data_root` 用于首次初始化时创建后续恢复所需的 policy 锁，并把 seed 与安装根作为同一代初始化处理；`UpdateFixtureLayout` 明确区分 `note.txt=alpha` 与原 namespace 缺失，避免 helper 隐式猜测或失败后补数据。允许正式安装根直接位于该 data 根内；首次 data 根必须已存在、权限为 0700 且为空，失败保留初始化 guard 与该代 data 并拒绝重试，不改变仅新盘角色可初始化的目标。
 
 - [ ] **真实fixture固定。** 新app2包ID `dev.ming.persistent-update-demo`，旧 `0.1.0`、新 `0.2.0`、SDK6；bootstrap沿用text-entry-demo@0.1.0、ID1/autostart=[1]。样例构建属性 `-PpersistentUpdateFixture=old|new|absent-write` 分别选择独立源码/输出目录：old读取note.txt并呈现0.1.0，new读取state/note.txt并呈现0.2.0，两者均检查alpha后等待Close；absent-write用于无migration原缺失runtime，写入并同步新note再呈现。旧数据由首次helper通过父侧私有API写note.txt=alpha并同步，新签名manifest声明 ensureDir(state)+renameFile(note.txt,state/note.txt)。新旧真实raw/packaged Wasm各自绑定版本签名，rollback后实际运行old模块验证旧布局，不用只支持新路径的同一模块冒充可运行旧版本。
 - [ ] **首次初始化RED/GREEN。** 只允许新盘boot1角色初始化。新入口在同盘可信父目录的唯一私有staging路径调用既有initialize_first建立仅bootstrap根，再持有该staging的registry调用crate内部install_new加入精确old_target，验证catalog为ID1/2和autostart=[1]、签名/内容/bootstrap/trust及所有同步后，整体no-clobber发布正式根并同步父目录。对用户可见正式根从未发布单包中间态；helper记录packagesInstalled=2，其余初始化计数按真实物理动作核对（catalog先初始写入再添加app2，因此catalogWrites=2、rootPublished=1，publisherProvisioned/bootstrapPublished各1），后续只读全部0。根已存在（包括空根/损坏根）拒绝首次；不把staging内seed记作UI更新。

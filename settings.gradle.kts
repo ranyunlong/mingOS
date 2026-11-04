@@ -41,3 +41,6 @@ project(":text-entry-demo").projectDir = file("samples/text-entry-demo")
 
 include(":persistent-uninstall-demo")
 project(":persistent-uninstall-demo").projectDir = file("samples/persistent-uninstall-demo")
+
+include(":persistent-update-demo")
+project(":persistent-update-demo").projectDir = file("samples/persistent-update-demo")
