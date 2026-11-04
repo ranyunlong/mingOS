@@ -59,6 +59,35 @@ fn install_update_and_uninstall_are_atomic_and_versioned() {
 }
 
 #[test]
+fn outer_update_marker_blocks_registry_mutations_without_an_inner_journal() {
+    for marker_kind in ["file","directory","symlink"] {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(),fs::Permissions::from_mode(0o700)).unwrap();
+        let root = temp.path().join("install"); fs::create_dir(&root).unwrap(); fs::set_permissions(&root,fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = PackageInstallRegistry::open(&root).unwrap();
+        let old = package("1.0.0", b"\0asm\x01\0\0\0");
+        registry.install_package(&old).unwrap();
+        let marker = root.join("desktop-update-pending-v1.json");
+        match marker_kind {
+            "file" => fs::write(&marker,b"{}").unwrap(),
+            "directory" => fs::create_dir(&marker).unwrap(),
+            "symlink" => std::os::unix::fs::symlink("missing",&marker).unwrap(),
+            _ => unreachable!(),
+        }
+        let before = fs::read(root.join("installed-packages-v1")).unwrap();
+        let data = temp.path().join("data"); fs::create_dir(&data).unwrap(); fs::set_permissions(&data,fs::Permissions::from_mode(0o700)).unwrap();
+        let authority = PackageStorageAuthority::new(AppDataRoot::open(&data).unwrap());
+        let updated = package("2.0.0",b"\0asm\x01\0\0\0updated");
+        assert!(registry.install_package(&updated).unwrap_err().to_string().contains("INSTALL_COORDINATED_UPDATE_PENDING"));
+        assert!(registry.install_from_manifest(&temp.path().join("missing.json")).unwrap_err().to_string().contains("INSTALL_COORDINATED_UPDATE_PENDING"));
+        assert!(registry.uninstall(&old.manifest.id).is_err());
+        assert!(registry.uninstall_with_data_policy(&old.manifest.id,UninstallDataPolicy::PurgePrivateData(&authority)).is_err());
+        assert_eq!(fs::read(root.join("installed-packages-v1")).unwrap(),before);
+        assert_eq!(fs::read_dir(&data).unwrap().count(),0);
+    }
+}
+
+#[test]
 fn malformed_or_unsafe_registry_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();

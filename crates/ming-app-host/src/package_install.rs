@@ -23,6 +23,7 @@ const RECORD_NAME: &str = "installed-packages-v1";
 const LOCK_NAME: &str = ".ming-installed-packages.lock";
 const CONTENT_DIR_NAME: &str = "packages";
 const JOURNAL_NAME: &str = "update-journal-v1";
+pub(crate) const COORDINATED_UPDATE_PENDING_NAME: &str = "desktop-update-pending-v1.json";
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -148,8 +149,33 @@ impl std::fmt::Debug for PackageInstallRegistry {
 }
 
 impl PackageInstallRegistry {
+    /// Outer creation and removal are serialized with ordinary registry writes.
+    /// Do not call the self-locking coordinated mutators inside this closure.
+    #[cfg(feature = "desktop")]
+    pub(crate) fn with_update_operation<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.ensure_records_usable()?;
+        action()
+    }
+
+    pub(crate) fn reject_update_outer(&self) -> Result<()> {
+        match fs::symlink_metadata(self.root.join(COORDINATED_UPDATE_PENDING_NAME)) {
+            Ok(_) => bail!("INSTALL_COORDINATED_UPDATE_PENDING"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     fn ensure_records_usable(&self) -> Result<()> {
         if self.records_unusable.load(Ordering::Acquire) { bail!("INSTALL_RECORD_CACHE_UNUSABLE"); }
+        Ok(())
+    }
+
+    fn coordinated_checkpoint(&self, stage: &str) -> Result<()> {
+        #[cfg(all(test, feature = "desktop"))]
+        crate::persistent_update::test_checkpoint(stage)?;
+        let _ = stage;
         Ok(())
     }
 
@@ -286,6 +312,7 @@ impl PackageInstallRegistry {
 
     pub fn install_package(&self, package: &Package) -> Result<InstallState> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         if package.manifest.data_migration.is_some() { bail!("INSTALL_MIGRATION_REQUIRES_UPDATE"); }
         self.verify_publisher(package)?;
@@ -313,6 +340,7 @@ impl PackageInstallRegistry {
     /// versioned directory, and then publishes the matching active record atomically.
     pub fn install_from_manifest(&self, manifest_path: &Path) -> Result<InstallState> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         let package = load_package(manifest_path).context("INSTALL_PACKAGE_LOAD")?;
         self.install_loaded_package_locked(&package)
@@ -322,6 +350,7 @@ impl PackageInstallRegistry {
     /// The source path is not reopened after that identity check.
     pub(crate) fn install_loaded_package(&self, package: &Package) -> Result<InstallState> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         self.install_loaded_package_locked(package)
     }
@@ -381,6 +410,7 @@ impl PackageInstallRegistry {
         fingerprint: [u8; 32],
     ) -> Result<()> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         let mut records = self.lock_records()?;
         let current = records.get(&rollback.package_id).cloned().context("INSTALL_ROLLBACK_RECORD_MISSING")?;
         if current.state != RecordState::Active || current.version != version || current.fingerprint != fingerprint {
@@ -403,6 +433,7 @@ impl PackageInstallRegistry {
     pub(crate) fn restore_records_snapshot(&self, bytes: &[u8]) -> Result<()> {
         let parsed = parse_records(bytes)?;
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         let mut records = self.lock_records()?;
         self.persist_record_bytes(bytes)?;
         *records = parsed;
@@ -413,6 +444,7 @@ impl PackageInstallRegistry {
     /// The backup survives until a matching desktop startup is confirmed.
     pub fn update_from_manifest(&self, manifest_path: &Path, authority: &PackageStorageAuthority) -> Result<InstallState> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         self.recover_pending_update_locked(authority)?;
         if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         let package = load_package(manifest_path).context("INSTALL_PACKAGE_LOAD")?;
@@ -422,6 +454,7 @@ impl PackageInstallRegistry {
     /// Updates from the exact package checked against the presented prompt.
     pub(crate) fn update_loaded_package(&self, package: &Package, authority: &PackageStorageAuthority) -> Result<InstallState> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         self.recover_pending_update_locked(authority)?;
         if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         self.update_loaded_package_locked(package, authority)
@@ -496,6 +529,7 @@ impl PackageInstallRegistry {
     /// tried once; interrupted startup or rollback restores the old version.
     pub fn recover_pending_update(&self, authority: &PackageStorageAuthority) -> Result<bool> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         self.recover_pending_update_locked(authority)
     }
 
@@ -540,8 +574,18 @@ impl PackageInstallRegistry {
         if journal.phase != UpdatePhase::RecordPublished || decode_hex(&journal.new_fingerprint)? != fingerprint {
             bail!("INSTALL_UPDATE_STARTUP_STATE");
         }
+        #[cfg(feature = "desktop")]
+        let transaction = self.read_coordinated_marker(COORDINATED_UPDATE_PENDING_NAME,
+            crate::persistent_update::MAX_UPDATE_RECORD_BYTES as u64)?.map(|raw| -> Result<String> {
+                let outer = crate::persistent_update::parse_update_record(&raw)?;
+                crate::persistent_update::validate_inner_binding(&outer, &serde_json::to_vec(&journal)?)?;
+                Ok(outer.transaction_id)
+            }).transpose()?;
+        #[cfg(not(feature = "desktop"))]
+        let transaction: Option<String> = { self.reject_update_outer()?; None };
         journal.phase = UpdatePhase::StartupAttempted;
-        self.persist_journal(&journal)?;
+        self.persist_journal_with_transaction(&journal, transaction.as_deref())?;
+        self.coordinated_checkpoint("inner-startup-attempted")?;
         Ok(true)
     }
 
@@ -550,6 +594,7 @@ impl PackageInstallRegistry {
         &self, authority: &PackageStorageAuthority, package_id: &str, version: &str, fingerprint: [u8; 32],
     ) -> Result<bool> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         let Some(mut journal) = self.load_journal()? else { return Ok(false); };
         if journal.phase != UpdatePhase::StartupAttempted || journal.package_id != package_id
             || journal.new_version != version || decode_hex(&journal.new_fingerprint)? != fingerprint {
@@ -577,6 +622,7 @@ impl PackageInstallRegistry {
     /// decision makes all rename/record crash windows retryable on reopening.
     pub fn rollback_pending_update(&self, authority: &PackageStorageAuthority) -> Result<bool> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.reject_update_outer()?;
         self.rollback_pending_update_locked(authority)
     }
 
@@ -636,6 +682,11 @@ impl PackageInstallRegistry {
 
     pub fn uninstall(&self, package_id: &str) -> Result<bool> {
         let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        self.uninstall_locked(package_id)
+    }
+
+    fn uninstall_locked(&self, package_id: &str) -> Result<bool> {
+        self.reject_update_outer()?;
         if self.has_pending_update()? { bail!("INSTALL_UPDATE_PENDING"); }
         if !valid_package_id(package_id) {
             bail!("INSTALL_PACKAGE_ID");
@@ -657,7 +708,8 @@ impl PackageInstallRegistry {
     /// Marks the package removed and optionally performs the separate destructive data purge.
     /// A purge failure leaves the package removed and its private data available for retry.
     pub fn uninstall_with_data_policy(&self, package_id: &str, policy: UninstallDataPolicy<'_>) -> Result<UninstallOutcome> {
-        let registry_changed = self.uninstall(package_id)?;
+        let _operation = self.operation.lock().map_err(|_| anyhow::anyhow!("INSTALL_ROOT_POISONED"))?;
+        let registry_changed = self.uninstall_locked(package_id)?;
         let private_data_purged = match policy {
             UninstallDataPolicy::PreservePrivateData => false,
             UninstallDataPolicy::PurgePrivateData(authority) => authority
@@ -709,7 +761,7 @@ impl PackageInstallRegistry {
     fn journal_path(&self) -> PathBuf { self.root.join(JOURNAL_NAME) }
 
     #[cfg(feature = "desktop")]
-    fn read_coordinated_marker(&self, name: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn read_coordinated_marker(&self, name: &str, limit: u64) -> Result<Option<Vec<u8>>> {
         self.ensure_records_usable()?;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let path = self.root.join(name);
@@ -795,7 +847,7 @@ impl PackageInstallRegistry {
         records.insert(context.package_id.clone(), Record { state: RecordState::Active,
             version: if old { context.old_version.clone() } else { context.new_version.clone() },
             fingerprint: if old { context.old_fingerprint } else { context.new_fingerprint } });
-        if let Err(error) = self.persist_locked(&records) {
+        if let Err(error) = self.persist_locked_with_transaction(&records, Some(&context.outer.transaction_id)) {
             match self.read_coordinated_marker(RECORD_NAME, MAX_RECORD_BYTES)
                 .and_then(|bytes| parse_records(&bytes.context("INSTALL_RECORD_MISSING")?)) {
                 Ok(disk) => *records = disk,
@@ -832,22 +884,27 @@ impl PackageInstallRegistry {
         let path = self.content_path(&context.package_id, &candidate);
         match fs::symlink_metadata(&path) {
             Ok(info) => { if !info.is_dir() || info.file_type().is_symlink() { bail!("INSTALL_CONTENT_DIRECTORY"); } self.verify_stored_package(&path, package)?; }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.stage_package(&path, package)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.stage_package_with_transaction(&path, package, Some(&context.outer.transaction_id))?,
             Err(error) => return Err(error.into()),
         }
         self.recheck_coordinated_markers(&outer, inner.as_deref())?;
+        self.coordinated_checkpoint("candidate-staged")?;
         let mut journal = UpdateJournal { package_id: context.package_id.clone(), old_version: context.old_version.clone(),
             old_fingerprint: hex(&context.old_fingerprint), new_version: context.new_version.clone(), new_fingerprint: hex(&context.new_fingerprint),
             backup_name: context.data.backup_name.clone(), migration_declared: package.manifest.data_migration.is_some(), phase: UpdatePhase::Planned };
-        self.persist_journal(&journal)?;
+        self.persist_journal_with_transaction(&journal, Some(&context.outer.transaction_id))?;
+        self.coordinated_checkpoint("inner-planned")?;
         self.validate_coordinated_context(authority, context)?;
         authority.prepare_coordinated_update(&context.data, package.manifest.data_migration.as_ref())?;
         journal.phase = UpdatePhase::DataSwapped;
-        self.persist_journal(&journal)?;
+        self.persist_journal_with_transaction(&journal, Some(&context.outer.transaction_id))?;
+        self.coordinated_checkpoint("inner-data-swapped")?;
         self.validate_coordinated_context(authority, context)?;
         self.persist_coordinated_record(context, false)?;
+        self.coordinated_checkpoint("record-published")?;
         journal.phase = UpdatePhase::RecordPublished;
-        self.persist_journal(&journal)
+        self.persist_journal_with_transaction(&journal, Some(&context.outer.transaction_id))?;
+        self.coordinated_checkpoint("inner-record-published")
     }
 
     #[cfg(feature = "desktop")]
@@ -872,7 +929,8 @@ impl PackageInstallRegistry {
             && authority.observe_coordinated_update(&context.data)?.files.is_none() { bail!("INSTALL_COORDINATED_MIGRATED_FILES_MISSING"); }
         self.recheck_coordinated_markers(&outer, inner.as_deref())?;
         journal.phase = UpdatePhase::RollingBack;
-        self.persist_journal(&journal)?;
+        self.persist_journal_with_transaction(&journal, Some(&context.outer.transaction_id))?;
+        self.coordinated_checkpoint("inner-rolling-back")?;
         self.validate_coordinated_context(authority, context)?;
         self.persist_coordinated_record(context, true)?;
         self.validate_coordinated_context(authority, context)?;
@@ -905,7 +963,8 @@ impl PackageInstallRegistry {
         // A previous rename may have succeeded before its directory sync failed.
         // Re-establish durable confirmation on every retry before deleting backup.
         journal.phase = UpdatePhase::StartupConfirmed;
-        self.persist_journal(&journal)?;
+        self.persist_journal_with_transaction(&journal, Some(&context.outer.transaction_id))?;
+        self.coordinated_checkpoint("inner-confirmed")?;
         self.validate_coordinated_context(authority, context)?;
         authority.finish_coordinated_update(&context.data, PrivateUpdatePhase::CommittedCleaning, confirmed)?;
         self.validate_coordinated_context(authority, context)?;
@@ -945,10 +1004,17 @@ impl PackageInstallRegistry {
     }
 
     fn persist_journal(&self, journal: &UpdateJournal) -> Result<()> {
+        self.persist_journal_with_transaction(journal, None)
+    }
+
+    fn persist_journal_with_transaction(&self, journal: &UpdateJournal, transaction: Option<&str>) -> Result<()> {
         let bytes = serde_json::to_vec(journal).context("INSTALL_UPDATE_JOURNAL_SERIALIZE")?;
         if bytes.len() > MAX_JOURNAL_BYTES as usize { bail!("INSTALL_UPDATE_JOURNAL_TOO_LARGE"); }
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = self.root.join(format!(".ming-update-journal.tmp-{}-{sequence}", std::process::id()));
+        let temporary = self.root.join(match transaction {
+            Some(id) => format!(".ming-update-journal-{id}.tmp"),
+            None => format!(".ming-update-journal.tmp-{}-{sequence}", std::process::id()),
+        });
         let result = (|| -> Result<()> {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -972,6 +1038,9 @@ impl PackageInstallRegistry {
             Ok(())
         })();
         if let Err(error) = result {
+            // Coordinated recovery validates and removes its exact unpublished
+            // object. Never unlink a pre-existing name after create_new fails.
+            if transaction.is_some() { return Err(error); }
             return match fs::remove_file(&temporary) {
                 Ok(()) => Err(error),
                 Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => Err(error),
@@ -995,6 +1064,10 @@ impl PackageInstallRegistry {
     }
 
     fn persist_locked(&self, records: &BTreeMap<String, Record>) -> Result<()> {
+        self.persist_locked_with_transaction(records, None)
+    }
+
+    fn persist_locked_with_transaction(&self, records: &BTreeMap<String, Record>, transaction: Option<&str>) -> Result<()> {
         let mut bytes = HEADER.as_bytes().to_vec();
         for (id, record) in records {
             bytes.extend_from_slice(id.as_bytes());
@@ -1006,13 +1079,20 @@ impl PackageInstallRegistry {
             bytes.extend_from_slice(hex(&record.fingerprint).as_bytes());
             bytes.push(b'\n');
         }
-        self.persist_record_bytes(&bytes)
+        self.persist_record_bytes_with_transaction(&bytes, transaction)
     }
 
     fn persist_record_bytes(&self, bytes: &[u8]) -> Result<()> {
+        self.persist_record_bytes_with_transaction(bytes, None)
+    }
+
+    fn persist_record_bytes_with_transaction(&self, bytes: &[u8], transaction: Option<&str>) -> Result<()> {
         if bytes.len() as u64 > MAX_RECORD_BYTES { bail!("INSTALL_RECORD_TOO_LARGE"); }
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp_path = self.root.join(format!(".ming-installed-packages.tmp-{}-{sequence}", std::process::id()));
+        let temp_path = self.root.join(match transaction {
+            Some(id) => format!(".ming-update-record-{id}.tmp"),
+            None => format!(".ming-installed-packages.tmp-{}-{sequence}", std::process::id()),
+        });
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1039,6 +1119,9 @@ impl PackageInstallRegistry {
             Ok(())
         })();
         if let Err(error) = result {
+            // Coordinated recovery validates and removes its exact unpublished
+            // object. Never unlink a pre-existing name after create_new fails.
+            if transaction.is_some() { return Err(error); }
             return match fs::remove_file(&temp_path) {
                 Ok(()) => Err(error),
                 Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => Err(error),
@@ -1055,6 +1138,8 @@ impl PackageInstallRegistry {
 
     #[cfg(test)]
     fn record_persist_checkpoint(&self, stage: &'static str) -> Result<()> {
+        #[cfg(feature = "desktop")]
+        crate::persistent_update::test_checkpoint(stage)?;
         let mut fault = self.record_persist_fault.lock().unwrap();
         if *fault == Some(stage) {
             *fault = None;
@@ -1071,25 +1156,44 @@ impl PackageInstallRegistry {
     }
 
     fn stage_package(&self, destination: &Path, package: &Package) -> Result<()> {
+        self.stage_package_with_transaction(destination, package, None)
+    }
+
+    fn stage_package_with_transaction(&self, destination: &Path, package: &Package, transaction: Option<&str>) -> Result<()> {
         let package_root = self.root.join(CONTENT_DIR_NAME);
         ensure_private_directory(&package_root)?;
         let id_root = package_root.join(hex_bytes(package.manifest.id.as_bytes()));
         ensure_private_directory(&id_root)?;
         if destination.exists() { bail!("INSTALL_CONTENT_RACE"); }
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = id_root.join(format!(".tmp-{}-{sequence}", std::process::id()));
-        ensure_private_directory(&temporary)?;
+        let temporary = id_root.join(match transaction {
+            Some(id) => format!(".ming-update-candidate-{id}.tmp"),
+            None => format!(".tmp-{}-{sequence}", std::process::id()),
+        });
+        if transaction.is_some() {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&temporary).context("INSTALL_CONTENT_TEMP_CREATE")?;
+        } else { ensure_private_directory(&temporary)?; }
         let result = (|| -> Result<()> {
+            self.coordinated_checkpoint("candidate-created")?;
             let manifest = serde_json::to_vec(&package.manifest).context("INSTALL_MANIFEST_SERIALIZE")?;
             write_private_file(&temporary.join("app.json"), &manifest)?;
+            self.coordinated_checkpoint("candidate-manifest-written")?;
             write_private_file(&temporary.join(&package.manifest.entry), &package.bytes)?;
+            self.coordinated_checkpoint("candidate-wasm-written")?;
             File::open(&temporary).context("INSTALL_CONTENT_OPEN")?.sync_all().context("INSTALL_CONTENT_SYNC")?;
+            self.coordinated_checkpoint("candidate-directory-synced")?;
             fs::rename(&temporary, destination).context("INSTALL_CONTENT_RENAME")?;
+            self.coordinated_checkpoint("candidate-renamed")?;
             File::open(&id_root).context("INSTALL_CONTENT_PARENT_OPEN")?.sync_all().context("INSTALL_CONTENT_PARENT_SYNC")?;
+            self.coordinated_checkpoint("candidate-parent-synced")?;
             File::open(&package_root).context("INSTALL_CONTENT_ROOT_OPEN")?.sync_all().context("INSTALL_CONTENT_ROOT_SYNC")?;
             Ok(())
         })();
         if let Err(error) = result {
+            // Coordinated recovery validates and removes its exact unpublished
+            // object. Never unlink a pre-existing name after create_new fails.
+            if transaction.is_some() { return Err(error); }
             return match fs::remove_dir_all(&temporary) {
                 Ok(()) => Err(error),
                 Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => Err(error),
@@ -1299,6 +1403,17 @@ mod tests {
         let fingerprint = load_package(&active).unwrap().storage_fingerprint();
         drop(registry);
         (temp, install_root, authority, fingerprint)
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    #[test]
+    fn no_desktop_startup_rejects_coordinated_outer_before_writing() {
+        let (_temp,root,_authority,fingerprint)=pending_update_fixture();
+        let registry=PackageInstallRegistry::open(&root).unwrap();
+        fs::write(root.join(COORDINATED_UPDATE_PENDING_NAME),b"blocked").unwrap();
+        let before=fs::read(registry.journal_path()).unwrap();
+        assert!(registry.begin_update_startup("dev.example.installed",fingerprint).is_err());
+        assert_eq!(fs::read(registry.journal_path()).unwrap(),before);
     }
 
     #[test]
@@ -1577,7 +1692,12 @@ mod coordinated_tests {
             assert_eq!(phase, (stage == "registry-journal-directory-sync").then_some(UpdatePhase::Planned), "{stage}");
             let root = registry.root.clone(); drop(registry);
             let reopened = PackageInstallRegistry::open_verified_existing(&root).unwrap();
-            reopened.rollback_coordinated_update(&authority, &context).unwrap();
+            if !stage.ends_with("-create") && !stage.ends_with("-directory-sync") {
+                let before=tree(&root);let data=tree(&context.data_root);
+                assert!(reopened.rollback_coordinated_update(&authority,&context).is_err());
+                assert_eq!(tree(&root),before);assert_eq!(tree(&context.data_root),data);
+            }
+            persistent_update::recover_loaded_update(&reopened,&authority,&context.data_root,&context.outer.transaction_id).unwrap();
             assert!(reopened.inspect_coordinated_journal().unwrap().is_none());
             assert_eq!(authority.observe_coordinated_update(&context.data).unwrap(), context.data.baseline);
         }
@@ -1596,7 +1716,12 @@ mod coordinated_tests {
             registry.verify_records_snapshot(&fs::read(registry.root.join(RECORD_NAME)).unwrap()).unwrap();
             let root = registry.root.clone(); drop(registry);
             let reopened = PackageInstallRegistry::open_verified_existing(&root).unwrap();
-            reopened.rollback_coordinated_update(&authority, &context).unwrap();
+            if !stage.ends_with("-create") && !stage.ends_with("-directory-sync") {
+                let before=tree(&root);let data=tree(&context.data_root);
+                assert!(reopened.rollback_coordinated_update(&authority,&context).is_err());
+                assert_eq!(tree(&root),before);assert_eq!(tree(&context.data_root),data);
+            }
+            persistent_update::recover_loaded_update(&reopened,&authority,&context.data_root,&context.outer.transaction_id).unwrap();
             assert_eq!(reopened.active_records().unwrap()[&context.package_id].0, context.old_version);
             assert_eq!(authority.observe_coordinated_update(&context.data).unwrap(), context.data.baseline);
         }

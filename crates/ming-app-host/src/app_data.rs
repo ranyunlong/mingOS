@@ -256,6 +256,20 @@ pub(crate) enum PrivateUpdatePhase { BeforeSwap, SwappedUnconfirmed, RestoringOl
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CoordinatedCleanupPhase { BeforeConfirmation, Cleaning, JournalCleared }
 #[cfg(target_os = "linux")]
+#[cfg(test)]
+thread_local! { pub(crate) static UPDATE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> anyhow::Result<()>>>> = std::cell::RefCell::new(None); }
+#[cfg(all(target_os = "linux", test))]
+pub(crate) fn update_test_checkpoint(stage: &str) -> anyhow::Result<()> {
+    UPDATE_TEST_HOOK.with(|slot| { if let Some(hook) = slot.borrow_mut().as_mut() { hook(stage)?; } Ok(()) })
+}
+#[cfg(target_os = "linux")]
+fn coordinated_checkpoint(stage: &'static str) -> Result<()> {
+    #[cfg(test)]
+    update_test_checkpoint(&format!("data-{stage}")).map_err(|_| AppDataError::Io)?;
+    let _ = stage;
+    Ok(())
+}
+#[cfg(target_os = "linux")]
 impl CoordinatedPrivateUpdate {
     fn validate(&self) -> Result<()> {
         let valid_hash = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
@@ -454,7 +468,7 @@ impl PackageStorageAuthority {
     /// Only the parent coordinator may call these after binding its outer and inner journals.
     #[cfg(target_os = "linux")]
     pub(crate) fn prepare_coordinated_update(&self, context: &CoordinatedPrivateUpdate, migration: Option<&DataMigration>) -> Result<()> {
-        self.with_coordinated_target(context, |root| platform::prepare_coordinated(root, context, migration, &mut |_| Ok(())))
+        self.with_coordinated_target(context, |root| platform::prepare_coordinated(root, context, migration, &mut coordinated_checkpoint))
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn observe_coordinated_update(&self, context: &CoordinatedPrivateUpdate) -> Result<PrivateUpdateBaseline> {
@@ -470,12 +484,12 @@ impl PackageStorageAuthority {
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn rollback_coordinated_update(&self, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase) -> Result<()> {
-        self.with_coordinated_target(context, |root| platform::rollback_coordinated(root, context, phase, &mut |_| Ok(())))
+        self.with_coordinated_target(context, |root| platform::rollback_coordinated(root, context, phase, &mut coordinated_checkpoint))
     }
     /// Requires the durable outer commit decision and inner StartupConfirmed state.
     #[cfg(target_os = "linux")]
     pub(crate) fn finish_coordinated_update(&self, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase, confirmed: &PrivateUpdateBaseline) -> Result<()> {
-        self.with_coordinated_target(context, |root| platform::finish_coordinated(root, context, phase, confirmed, &mut |_| Ok(())))
+        self.with_coordinated_target(context, |root| platform::finish_coordinated(root, context, phase, confirmed, &mut coordinated_checkpoint))
     }
     /// Read-only layout check; callers must retain the registry operation mutex
     /// and launch gate until the matching mutation completes.

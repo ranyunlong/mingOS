@@ -114,7 +114,7 @@ fn content_shape(root: &Path) -> Result<BTreeMap<PathBuf, ContentStamp>> {
     }
     let mut result=BTreeMap::new(); visit(root,root,&mut result)?; Ok(result)
 }
-fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>, total: &mut usize, markers: &[(&str, &[u8])]) -> Result<()> {
+fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>, total: &mut usize, markers: &[(&str, &[u8])], temporary: &[PathBuf]) -> Result<()> {
     metadata(directory, true)?;
     ensure!(directory.strip_prefix(root)?.components().count() <= 3, "PERSISTENT_CONTENT_DEPTH");
     let children = fs::read_dir(directory)?.take(MAX_FILES + 1).collect::<std::io::Result<Vec<_>>>()?;
@@ -127,6 +127,7 @@ fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>,
     }
     for entry in children {
         let path = entry.path();
+        if temporary.iter().any(|temporary|temporary==&path) { continue; }
         let rel = relative(root, &path)?;
         let info = fs::symlink_metadata(&path)?;
         if info.is_dir() && !info.file_type().is_symlink() {
@@ -134,7 +135,7 @@ fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>,
             ensure!(parts[0] == "packages" && parts.len() <= 3, "PERSISTENT_UNKNOWN_DIRECTORY");
             if parts.len() >= 2 { ensure!(!parts[1].is_empty() && parts[1].len() <= 512 && parts[1].len() % 2 == 0 && parts[1].bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "PERSISTENT_PACKAGE_DIRECTORY"); }
             if parts.len() == 3 { ensure!(parts[2].len() <= 160 && parts[2].bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c) || c == b'.' || c == b'-'), "PERSISTENT_VERSION_DIRECTORY"); }
-            collect(root, &path, files, total, markers)?;
+            collect(root, &path, files, total, markers, temporary)?;
         } else {
             let parts: Vec<_> = rel.split('/').collect();
             if let Some((_, expected)) = markers.iter().find(|(name, _)| *name == rel) {
@@ -212,7 +213,7 @@ fn snapshot_state(registry: &PackageInstallRegistry, pending: Option<&[u8]>, upd
     }
     let before_shape = content_shape(root)?;
     let mut files = BTreeMap::new();
-    collect(root, root, &mut files, &mut 0, &markers)?;
+    collect(root, root, &mut files, &mut 0, &markers, update.map(|access|access.temporary()).unwrap_or(&[]))?;
     let required = |name: &str| -> Result<&Vec<u8>> { files.get(name).with_context(|| format!("PERSISTENT_REQUIRED {name}")) };
     // The receipt hashes these bytes; validate the same bytes rather than
     // accidentally combining a changed disk registry with cached records.
@@ -262,7 +263,7 @@ fn snapshot_state(registry: &PackageInstallRegistry, pending: Option<&[u8]>, upd
         ensure!(read_file(&root.join(PENDING_NAME), 4096)? == expected, "PERSISTENT_PENDING_CHANGED");
     }
     let mut after_files = BTreeMap::new();
-    collect(root, root, &mut after_files, &mut 0, &markers)?;
+    collect(root, root, &mut after_files, &mut 0, &markers, update.map(|access|access.temporary()).unwrap_or(&[]))?;
     for (name,expected) in &markers {
         ensure!(read_file(&root.join(name),16*1024)?==*expected,"PERSISTENT_PENDING_CHANGED");
     }
@@ -280,7 +281,7 @@ pub fn open_existing(root: &Path) -> Result<OpenedInstall> {
     absent(&root.join(PENDING_NAME))?;
     // Opening an existing root must never create either lock or repair state.
     let mut files = BTreeMap::new();
-    collect(root, root, &mut files, &mut 0, &[])?;
+    collect(root, root, &mut files, &mut 0, &[], &[])?;
     for name in [CATALOG_NAME, BOOTSTRAP_NAME, REGISTRY_NAME, TRUST_NAME] {
         ensure!(files.contains_key(name), "PERSISTENT_REQUIRED {name}");
     }
@@ -520,7 +521,14 @@ impl MarkerIdentity {
         Ok(())
     }
 }
-fn create_pending(root: &Path, bytes: &[u8], hook: &mut impl FnMut(&'static str) -> Result<()>) -> std::result::Result<MarkerIdentity, PhaseError> {
+fn create_pending(registry: &PackageInstallRegistry, bytes: &[u8], hook: &mut impl FnMut(&'static str) -> Result<()>) -> std::result::Result<MarkerIdentity, PhaseError> {
+    let nested = registry.with_update_operation(|| {
+        registry.reject_update_outer()?;
+        Ok(create_pending_locked(registry.root_path(), bytes, hook))
+    }).map_err(|error| PhaseError { stage: "pending-create", error })?;
+    nested
+}
+fn create_pending_locked(root: &Path, bytes: &[u8], hook: &mut impl FnMut(&'static str) -> Result<()>) -> std::result::Result<MarkerIdentity, PhaseError> {
     let mut file = at(hook, "pending-create", || Ok(OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(root.join(PENDING_NAME))?))?;
     let identity = at(hook, "pending-identity", || MarkerIdentity::of(&file))?;
     at(hook, "pending-write", || { file.write_all(bytes)?; Ok(()) })?;
@@ -531,8 +539,9 @@ fn create_pending(root: &Path, bytes: &[u8], hook: &mut impl FnMut(&'static str)
 }
 // One bounded compensation attempt. A failed or absent namespace check is not
 // evidence that a marker remains durable. Never overwrite a pre-existing file.
-fn block_after_failure(root: &Path, bytes: &[u8], error: PhaseError, original_durable: Option<MarkerIdentity>,
+fn block_after_failure(registry: &PackageInstallRegistry, bytes: &[u8], error: PhaseError, original_durable: Option<MarkerIdentity>,
     hook: &mut impl FnMut(&'static str) -> Result<()>) -> InstallFailure {
+    let root = registry.root_path();
     let mut failure = failed(error.stage, &error.error, true);
     if original_durable.is_some_and(|identity| identity.verify(root, bytes).is_ok()) {
         failure.status = "persistent-blocked";
@@ -541,7 +550,10 @@ fn block_after_failure(root: &Path, bytes: &[u8], error: PhaseError, original_du
     }
     failure.compensation_attempted = true;
     let compensation = (|| {
-        let mut file = at(hook, "compensation-create", || Ok(OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(root.join(PENDING_NAME))?))?;
+        let mut file = at(hook, "compensation-create", || registry.with_update_operation(|| {
+            registry.reject_update_outer()?;
+            Ok(OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(root.join(PENDING_NAME))?)
+        }))?;
         let identity = at(hook, "compensation-identity", || MarkerIdentity::of(&file))?;
         at(hook, "compensation-write", || { file.write_all(bytes)?; Ok(()) })?;
         at(hook, "compensation-file-sync", || { file.sync_all()?; Ok(()) })?;
@@ -561,15 +573,16 @@ fn block_after_failure(root: &Path, bytes: &[u8], error: PhaseError, original_du
     }
     failure
 }
-fn remove_pending(root: &Path, bytes: &[u8], identity: MarkerIdentity, hook: &mut impl FnMut(&'static str) -> Result<()>) -> std::result::Result<(), InstallFailure> {
+fn remove_pending(registry: &PackageInstallRegistry, bytes: &[u8], identity: MarkerIdentity, hook: &mut impl FnMut(&'static str) -> Result<()>) -> std::result::Result<(), InstallFailure> {
+    let root = registry.root_path();
     if let Err(error) = at(hook, "pending-remove-readback", || {
         identity.verify(root, bytes)
-    }) { return Err(block_after_failure(root, bytes, error, None, hook)); }
+    }) { return Err(block_after_failure(registry, bytes, error, None, hook)); }
     if let Err(error) = at(hook, "pending-unlink", || { fs::remove_file(root.join(PENDING_NAME))?; Ok(()) }) {
-        return Err(block_after_failure(root, bytes, error, Some(identity), hook));
+        return Err(block_after_failure(registry, bytes, error, Some(identity), hook));
     }
     if let Err(error) = at(hook, "pending-remove-directory-sync", || { File::open(root)?.sync_all()?; Ok(()) }) {
-        return Err(block_after_failure(root, bytes, error, None, hook));
+        return Err(block_after_failure(registry, bytes, error, None, hook));
     }
     Ok(())
 }
@@ -599,13 +612,13 @@ pub(crate) fn install_new_with_hook(registry: &PackageInstallRegistry, package: 
         Ok((catalog, old_registry, old_catalog, pending, pending_bytes))
     })();
     let (catalog_bytes, old_registry, old_catalog, pending, pending_bytes) = prepare.map_err(|error| failed("prepare", error, false))?;
-    let pending_identity = match create_pending(root, &pending_bytes, hook) {
+    let pending_identity = match create_pending(registry, &pending_bytes, hook) {
         Ok(identity) => identity,
         Err(error) => {
             if error.stage == "pending-create" && absent(&root.join(PENDING_NAME)).is_ok() {
                 return Err(failed(error.stage, error.error, false));
             }
-            return Err(block_after_failure(root, &pending_bytes, error, None, hook));
+            return Err(block_after_failure(registry, &pending_bytes, error, None, hook));
         }
     };
     let operation = (|| {
@@ -631,22 +644,22 @@ pub(crate) fn install_new_with_hook(registry: &PackageInstallRegistry, package: 
             let current = snapshot_while_pending(registry, &pending, &pending_bytes, false)?;
             ensure!(current.apps == old.apps && current.trust_sha256 == old.trust_sha256 && current.bootstrap_sha256 == old.bootstrap_sha256, "PERSISTENT_ROLLBACK_BASE_DRIFT"); Ok(())
         }));
-        if let Err(rollback) = restored { return Err(block_after_failure(root, &pending_bytes, rollback, Some(pending_identity), hook)); }
-        remove_pending(root, &pending_bytes, pending_identity, hook)?;
+        if let Err(rollback) = restored { return Err(block_after_failure(registry, &pending_bytes, rollback, Some(pending_identity), hook)); }
+        remove_pending(registry, &pending_bytes, pending_identity, hook)?;
         at(hook, "rollback-final-readback", || snapshot(registry))
-            .map_err(|error| block_after_failure(root, &pending_bytes, error, None, hook))?;
+            .map_err(|error| block_after_failure(registry, &pending_bytes, error, None, hook))?;
         return Err(failed(error.stage, error.error, false));
     }
-    remove_pending(root, &pending_bytes, pending_identity, hook)?;
+    remove_pending(registry, &pending_bytes, pending_identity, hook)?;
     let catalog = at(hook, "catalog-final-load", || {
         let (catalog, grants) = load_catalog_with_install_registry(&root.join(CATALOG_NAME), registry)?;
         ensure!(crate::desktop_catalog::encode_installed_catalog(&catalog, &grants)? == catalog_bytes, "PERSISTENT_COMMIT_CHANGED");
         Ok(catalog)
-    }).map_err(|error| block_after_failure(root, &pending_bytes, error, None, hook))?;
+    }).map_err(|error| block_after_failure(registry, &pending_bytes, error, None, hook))?;
     let content = at(hook, "final-readback", || snapshot(registry))
-        .map_err(|error| block_after_failure(root, &pending_bytes, error, None, hook))?;
+        .map_err(|error| block_after_failure(registry, &pending_bytes, error, None, hook))?;
     if content.catalog_sha256 != pending.new_catalog_sha256 {
-        return Err(block_after_failure(root, &pending_bytes, PhaseError { stage: "final-readback", error: anyhow::anyhow!("PERSISTENT_COMMIT_CHANGED") }, None, hook));
+        return Err(block_after_failure(registry, &pending_bytes, PhaseError { stage: "final-readback", error: anyhow::anyhow!("PERSISTENT_COMMIT_CHANGED") }, None, hook));
     }
     Ok(CommittedInstall { catalog, receipt: InstallCommit { schema_version: 1, status: "committed", package_id: package.manifest.id.clone(),
         version: package.manifest.version.clone(), fingerprint: fingerprint(package.storage_fingerprint()), registry_root: root.into(), catalog_path: root.join(CATALOG_NAME), content, persistent_block_confirmed: false } })
@@ -708,13 +721,13 @@ pub(crate) fn uninstall_existing_with_hook(registry: &PackageInstallRegistry, pa
         Ok((catalog_bytes, old_registry, old_catalog, pending, pending_bytes))
     })();
     let (catalog_bytes, old_registry, old_catalog, pending, pending_bytes) = prepare.map_err(|error| failed("prepare", error, false))?;
-    let pending_identity = match create_pending(root, &pending_bytes, hook) {
+    let pending_identity = match create_pending(registry, &pending_bytes, hook) {
         Ok(identity) => identity,
         Err(error) => {
             if error.stage == "pending-create" && absent(&root.join(PENDING_NAME)).is_ok() {
                 return Err(failed(error.stage, error.error, false));
             }
-            return Err(block_after_failure(root, &pending_bytes, error, None, hook));
+            return Err(block_after_failure(registry, &pending_bytes, error, None, hook));
         }
     };
     let operation = (|| {
@@ -745,19 +758,19 @@ pub(crate) fn uninstall_existing_with_hook(registry: &PackageInstallRegistry, pa
             ensure!(uninstall_snapshot_while_pending(registry, &pending, &pending_bytes)? == old, "PERSISTENT_ROLLBACK_CHANGED");
             Ok(())
         }));
-        if let Err(rollback) = restored { return Err(block_after_failure(root, &pending_bytes, rollback, Some(pending_identity), hook)); }
-        remove_pending(root, &pending_bytes, pending_identity, hook)?;
+        if let Err(rollback) = restored { return Err(block_after_failure(registry, &pending_bytes, rollback, Some(pending_identity), hook)); }
+        remove_pending(registry, &pending_bytes, pending_identity, hook)?;
         at(hook, "rollback-final-readback", || {
             ensure!(snapshot(registry)? == old, "PERSISTENT_ROLLBACK_CHANGED"); Ok(())
-        }).map_err(|error| block_after_failure(root, &pending_bytes, error, None, hook))?;
+        }).map_err(|error| block_after_failure(registry, &pending_bytes, error, None, hook))?;
         return Err(failed(error.stage, error.error, false));
     }
-    remove_pending(root, &pending_bytes, pending_identity, hook)?;
+    remove_pending(registry, &pending_bytes, pending_identity, hook)?;
     let catalog = at(hook, "catalog-final-load", || {
         let (catalog, grants) = load_catalog_with_install_registry(&root.join(CATALOG_NAME), registry)?;
         ensure!(crate::desktop_catalog::encode_installed_catalog(&catalog, &grants)? == catalog_bytes, "PERSISTENT_COMMIT_CHANGED");
         Ok(catalog)
-    }).map_err(|error| block_after_failure(root, &pending_bytes, error, None, hook))?;
+    }).map_err(|error| block_after_failure(registry, &pending_bytes, error, None, hook))?;
     let (content, removed) = at(hook, "final-readback", || {
         let content = snapshot(registry)?;
         registry.verify_removed_transition(&old_registry, package)?;
@@ -765,7 +778,7 @@ pub(crate) fn uninstall_existing_with_hook(registry: &PackageInstallRegistry, pa
         ensure!(removed == removed_identity(package) && content.catalog_sha256 == pending.new_catalog_sha256, "PERSISTENT_COMMIT_CHANGED");
         verify_uninstall_content(&old, &content, &package.manifest.id)?;
         Ok((content, removed))
-    }).map_err(|error| block_after_failure(root, &pending_bytes, error, None, hook))?;
+    }).map_err(|error| block_after_failure(registry, &pending_bytes, error, None, hook))?;
     Ok(CommittedUninstall { catalog, receipt: UninstallCommit { schema_version: 1, status: "committed", removed,
         registry_root: root.into(), catalog_path: root.join(CATALOG_NAME), content } })
 }
