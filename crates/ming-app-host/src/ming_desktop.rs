@@ -243,6 +243,14 @@ struct NativeLaunchEvidence {
     ready: bool,
 }
 
+#[cfg(target_os = "linux")]
+struct DesktopTrialUpdate {
+    record: crate::persistent_update::UpdateRecord,
+    launched: bool,
+    down: Option<u64>,
+    confirmation: Option<serde_json::Value>,
+}
+
 pub(crate) struct Session {
     app_data: crate::desktop_catalog::DesktopDataConfig,
     #[cfg(target_os = "linux")]
@@ -257,6 +265,16 @@ pub(crate) struct Session {
     persistent_uninstall_output_faults: BTreeSet<&'static str>,
     #[cfg(target_os = "linux")]
     storage_prompt_revision: u64,
+    #[cfg(target_os = "linux")]
+    persistent_update: Option<DesktopTrialUpdate>,
+    #[cfg(target_os = "linux")]
+    pending_update_identity: Option<crate::desktop_catalog::CatalogEntry>,
+    #[cfg(target_os = "linux")]
+    persistent_update_state: Option<serde_json::Value>,
+    #[cfg(target_os = "linux")]
+    native_dock_launch_active: bool,
+    #[cfg(all(test, target_os = "linux"))]
+    persistent_update_output_faults: BTreeSet<&'static str>,
     #[cfg(target_os = "linux")]
     native_uninstall_confirm: Option<serde_json::Value>,
     #[cfg(target_os = "linux")]
@@ -355,6 +373,16 @@ impl Session {
             persistent_uninstall_output_faults: BTreeSet::new(),
             #[cfg(target_os = "linux")]
             storage_prompt_revision: 0,
+            #[cfg(target_os = "linux")]
+            persistent_update: None,
+            #[cfg(target_os = "linux")]
+            pending_update_identity: None,
+            #[cfg(target_os = "linux")]
+            persistent_update_state: None,
+            #[cfg(target_os = "linux")]
+            native_dock_launch_active: false,
+            #[cfg(all(test, target_os = "linux"))]
+            persistent_update_output_faults: BTreeSet::new(),
             #[cfg(target_os = "linux")]
             native_uninstall_confirm: None,
             #[cfg(target_os = "linux")]
@@ -455,6 +483,8 @@ impl Session {
         self.pending_autostart.pop_front()
     }
     fn launch_pending_autostart(&mut self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.persistent_update.is_some() { return Ok(()); }
         while let Some(app) = self.take_pending_autostart() {
             self.launch(app)?;
         }
@@ -569,20 +599,23 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn respond_storage_prompt(&mut self, allow: bool) -> Result<()> {
+        self.ensure_no_persistent_update()?;
         if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
         let pending = self.pending_storage.as_ref().context("DESKTOP_STORAGE_NO_PROMPT")?;
+        if self.persistent_update.is_some() { bail!("DESKTOP_UPDATE_PENDING"); }
         if !pending.presented || !self.sink_ready { bail!("DESKTOP_STORAGE_NOT_PRESENTED"); }
         if allow && matches!(&pending.pending, DesktopStorageDecision::Information) { bail!("DESKTOP_STORAGE_CONFLICT"); }
         if allow && !pending.prompt.has_allow() { bail!("DESKTOP_STORAGE_CONFLICT"); }
         let pending = self.pending_storage.take().expect("checked pending");
         let app = pending.app;
         if self.options.persistent_install_root.is_some() && matches!(&pending.pending,
-            DesktopStorageDecision::Install { update: true, .. } | DesktopStorageDecision::Purge { .. }) {
+            DesktopStorageDecision::Purge { .. }) {
             bail!("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED");
         }
         match pending.pending {
             DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, update, retry: _ } => {
                 if !allow {
+                    self.pending_update_identity = None;
                     self.changed();
                     self.launch_pending_autostart()?;
                     return Ok(());
@@ -614,6 +647,8 @@ impl Session {
                     return Ok(());
                 }
                 if self.options.persistent_install_root.is_some() {
+                    if update { return self.begin_persistent_update(package, app); }
+                    self.ensure_no_persistent_update()?;
                     return self.commit_persistent_install(package, app, package_id, version, fingerprint, manifest_path);
                 }
                 let previous_catalog = self.catalog.clone();
@@ -907,6 +942,7 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn begin_storage_management(&mut self, app: u16) -> Result<()> {
+        self.ensure_no_persistent_update()?;
         if self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen { bail!("DESKTOP_STORAGE_UNAVAILABLE"); }
         let entry = self.catalog.apps.iter().find(|entry| entry.id == app).context("DESKTOP_UNKNOWN_APP")?;
         let package = crate::package::load_package(&entry.manifest_path).ok();
@@ -961,6 +997,165 @@ impl Session {
         self.reset_input()?;
         self.changed();
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_no_persistent_update(&self) -> Result<()> {
+        if self.options.persistent_install_root.is_none() { return Ok(()); }
+        if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
+        if self.persistent_update.is_some() { bail!("DESKTOP_UPDATE_PENDING"); }
+        let registry = self.options.install_registry.as_ref().context("DESKTOP_UPDATE_REGISTRY")?;
+        if registry.read_coordinated_marker(crate::persistent_update::UPDATE_PENDING_NAME, 4096)?.is_some()
+            || registry.has_pending_update()? { bail!("DESKTOP_UPDATE_PENDING"); }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn verify_persistent_update_target(&self, app: u16) -> Result<()> {
+        self.ensure_no_persistent_update()?;
+        if !(2..=4).contains(&app) { bail!("DESKTOP_BOOTSTRAP_PROTECTED"); }
+        if self.closing.is_some() || self.instances.iter().any(|instance| instance.app == app)
+            || self.pending_autostart.contains(&app) { bail!("DESKTOP_UPDATE_RUNNING_OR_PENDING"); }
+        let entry = self.catalog.apps.iter().find(|entry| entry.id == app).context("DESKTOP_UNKNOWN_APP")?;
+        let package = crate::package::load_package(&entry.manifest_path)?;
+        if package.manifest.id != entry.package_id || package.storage_fingerprint() != entry.package_fingerprint
+            || package.manifest.sdk_version != 6 { bail!("DESKTOP_PACKAGE_CHANGED"); }
+        self.options.install_registry.as_ref().context("DESKTOP_UPDATE_REGISTRY")?.verify_package(&package)
+    }
+    #[cfg(target_os = "linux")]
+    fn update_state(&mut self, record: &crate::persistent_update::UpdateRecord, status: &str) {
+        self.persistent_update_state = Some(serde_json::json!({"transactionId":record.transaction_id,
+            "app":record.app,"packageId":record.new.package_id,"newVersion":record.new.version,"status":status}));
+        self.changed();
+    }
+    #[cfg(target_os = "linux")]
+    fn update_output_checkpoint(&self, _stage: &'static str) -> Result<()> {
+        #[cfg(test)]
+        if self.persistent_update_output_faults.contains(_stage) { bail!("injected {_stage}"); }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn begin_persistent_update(&mut self, package: crate::package::Package, app: u16) -> Result<()> {
+        if package.manifest.sdk_version != 6 || package.manifest.entry != "main.wasm" { bail!("DESKTOP_UPDATE_PACKAGE_SCHEMA"); }
+        self.verify_persistent_update_target(app)?;
+        let previous = self.pending_update_identity.as_ref().context("DESKTOP_UPDATE_CONFIRMATION_IDENTITY")?;
+        let current = self.catalog.apps.iter().find(|entry| entry.id == app).context("DESKTOP_UNKNOWN_APP")?;
+        if previous.id != app || previous.package_id != package.manifest.id || previous.package_id != current.package_id
+            || previous.package_fingerprint != current.package_fingerprint || previous.manifest_path != current.manifest_path {
+            bail!("DESKTOP_PACKAGE_CHANGED");
+        }
+        if self.options.persistent_update_receipts && self.native_uninstall_confirm.is_none() {
+            bail!("DESKTOP_UPDATE_NATIVE_CONFIRMATION_REQUIRED");
+        }
+        if self.storage_authority.is_none() {
+            let root = self.app_data.root.clone().context("DESKTOP_DATA_ROOT_REQUIRED")?;
+            self.storage_authority = Some(Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(root)?));
+        }
+        let registry = self.options.install_registry.as_ref().context("DESKTOP_UPDATE_REGISTRY")?;
+        let authority = self.storage_authority.as_ref().context("DESKTOP_UPDATE_STORAGE_AUTHORITY")?;
+        let data_root = self.options.data_root_path.as_deref().context("DESKTOP_DATA_ROOT_REQUIRED")?;
+        match crate::persistent_update::begin_existing_update(registry, authority, data_root, &package, app) {
+            Ok(trial) => {
+                self.catalog = trial.catalog;
+                self.pending_update_identity = None;
+                self.reset_catalog_binding(app);
+                self.update_state(&trial.record, "trial");
+                self.persistent_update = Some(DesktopTrialUpdate { record: trial.record.clone(), launched: false, down: None,
+                    confirmation: self.native_uninstall_confirm.clone() });
+                if self.options.persistent_update_receipts {
+                    let output = (|| {
+                        let anchor = self.native_anchor()?;
+                        self.emit_native_receipt("trial-published", serde_json::json!({"record":trial.record,
+                            "confirmation":self.native_uninstall_confirm,"anchor":anchor}))
+                    })();
+                    if let Err(error) = output {
+                        return Err(self.uninstall_session_failure("DESKTOP_PERSISTENT_UPDATE_TRIAL_OUTPUT", error));
+                    }
+                }
+                Ok(())
+            }
+            Err(failure) => {
+                if !matches!(failure.status.as_str(), "rejected" | "rolled-back") {
+                    let record = self.options.install_registry.as_ref().and_then(|registry|
+                        registry.read_coordinated_marker(crate::persistent_update::UPDATE_PENDING_NAME,4096).ok().flatten())
+                        .and_then(|raw|crate::persistent_update::parse_update_record(&raw).ok());
+                    if let Some(record) = record { self.update_state(&record, if failure.status=="commit-uncertain" { "uncertain" } else { "blocked" }); }
+                    return Err(self.uninstall_session_failure("DESKTOP_PERSISTENT_UPDATE_FATAL", failure.into()));
+                }
+                self.log(app, 0, 0, "update-not-saved", failure.to_string()); self.changed();
+                Ok(())
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn check_persistent_launch(&self, app: u16) -> Result<()> {
+        if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
+        if self.options.persistent_install_root.is_none() { return Ok(()); }
+        if let Some(trial) = &self.persistent_update {
+            if trial.record.app != app || trial.launched || !self.native_dock_launch_active
+                || self.instances.iter().any(|instance| instance.app == app) {
+                bail!("DESKTOP_UPDATE_NATIVE_TRIAL_REQUIRED");
+            }
+            let registry = self.options.install_registry.as_ref().context("DESKTOP_UPDATE_REGISTRY")?;
+            let raw = registry.read_coordinated_marker(crate::persistent_update::UPDATE_PENDING_NAME,4096)?
+                .context("DESKTOP_UPDATE_OUTER_MISSING")?;
+            if crate::persistent_update::parse_update_record(&raw)? != trial.record {
+                bail!("DESKTOP_UPDATE_TRANSACTION_CHANGED");
+            }
+            let pending = registry.pending_update()?.context("DESKTOP_UPDATE_STARTUP_PENDING_MISSING")?;
+            if pending.package_id != trial.record.new.package_id || pending.new_version != trial.record.new.version
+                || pending.new_fingerprint.iter().map(|byte|format!("{byte:02x}")).collect::<String>() != trial.record.new.fingerprint {
+                bail!("DESKTOP_UPDATE_PACKAGE_CHANGED");
+            }
+        } else { self.ensure_no_persistent_update()?; }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn launch_from_native_dock(&mut self, app: u16) -> Result<()> {
+        self.native_dock_launch(app);
+        let trial_action = self.persistent_update.is_some();
+        self.native_dock_launch_active = true;
+        let result = if trial_action { self.perform(&DesktopAction::Launch { app }) }
+            else { self.user_action(&DesktopAction::Launch { app }) };
+        self.native_dock_launch_active = false;
+        if let Err(error) = result {
+            if self.persistent_install_blocked { return Err(error); }
+            if self.persistent_update.as_ref().is_some_and(|trial|trial.record.app==app)
+                && !self.instances.iter().any(|instance| instance.app==app) {
+                self.rollback_persistent_update()?;
+            }
+            self.log(app,0,0,"action_rejected",format!("{error:#}"));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn rollback_persistent_update(&mut self) -> Result<()> {
+        let Some(trial) = self.persistent_update.as_ref() else { return Ok(()); };
+        let record = trial.record.clone();
+        let result = (|| {
+            let registry = self.options.install_registry.as_ref().context("DESKTOP_UPDATE_REGISTRY")?;
+            let authority = self.storage_authority.as_ref().context("DESKTOP_UPDATE_STORAGE_AUTHORITY")?;
+            let data = self.options.data_root_path.as_deref().context("DESKTOP_DATA_ROOT_REQUIRED")?;
+            let recovered = crate::persistent_update::recover_loaded_update(registry, authority, data, &record.transaction_id)?;
+            if !matches!(recovered, crate::persistent_update::UpdateRecovery::RolledBack(_)) { bail!("DESKTOP_UPDATE_ROLLBACK_DECISION"); }
+            crate::desktop_catalog::load_catalog_with_install_registry(&registry.root_path().join("catalog.json"), registry)
+        })();
+        match result {
+            Ok((catalog, _)) => {
+                self.catalog = catalog; self.reset_catalog_binding(record.app);
+                self.persistent_update = None; self.update_state(&record, "rolled-back");
+                self.log(record.app, 0, 0, "update-rolled-back", record.new.package_id.clone());
+                if self.options.persistent_update_receipts {
+                    self.emit_native_receipt("update-rolled-back", serde_json::json!({"record":record}))?;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let uncertain = error.downcast_ref::<crate::persistent_update::UpdateFailure>()
+                    .is_some_and(|failure|failure.status=="commit-uncertain");
+                self.update_state(&record, if uncertain { "uncertain" } else { "blocked" });
+                Err(self.uninstall_session_failure("DESKTOP_PERSISTENT_UPDATE_RECOVERY_FAILED", error))
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1024,6 +1219,7 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     fn verify_uninstall_target(&self, app: u16, package: &crate::package::Package, manifest: &std::path::Path) -> Result<()> {
+        self.ensure_no_persistent_update()?;
         if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
         if self.instances.iter().any(|instance| instance.app == app) || self.pending_autostart.contains(&app) {
             bail!("DESKTOP_UNINSTALL_RUNNING_OR_PENDING");
@@ -1135,7 +1331,7 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     fn native_receipts_enabled(&self) -> bool {
-        (self.options.persistent_install_receipts || self.options.persistent_uninstall_receipts) && self.options.persistent_install_root.is_some()
+        (self.options.persistent_install_receipts || self.options.persistent_uninstall_receipts || self.options.persistent_update_receipts) && self.options.persistent_install_root.is_some()
             && self.options.state_file.is_some() && !self.options.offscreen
     }
     #[cfg(target_os = "linux")]
@@ -1236,12 +1432,12 @@ impl Session {
         let record = serde_json::json!({"kind":kind,"bootId":self.state_boot,
             "sessionId":self.state_session,"desktopPid":std::process::id(),"receipt":receipt});
         let line = format!("{}{}\n", self.persistent_receipt_prefix(), serde_json::to_string(&record)?);
-        if self.options.persistent_uninstall_receipts && (line.len() > 262144 || self.native_evidence.receipts >= 128) {
+        if (self.options.persistent_uninstall_receipts || self.options.persistent_update_receipts) && (line.len() > 262144 || self.native_evidence.receipts >= 128) {
             self.persistent_install_blocked = true;
             bail!("DESKTOP_NATIVE_EVIDENCE_BOUND");
         }
         std::io::stderr().lock().write_all(line.as_bytes()).context("DESKTOP_PERSISTENT_RECEIPT_WRITE")?;
-        if self.options.persistent_uninstall_receipts {
+        if self.options.persistent_uninstall_receipts || self.options.persistent_update_receipts {
             self.native_evidence.receipts += 1;
             #[cfg(test)]
             self.test_native_receipts.push(record);
@@ -1250,7 +1446,8 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     fn persistent_receipt_prefix(&self) -> &'static str {
-        if self.options.persistent_uninstall_receipts { "MING_PERSISTENT_UNINSTALL " } else { "MING_PERSISTENT_INSTALL " }
+        if self.options.persistent_update_receipts { "MING_PERSISTENT_UPDATE " }
+        else if self.options.persistent_uninstall_receipts { "MING_PERSISTENT_UNINSTALL " } else { "MING_PERSISTENT_INSTALL " }
     }
 
     #[cfg(target_os = "linux")]
@@ -1259,7 +1456,8 @@ impl Session {
         let mut value = pending.prompt.state_value();
         value["promptRevision"] = self.storage_prompt_revision.into();
         value["presentedSequence"] = serde_json::json!(pending.presented_sequence);
-        if let DesktopStorageDecision::Uninstall { package_id, version, fingerprint, manifest_path } = &pending.pending {
+        if let DesktopStorageDecision::Uninstall { package_id, version, fingerprint, manifest_path }
+            | DesktopStorageDecision::Install { package_id, version, fingerprint, manifest_path, .. } = &pending.pending {
             value["packageId"] = package_id.clone().into();
             value["version"] = version.clone().into();
             value["fingerprint"] = fingerprint.clone().into();
@@ -1291,6 +1489,21 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn respond_storage_prompt_from_native(&mut self, allow: bool) -> Result<()> {
+        if self.options.persistent_update_receipts && self.pending_storage.as_ref().is_some_and(|pending|
+            matches!(pending.pending, DesktopStorageDecision::Install { update: true, .. })) {
+            let pending = self.pending_storage.as_ref().expect("checked pending");
+            let DesktopStorageDecision::Install { package_id, version, fingerprint, .. } = &pending.pending else { unreachable!() };
+            let mut cause = self.native_uninstall_cause(pending.app, package_id, version, fingerprint,
+                pending.presented_sequence.context("DESKTOP_STORAGE_NOT_PRESENTED")?)?;
+            cause["binding"] = self.storage_prompt_native_binding().context("DESKTOP_STORAGE_NO_PROMPT")?;
+            cause["before"] = self.native_evidence.pending.as_ref().expect("checked release").before.clone();
+            self.native_uninstall_confirm = allow.then(|| cause.clone());
+            let result = self.respond_storage_prompt(allow);
+            self.native_uninstall_confirm = None;
+            result?;
+            cause["allow"] = allow.into(); cause["after"] = self.native_anchor()?;
+            return self.emit_native_receipt("update-confirm", cause);
+        }
         if !self.options.persistent_uninstall_receipts
             || !self.pending_storage.as_ref().is_some_and(|pending| matches!(pending.pending, DesktopStorageDecision::Uninstall { .. })) {
             return self.respond_storage_prompt(allow);
@@ -1331,22 +1544,26 @@ impl Session {
             bail!("DESKTOP_INSTALL_SOURCE");
         }
         let registry = self.options.install_registry.as_ref().context("DESKTOP_INSTALL_REGISTRY_REQUIRED")?;
+        self.ensure_no_persistent_update()?;
         let package = crate::package::load_package(source).context("DESKTOP_INSTALL_PACKAGE")?;
         registry.verify_package_source(&package).context("DESKTOP_INSTALL_PUBLISHER")?;
         let existing = self.catalog.apps.iter().find(|entry| entry.package_id == package.manifest.id).cloned();
-        let (update, app) = if let Some(entry) = existing {
+        let (update, app) = if let Some(entry) = existing.as_ref() {
             let current = crate::package::load_package(&entry.manifest_path).context("DESKTOP_INSTALL_CURRENT")?;
             if !crate::package::version_is_newer(&package.manifest.version, &current.manifest.version) {
                 bail!("DESKTOP_INSTALL_VERSION");
             }
-            if self.options.persistent_install_root.is_some() { bail!("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED"); }
+            if self.options.persistent_install_root.is_some() {
+                if package.manifest.sdk_version != 6 || package.manifest.entry != "main.wasm" { bail!("DESKTOP_UPDATE_PACKAGE_SCHEMA"); }
+                self.verify_persistent_update_target(entry.id)?;
+            }
             (true, entry.id)
         } else {
             if self.catalog.apps.len() >= 4 { bail!("DESKTOP_CATALOG_LIMIT"); }
             (false, 0)
         };
         let mut fingerprint = package_fingerprint_hex(&package);
-        let blocked = update && self.instances.iter().any(|instance| instance.app == app);
+        let blocked = update && (self.instances.iter().any(|instance| instance.app == app) || self.pending_autostart.contains(&app));
         let prompt = crate::graphics::desktop_shell::StoragePrompt::install(
             &package.manifest.id,
             &package.manifest.version,
@@ -1355,6 +1572,7 @@ impl Session {
             false,
             blocked,
         )?;
+        self.pending_update_identity = existing;
         self.pending_storage = Some(PendingDesktopStorage {
             app,
             pending: DesktopStorageDecision::Install {
@@ -1376,6 +1594,7 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn begin_uninstall(&mut self, app: u16) -> Result<()> {
+        self.ensure_no_persistent_update()?;
         if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
         if self.pending_storage.is_some() || self.closing.is_some() || self.options.offscreen {
             bail!("DESKTOP_UNINSTALL_UNAVAILABLE");
@@ -1487,6 +1706,8 @@ impl Session {
     }
     fn launch(&mut self, app: u16) -> Result<()> {
         #[cfg(target_os = "linux")]
+        self.check_persistent_launch(app)?;
+        #[cfg(target_os = "linux")]
         if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
         if self.closing.is_some() {
             bail!("DESKTOP_CLOSING");
@@ -1532,6 +1753,11 @@ impl Session {
                     let consent = crate::storage_consent::PublicStorageConsent::new(authority);
                     match consent.request_package(&package)? {
                         crate::storage_consent::PublicConsentRequest::Allowed(granted) => Some((granted.app_id, granted.session)),
+                        crate::storage_consent::PublicConsentRequest::Prompt(_) if self.persistent_update.is_some() => {
+                            drop(session);
+                            self.rollback_persistent_update()?;
+                            bail!("DESKTOP_UPDATE_PUBLIC_AUTHORIZATION_REQUIRED");
+                        }
                         crate::storage_consent::PublicConsentRequest::Prompt(pending) if !self.options.offscreen => {
                             let prompt = crate::graphics::desktop_shell::StoragePrompt::public_request(&package.manifest.id)?;
                             self.pending_storage = Some(PendingDesktopStorage { app, pending: DesktopStorageDecision::Public(pending), prompt, composed: None, presented: false, presented_sequence: None });
@@ -1551,6 +1777,8 @@ impl Session {
         #[cfg(target_os = "linux")]
         if self.persistent_install_blocked { bail!("DESKTOP_PERSISTENT_INSTALL_BLOCKED"); }
         let app = entry.id;
+        #[cfg(target_os = "linux")]
+        self.check_persistent_launch(app)?;
         let grant = match (&self.app_data.root, self.app_data.grants.get(&app)) {
             (Some(root), Some(binding)) => Some(root.grant(&binding.data_key, &binding.slots).context("DESKTOP_DATA_OPEN")?),
             _ => None,
@@ -1599,17 +1827,34 @@ impl Session {
         } else { None };
         let (window, effects) = self.scene.model_mut().open(app).map_err(model_error)?;
         #[cfg(target_os = "linux")]
-        let update_startup = if let Some(registry) = self.options.install_registry.as_ref() {
+        let startup_result: Result<Option<UpdateStartupIdentity>> = (|| {
+            Ok(if let Some(registry) = self.options.install_registry.as_ref() {
             match registry.pending_update()?.filter(|pending| pending.package_id == entry.package_id) {
                 Some(pending) => {
                     if pending.new_fingerprint != entry.package_fingerprint { bail!("DESKTOP_UPDATE_PACKAGE_CHANGED"); }
-                    registry.begin_update_startup(&pending.package_id, pending.new_fingerprint)?;
+                    let started = registry.begin_update_startup(&pending.package_id, pending.new_fingerprint)?;
+                    if let Some(trial) = self.persistent_update.as_mut() {
+                        if !started { bail!("DESKTOP_UPDATE_STARTUP_ALREADY_ATTEMPTED"); }
+                        trial.launched = true;
+                        trial.down = self.native_evidence.pending.as_ref().filter(|input| input.down).map(|input| input.sequence);
+                    }
                     Some(UpdateStartupIdentity { package_id: pending.package_id, version: pending.new_version,
                         fingerprint: pending.new_fingerprint, app, generation, window: window.0 })
                 }
+                None if self.persistent_update.is_some() => bail!("DESKTOP_UPDATE_STARTUP_PENDING_MISSING"),
                 None => None,
             }
-        } else { None };
+            } else { None })
+        })();
+        #[cfg(target_os = "linux")]
+        let update_startup = match startup_result {
+            Ok(identity) => identity,
+            Err(error) => {
+                let effects = self.scene.model_mut().close(window).map_err(model_error)?;
+                self.effects(effects)?;
+                return Err(error);
+            }
+        };
         let record = self.records.len();
         self.records.push(AppRecord {
             module_source: None, fuel_consumed: None,
@@ -2178,6 +2423,63 @@ impl Session {
     }
     #[cfg(target_os = "linux")]
     fn finish_update_startup(&mut self, expected: &UpdateStartupIdentity, evidence: &UpdateStartupEvidence) -> Result<()> {
+        if let Some(trial) = self.persistent_update.as_ref() {
+            let transaction = trial.record.clone(); let down = trial.down; let confirmation = trial.confirmation.clone();
+            let identity_matches = expected.app == transaction.app && expected.package_id == transaction.new.package_id
+                && expected.version == transaction.new.version
+                && expected.fingerprint.iter().map(|byte| format!("{byte:02x}")).collect::<String>() == transaction.new.fingerprint;
+            let record_matches = self.current_record(expected.app).is_some_and(|record| record.completed
+                && record.generation == expected.generation && record.window == expected.window
+                && record.worker_pid == evidence.worker_pid && record.worker_pid != 0
+                && record.package_id.as_deref() == Some(expected.package_id.as_str())
+                && record.error.is_none() && record.first_ready_ms.is_some()
+                && record.presented_source_sequence == evidence.presented_source_sequence);
+            if !trial.launched || !identity_matches || !record_matches || !evidence.confirms(expected)
+                || (self.options.persistent_update_receipts && (down.is_none() || confirmation.is_none())) {
+                return self.rollback_persistent_update();
+            }
+            let proof = crate::persistent_update::UpdateLifecycleProof { app:expected.app, package:transaction.new.clone(),
+                generation:expected.generation, window:expected.window, worker_pid:evidence.worker_pid,
+                input_ready:evidence.input_ready, presented_source_sequence:evidence.presented_source_sequence,
+                completed:evidence.completed, result_accepted:evidence.result_accepted,
+                native_exit_ok:evidence.native_exit_ok, reaped:evidence.reaped };
+            let registry = self.options.install_registry.as_ref().context("DESKTOP_UPDATE_REGISTRY")?;
+            let authority = self.storage_authority.as_ref().context("DESKTOP_UPDATE_STORAGE_AUTHORITY")?;
+            let data = self.options.data_root_path.as_deref().context("DESKTOP_DATA_ROOT_REQUIRED")?;
+            let committed = match crate::persistent_update::confirm_existing_update(registry, authority, data, &proof) {
+                Ok(committed) => committed,
+                Err(failure) => {
+                    if failure.status == "rejected" { return self.rollback_persistent_update(); }
+                    self.update_state(&transaction, match failure.status.as_str() {
+                        "commit-uncertain" => "uncertain", "commit-pending" => "commit-decided", _ => "blocked",
+                    });
+                    return Err(self.uninstall_session_failure("DESKTOP_PERSISTENT_UPDATE_COMMIT_FAILED", failure.into()));
+                }
+            };
+            // The coordinator has completed strict verification and cleared both journals.
+            // Align memory before any state/log/receipt operation that can fail.
+            self.persistent_update = None;
+            self.update_state(&committed.record, "committed");
+            let output = (|| {
+                self.update_output_checkpoint("state-file")?; self.write_state(true)?;
+                self.update_output_checkpoint("startup-receipt")?;
+                if self.options.persistent_update_receipts {
+                    let anchor = self.native_anchor()?;
+                    self.emit_native_receipt("startup-confirmed", serde_json::json!({"transactionId":transaction.transaction_id,
+                        "confirmation":confirmation,"downSequence":down,"proof":proof,"anchor":anchor}))?;
+                }
+                self.update_output_checkpoint("commit-receipt")?;
+                if self.options.persistent_update_receipts {
+                    self.emit_native_receipt("persistent-update-commit", serde_json::json!({"record":committed.record,
+                        "confirmation":confirmation,"downSequence":down,"content":committed.content}))?;
+                }
+                self.update_output_checkpoint("log")?;
+                self.log(expected.app, expected.window, expected.generation, "startup-confirmed", expected.package_id.clone());
+                if self.dropped_trace != 0 { bail!("DESKTOP_UPDATE_LOG_DROPPED"); }
+                Ok(())
+            })();
+            return output.map_err(|error| self.uninstall_session_failure("DESKTOP_PERSISTENT_UPDATE_COMMITTED_OUTPUT", error));
+        }
         let registry = self.options.install_registry.as_ref().context("DESKTOP_UPDATE_REGISTRY")?;
         let authority = self.storage_authority.as_ref().context("DESKTOP_UPDATE_STORAGE_AUTHORITY")?;
         if evidence.confirms(expected) {
@@ -2313,6 +2615,8 @@ impl Session {
     }
     pub fn begin_shutdown(&mut self) -> Result<()> {
         #[cfg(target_os = "linux")]
+        if self.persistent_update.as_ref().is_some_and(|trial| !trial.launched) { self.rollback_persistent_update()?; }
+        #[cfg(target_os = "linux")]
         { self.pending_storage = None; }
         self.pending_autostart.clear();
         if self.closing.is_none() {
@@ -2327,13 +2631,26 @@ impl Session {
         Ok(())
     }
     pub fn finish(&mut self) -> Result<()> {
-        self.begin_shutdown()?;
-        while !self.instances.is_empty() {
-            self.poll()?;
-            thread::sleep(Duration::from_millis(5));
+        let result = (|| {
+            self.begin_shutdown()?;
+            while !self.instances.is_empty() {
+                self.poll()?;
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.write_state(true)
+        })();
+        if result.is_err() {
+            // Output or scene failures must not bypass cancel, reap, or private
+            // session release. Preserve any active journal for explicit recovery.
+            for instance in &self.instances { instance.bridge.cancel.store(true, Ordering::SeqCst); }
+            for mut instance in self.instances.drain(..) {
+                if let Some(worker) = instance.worker.take() { let _ = worker.join(); }
+                instance.app_data.revoke();
+            }
+            #[cfg(target_os = "linux")]
+            if self.persistent_update.is_some() { self.persistent_install_blocked = true; }
         }
-        self.write_state(true)?;
-        Ok(())
+        result
     }
     pub fn note_state_failure(&mut self, error: &anyhow::Error) {
         self.state_error = Some(format!("{error:#}").chars().take(2048).collect());
@@ -2379,7 +2696,12 @@ impl Session {
             value["storagePromptPresentedSequence"] = serde_json::json!(prompt_presented_sequence);
             value
         });
-        serde_json::json!({"schemaVersion":1,"bootId":self.state_boot,"sessionId":self.state_session,"revision":revision,"phase":phase,"root":root,"apps":apps,"error":self.state_error})
+        let mut state = serde_json::json!({"schemaVersion":1,"bootId":self.state_boot,"sessionId":self.state_session,"revision":revision,"phase":phase,"root":root,"apps":apps,"error":self.state_error});
+        #[cfg(target_os = "linux")]
+        if self.options.persistent_update_receipts {
+            if let Some(update) = &self.persistent_update_state { state["persistentUpdate"] = update.clone(); }
+        }
+        state
     }
     fn write_state(&mut self, force: bool) -> Result<()> {
         use std::io::Write;
@@ -3169,6 +3491,361 @@ mod input_backpressure_tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn persistent_update_session() -> (tempfile::TempDir, Session, PathBuf) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use ed25519_dalek::{Signer, SigningKey};
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, mut session, source) = persistent_uninstall_session();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = crate::app_data::AppDataRoot::open(&data).unwrap();
+        session.storage_authority = Some(Arc::new(crate::app_data::PackageStorageAuthority::open_default_private(root.clone()).unwrap()));
+        session.app_data.root = Some(root);
+        session.options.data_root_path = Some(data);
+        let mut package = crate::package::load_package(&source).unwrap();
+        package.manifest.version = "2.0.0".into();
+        package.manifest.publisher_signature = None;
+        package.manifest.publisher_signature = Some(STANDARD.encode(SigningKey::from_bytes(&[7;32]).sign(&package.signature_message("mingos-dev-2026").unwrap()).to_bytes()));
+        std::fs::write(&source, serde_json::to_vec(&package.manifest).unwrap()).unwrap();
+        (temp, session, source)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_confirmation_publishes_trial_without_rewriting_catalog() {
+        let (_temp, mut session, source) = persistent_update_session();
+        let catalog = session.options.install_registry.as_ref().unwrap().root_path().join("catalog.json");
+        let before = std::fs::read(&catalog).unwrap();
+        let title = session.catalog.apps.iter().find(|entry| entry.id == 2).unwrap().title.clone();
+        session.begin_install(&source).unwrap();
+        present_install_confirmation(&mut session);
+        session.respond_storage_prompt(true).unwrap();
+        assert_eq!(std::fs::read(catalog).unwrap(), before);
+        assert_eq!(session.catalog.apps.iter().find(|entry| entry.id == 2).unwrap().title, title);
+        let registry = session.options.install_registry.as_ref().unwrap();
+        assert!(registry.pending_update().unwrap().is_some());
+        assert!(crate::persistent_install::snapshot(registry).is_err());
+        assert!(session.instances.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepared_desktop_trial() -> (tempfile::TempDir, Session, PathBuf) {
+        let (temp, mut session, source) = persistent_update_session();
+        session.begin_install(&source).unwrap(); present_install_confirmation(&mut session);
+        session.respond_storage_prompt(true).unwrap();
+        (temp, session, source)
+    }
+    #[cfg(target_os = "linux")]
+    fn completed_desktop_trial(session: &mut Session) -> (UpdateStartupIdentity, UpdateStartupEvidence) {
+        let trial = session.persistent_update.as_mut().unwrap();
+        trial.launched = true; trial.down = Some(7); trial.confirmation = Some(serde_json::json!({"pressSequence":1,"releaseSequence":2}));
+        let new = trial.record.new.clone();
+        let entry = session.catalog.apps.iter().find(|entry| entry.id == 2).unwrap();
+        session.options.install_registry.as_ref().unwrap().begin_update_startup(&new.package_id, entry.package_fingerprint).unwrap();
+        let expected = UpdateStartupIdentity { package_id:new.package_id.clone(), version:new.version,
+            fingerprint:entry.package_fingerprint, app:2, generation:4, window:9 };
+        let (mut fixture, _, _keepalive) = super::close_grace_tests::closing_session(crate::desktop_catalog::IsolationMode::Off);
+        let mut record = fixture.records.pop().unwrap();
+        record.app=2; record.generation=4; record.window=9; record.worker_pid=123;
+        record.package_id=Some(new.package_id); record.completed=true; record.error=None;
+        record.status="closed"; record.first_ready_ms=Some(1); record.presented_source_sequence=5;
+        session.records.push(record);
+        let evidence = UpdateStartupEvidence { identity:expected.clone(), worker_pid:123, input_ready:true,
+            presented_source_sequence:5, completed:true, result_accepted:true, native_exit_ok:true, reaped:true };
+        (expected, evidence)
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_rechecks_confirmation_and_cancel_preserves_old_state() {
+        for unavailable in ["instance", "pending", "closing", "identity", "source", "cancel"] {
+            let (_temp, mut session, source) = persistent_update_session();
+            let before=crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap();
+            session.begin_install(&source).unwrap(); present_install_confirmation(&mut session);
+            let mut held = None;
+            match unavailable {
+                "instance" => { let (mut other, _, keepalive)=super::close_grace_tests::closing_session(crate::desktop_catalog::IsolationMode::Off);
+                    other.instances[0].app=2; session.instances.push(other.instances.remove(0)); held=Some(keepalive); },
+                "pending" => session.pending_autostart.push_back(2),
+                "closing" => session.closing=Some(Instant::now()),
+                "identity" => session.catalog.apps.iter_mut().find(|entry|entry.id==2).unwrap().package_fingerprint=[0;32],
+                "source" => { let mut package=crate::package::load_package(&source).unwrap(); package.manifest.version="3.0.0".into();
+                    std::fs::write(&source,serde_json::to_vec(&package.manifest).unwrap()).unwrap(); },
+                _ => {},
+            }
+            let result=session.respond_storage_prompt(unavailable!="cancel");
+            if matches!(unavailable,"instance"|"pending"|"closing"|"identity") { assert!(result.is_err(),"{unavailable}"); }
+            else { result.unwrap(); }
+            assert!(session.persistent_update.is_none(),"{unavailable}");
+            assert_eq!(crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap(),before);
+            session.instances.clear(); drop(held);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_trial_blocks_mutation_script_and_resolved_launch() {
+        let (_temp, mut session, source)=prepared_desktop_trial();
+        let entry=session.catalog.apps.iter().find(|entry|entry.id==2).unwrap().clone();
+        assert!(session.launch(2).is_err()); assert!(session.launch(1).is_err());
+        assert!(session.launch_resolved(entry,None,None).is_err());
+        assert!(session.begin_install(&source).is_err()); assert!(session.begin_uninstall(2).is_err());
+        assert!(session.begin_uninstall_with_purge(2).is_err()); assert!(session.begin_storage_management(2).is_err());
+        assert!(session.respond_storage_prompt(true).is_err());
+        session.begin_shutdown().unwrap();
+        assert!(session.persistent_update.is_none()); assert!(!session.persistent_install_blocked);
+        assert_eq!(session.persistent_update_state.as_ref().unwrap()["status"],"rolled-back");
+        assert_eq!(crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap().apps.iter().find(|app|app.app==2).unwrap().version,"1.0.0");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_complete_proof_commits_and_every_missing_field_rolls_back() {
+        for field in 0..16 {
+            let (_temp,mut session,_)=prepared_desktop_trial();
+            let (expected,mut evidence)=completed_desktop_trial(&mut session);
+            match field {
+                0=>evidence.identity.package_id.push('x'), 1=>evidence.identity.version.push('x'),
+                2=>evidence.identity.fingerprint[0]^=1, 3=>evidence.identity.app=3,
+                4=>evidence.identity.generation+=1, 5=>evidence.identity.window+=1,
+                6=>evidence.worker_pid+=1, 7=>evidence.input_ready=false,
+                8=>evidence.presented_source_sequence=0, 9=>evidence.completed=false,
+                10=>evidence.result_accepted=false,11=>evidence.native_exit_ok=false,12=>evidence.reaped=false,
+                13=>session.records.last_mut().unwrap().worker_pid+=1,
+                14=>session.records.last_mut().unwrap().completed=false,
+                _=>{},
+            }
+            session.finish_update_startup(&expected,&evidence).unwrap();
+            assert!(session.persistent_update.is_none()); assert!(session.instances.is_empty());
+            let snapshot=crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap();
+            assert_eq!(snapshot.apps.iter().find(|app|app.app==2).unwrap().version,if field==15 {"2.0.0"} else {"1.0.0"},"field {field}");
+            assert_eq!(session.persistent_update_state.as_ref().unwrap()["status"],if field==15 {"committed"} else {"rolled-back"});
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_every_orphan_inner_phase_blocks_all_entries() {
+        for phase in ["planned","dataSwapped","recordPublished","startupAttempted","startupConfirmed","rollingBack"] {
+            let (_temp,mut session,source)=prepared_desktop_trial();
+            let root=session.options.install_registry.as_ref().unwrap().root_path().to_path_buf();
+            std::fs::remove_file(root.join(crate::persistent_update::UPDATE_PENDING_NAME)).unwrap();
+            session.persistent_update=None;
+            let journal=root.join("update-journal-v1");
+            let mut value:serde_json::Value=serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            value["phase"]=phase.into();std::fs::write(&journal,serde_json::to_vec(&value).unwrap()).unwrap();
+            let before=std::fs::read(&journal).unwrap();
+            let entry=session.catalog.apps.iter().find(|entry|entry.id==2).unwrap().clone();
+            for result in [session.begin_install(&source),session.begin_uninstall(2),session.begin_storage_management(2),
+                session.launch(2),session.launch_resolved(entry,None,None)] {
+                assert!(result.unwrap_err().to_string().contains("DESKTOP_UPDATE_PENDING"),"{phase}");
+            }
+            assert_eq!(std::fs::read(journal).unwrap(),before);assert!(session.instances.is_empty() && session.views().is_empty());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_local_trial_with_missing_inner_never_opens_worker_or_window() {
+        let (_temp,mut session,_)=prepared_desktop_trial();
+        let root=session.options.install_registry.as_ref().unwrap().root_path().to_path_buf();
+        std::fs::remove_file(root.join("update-journal-v1")).unwrap();
+        assert!(session.launch_from_native_dock(2).is_err());
+        assert!(session.persistent_install_blocked && session.state_error.is_some());
+        assert!(session.instances.is_empty() && session.views().is_empty() && session.records.is_empty());
+        assert!(root.join(crate::persistent_update::UPDATE_PENDING_NAME).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_startup_write_failure_closes_new_window_and_restores_old_state() {
+        let (_temp,mut session,_)=prepared_desktop_trial();
+        session.options.install_registry.as_ref().unwrap().fail_next_record_persist_at("registry-journal-file-sync");
+        session.launch_from_native_dock(2).unwrap();
+        assert!(session.trace.iter().any(|trace|trace.kind=="action_rejected"));
+        assert!(session.instances.is_empty() && session.views().is_empty());
+        assert!(session.persistent_update.is_none());
+        assert_eq!(crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap().apps.iter().find(|app|app.app==2).unwrap().version,"1.0.0");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_binding_resets_current_state_and_keeps_generation_history() {
+        let (_temp,mut session,source)=persistent_update_session();
+        let (mut fixture,_,_keepalive)=super::close_grace_tests::closing_session(crate::desktop_catalog::IsolationMode::Off);
+        let mut record=fixture.records.pop().unwrap();record.app=2;record.generation=8;record.worker_pid=999;
+        record.first_ready_ms=Some(1);record.error=Some("old failure".into());
+        session.records.push(record);session.public_denied.insert(2);
+        session.begin_install(&source).unwrap();present_install_confirmation(&mut session);session.respond_storage_prompt(true).unwrap();
+        assert!(session.current_record(2).is_none());assert!(!session.public_denied.contains(&2));
+        assert_eq!(session.records[0].generation,8);assert_eq!(session.records[0].worker_pid,999);
+        session.rollback_persistent_update().unwrap();assert_eq!(session.records.len(),1);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_qualification_is_explicit_and_requires_native_state() {
+        let (temp,session,_)=persistent_update_session();
+        let root=session.options.persistent_install_root.as_ref().unwrap();
+        let args=vec![root.join("catalog.json").into_os_string(),"--persistent-install-state".into(),root.clone().into_os_string(),
+            "--qualification-receipts".into(),"persistent-update-pointer-ready-v1".into()];
+        assert!(DesktopOptions::parse(args.clone()).is_err());
+        let mut complete=args;complete.extend(["--state-file".into(),temp.path().join("state.json").into_os_string()]);
+        let options=DesktopOptions::parse(complete.clone()).unwrap();
+        assert!(options.persistent_update_receipts && !options.persistent_install_receipts && !options.persistent_uninstall_receipts);
+        complete.extend(["--backend".into(),"offscreen".into()]);assert!(DesktopOptions::parse(complete).is_err());
+        assert!(session.state_snapshot(0).get("persistentUpdate").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_second_dock_down_preserves_first_launch_cause() {
+        let (_temp,mut session,_)=prepared_desktop_trial();
+        let (_expected,_evidence)=completed_desktop_trial(&mut session);
+        let (mut fixture,_,_keepalive)=super::close_grace_tests::closing_session(crate::desktop_catalog::IsolationMode::Off);
+        fixture.instances[0].app=2;
+        session.instances.push(fixture.instances.remove(0));
+        session.native_evidence.pending=Some(NativeInputEvidence { sequence:19,press:19,down:true,mouse:None,
+            before:serde_json::Value::Null,trace_start:0,target:None });
+        session.launch_from_native_dock(2).unwrap();
+        assert!(session.trace.iter().any(|trace|trace.kind=="action_rejected" && trace.detail.contains("DESKTOP_UPDATE_NATIVE_TRIAL_REQUIRED")));
+        assert_eq!(session.persistent_update.as_ref().unwrap().down,Some(7));
+        session.instances.clear(); session.rollback_persistent_update().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_rollback_compensation_failure_reports_uncertain_not_durable_block() {
+        let (_temp,mut session,_)=prepared_desktop_trial();
+        let stages=std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));let observed=stages.clone();
+        crate::app_data::UPDATE_TEST_HOOK.with(|slot|*slot.borrow_mut()=Some(Box::new(move |stage| {
+            if matches!(stage,"outer-remove-directory-sync"|"compensation-create") {
+                observed.borrow_mut().push(stage.to_owned());bail!("injected {stage}");
+            } Ok(())
+        })));
+        let result=session.rollback_persistent_update();
+        crate::app_data::UPDATE_TEST_HOOK.with(|slot|*slot.borrow_mut()=None);
+        let error=result.unwrap_err().to_string();assert!(error.contains("commit-uncertain"),"{error}");
+        assert_eq!(*stages.borrow(),["outer-remove-directory-sync","compensation-create"]);
+        assert!(session.persistent_install_blocked && session.state_error.is_some());
+        assert_eq!(session.persistent_update_state.as_ref().unwrap()["status"],"uncertain");
+        let registry=session.options.install_registry.as_ref().unwrap();
+        assert!(!registry.root_path().join(crate::persistent_update::UPDATE_PENDING_NAME).exists());
+        assert_eq!(crate::package::load_package(&registry.active_manifest_path("dev.ming.install-demo").unwrap()).unwrap().manifest.version,"1.0.0");
+        assert!(session.launch(2).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_shutdown_output_failure_reaps_and_releases_sessions_for_explicit_recovery() {
+        let (temp,mut session,_)=prepared_desktop_trial();
+        let (_expected,_evidence)=completed_desktop_trial(&mut session);
+        let transaction=session.persistent_update.as_ref().unwrap().record.transaction_id.clone();
+        let authority=session.storage_authority.as_ref().unwrap().clone();
+        let package=crate::package::load_package(&session.catalog.apps.iter().find(|entry|entry.id==2).unwrap().manifest_path).unwrap();
+        let private=authority.default_private_session_for_package(&package).unwrap();
+        private.write_file("trial-data",b"new").unwrap();
+        let (mut fixture,bridge,_keepalive)=super::close_grace_tests::closing_session(crate::desktop_catalog::IsolationMode::Off);
+        let mut instance=fixture.instances.remove(0);instance.app=2;
+        let window=session.scene.model_mut().open(2).unwrap().0;
+        instance.window=Some(window);instance.record=0;
+        instance.app_data=supervisor::AppDataService::new(None).with_private_files_for_package(private,package);
+        session.records[0].window=window.0;session.records[0].completed=false;
+        session.instances.push(instance);
+        session.options.state_file=Some(temp.path().join("absent").join("state.json"));
+        assert!(session.finish().is_err());assert!(bridge.cancel.load(Ordering::SeqCst));
+        assert!(session.instances.is_empty() && session.persistent_install_blocked);
+        let registry=session.options.install_registry.as_ref().unwrap();
+        assert!(registry.root_path().join(crate::persistent_update::UPDATE_PENDING_NAME).exists());
+        let recovered=crate::persistent_update::recover_loaded_update(registry,&authority,
+            session.options.data_root_path.as_deref().unwrap(),&transaction).unwrap();
+        assert!(matches!(recovered,crate::persistent_update::UpdateRecovery::RolledBack(_)));
+        assert!(authority.observe_update("dev.ming.install-demo").unwrap().files.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_durable_decision_or_cleanup_failure_stays_sealed_without_rollback() {
+        for stage in ["decision-directory-sync","registry-journal-directory-sync"] {
+            let (_temp,mut session,_)=prepared_desktop_trial();
+            let (expected,evidence)=completed_desktop_trial(&mut session);
+            let fired=std::rc::Rc::new(std::cell::Cell::new(false));let hook_fired=fired.clone();
+            crate::app_data::UPDATE_TEST_HOOK.with(|slot|*slot.borrow_mut()=Some(Box::new(move |point| {
+                if point==stage && !hook_fired.replace(true) { bail!("injected {stage}"); } Ok(())
+            })));
+            let result=session.finish_update_startup(&expected,&evidence);
+            crate::app_data::UPDATE_TEST_HOOK.with(|slot|*slot.borrow_mut()=None);
+            assert!(fired.get());assert!(result.unwrap_err().to_string().contains("DESKTOP_PERSISTENT_UPDATE_COMMIT_FAILED"));
+            assert!(session.persistent_install_blocked && session.state_error.is_some());
+            assert_eq!(session.persistent_update_state.as_ref().unwrap()["status"],"commit-decided");
+            let registry=session.options.install_registry.as_ref().unwrap();
+            let record=crate::persistent_update::parse_update_record(&std::fs::read(registry.root_path().join(crate::persistent_update::UPDATE_PENDING_NAME)).unwrap()).unwrap();
+            assert_eq!(record.decision,crate::persistent_update::UpdateDecision::CommitDecided);
+            assert_eq!(crate::package::load_package(&registry.active_manifest_path(&expected.package_id).unwrap()).unwrap().manifest.version,"2.0.0");
+            assert!(crate::persistent_install::snapshot(registry).is_err());
+            assert!(!session.trace.iter().any(|trace|matches!(trace.kind,"update-not-saved"|"update-rolled-back")));
+            assert!(session.launch(2).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_committed_output_failures_preserve_stable_new_disk_and_memory() {
+        for stage in ["state-file","startup-receipt","commit-receipt","log"] {
+            let (temp,mut session,_)=prepared_desktop_trial();
+            let (expected,evidence)=completed_desktop_trial(&mut session);
+            session.options.persistent_update_receipts=true;
+            session.options.state_file=Some(temp.path().join("state.json"));
+            session.persistent_update_output_faults.insert(stage);
+            let error=session.finish_update_startup(&expected,&evidence).unwrap_err();
+            assert!(error.to_string().contains("DESKTOP_PERSISTENT_UPDATE_COMMITTED_OUTPUT"));
+            assert!(session.persistent_install_blocked && session.state_error.is_some());
+            assert!(session.persistent_update.is_none());
+            assert_eq!(session.persistent_update_state.as_ref().unwrap()["status"],"committed");
+            let registry=session.options.install_registry.as_ref().unwrap();
+            assert!(!registry.root_path().join(crate::persistent_update::UPDATE_PENDING_NAME).exists());
+            assert!(registry.pending_update().unwrap().is_none());
+            assert_eq!(crate::persistent_install::snapshot(registry).unwrap().apps.iter().find(|app|app.app==2).unwrap().version,"2.0.0");
+            assert_eq!(session.catalog.apps.iter().find(|entry|entry.id==2).unwrap().package_fingerprint,expected.fingerprint);
+            assert!(!session.trace.iter().any(|trace|trace.kind=="update-not-saved"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_public_trial_rejects_new_authorization_without_policy_write() {
+        use base64::{Engine as _,engine::general_purpose::STANDARD};
+        use ed25519_dalek::{Signer,SigningKey};
+        for existing_grant in [false,true] { for fail_recovery in [false,true] {
+        let (_temp,mut session,source)=persistent_update_session();
+        let authority=session.storage_authority.as_ref().unwrap().clone();
+        let old=session.catalog.apps.iter().find(|entry|entry.id==2).unwrap().package_fingerprint;
+        if existing_grant { authority.authorize_public_bound("dev.ming.install-demo",old).unwrap(); }
+        let data=session.options.data_root_path.clone().unwrap();
+        let before=authority.observe_update_authority(&data).unwrap();
+        let mut package=crate::package::load_package(&source).unwrap(); package.manifest.public_storage=true;
+        package.manifest.publisher_signature=None;
+        package.manifest.publisher_signature=Some(STANDARD.encode(SigningKey::from_bytes(&[7;32]).sign(&package.signature_message("mingos-dev-2026").unwrap()).to_bytes()));
+        std::fs::write(&source,serde_json::to_vec(&package.manifest).unwrap()).unwrap();
+        session.begin_install(&source).unwrap();present_install_confirmation(&mut session);session.respond_storage_prompt(true).unwrap();
+        let attempts=std::rc::Rc::new(std::cell::Cell::new(0));let hook_attempts=attempts.clone();
+        if fail_recovery {
+            crate::app_data::UPDATE_TEST_HOOK.with(|slot|*slot.borrow_mut()=Some(Box::new(move |stage| {
+                if stage=="recovery-bound" { hook_attempts.set(hook_attempts.get()+1);bail!("injected recovery-bound"); } Ok(())
+            })));
+        }
+        let launch=session.launch_from_native_dock(2);
+        crate::app_data::UPDATE_TEST_HOOK.with(|slot|*slot.borrow_mut()=None);
+        if fail_recovery {
+            assert!(launch.is_err());assert_eq!(attempts.get(),1);
+            assert!(session.persistent_install_blocked && session.persistent_update.is_some());
+            assert_eq!(authority.observe_update_authority(&data).unwrap(),before);
+            assert!(session.instances.is_empty() && session.records.is_empty());continue;
+        }
+        launch.unwrap();
+        assert!(session.trace.iter().any(|trace|trace.kind=="action_rejected" && trace.detail.contains("DESKTOP_UPDATE_PUBLIC_AUTHORIZATION_REQUIRED")));
+        assert!(session.pending_storage.is_none() && session.persistent_update.is_none());
+        assert_eq!(authority.observe_update_authority(&data).unwrap(),before);
+        assert!(session.records.is_empty());
+        if existing_grant { assert_eq!(authority.public_binding_status("dev.ming.install-demo",old).unwrap(),crate::app_data::PackageBinding::Matched); }
+        assert_eq!(crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap().apps.iter().find(|app|app.app==2).unwrap().version,"1.0.0");
+        } }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn persistent_install_rejects_update_and_purge_before_writes() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -3181,9 +3858,8 @@ mod input_backpressure_tests {
         package.manifest.publisher_signature = None;
         package.manifest.publisher_signature = Some(STANDARD.encode(SigningKey::from_bytes(&[7;32]).sign(&package.signature_message("mingos-dev-2026").unwrap()).to_bytes()));
         std::fs::write(&source, serde_json::to_vec(&package.manifest).unwrap()).unwrap();
-        for result in [session.begin_install(&source), session.begin_uninstall_with_purge(1)] {
-            assert!(result.unwrap_err().to_string().contains("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED"));
-        }
+        assert!(session.begin_install(&source).unwrap_err().to_string().contains("DESKTOP_BOOTSTRAP_PROTECTED"));
+        assert!(session.begin_uninstall_with_purge(1).unwrap_err().to_string().contains("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED"));
         for operation in ["update", "purge"] {
             let package_id = package.manifest.id.clone();
             let version = package.manifest.version.clone();
@@ -3197,7 +3873,8 @@ mod input_backpressure_tests {
                 &package_fingerprint_hex(&package), true, false, false).unwrap();
             session.pending_storage = Some(PendingDesktopStorage { app: 1, pending, prompt, composed: None, presented: false, presented_sequence: None });
             present_install_confirmation(&mut session);
-            assert!(session.respond_storage_prompt(true).unwrap_err().to_string().contains("DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED"));
+            let error = session.respond_storage_prompt(true).unwrap_err().to_string();
+            assert!(error.contains(if operation == "update" { "DESKTOP_BOOTSTRAP_PROTECTED" } else { "DESKTOP_PERSISTENT_MUTATION_UNSUPPORTED" }), "{error}");
             assert_eq!(crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap(), before);
         }
         let after = crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap();

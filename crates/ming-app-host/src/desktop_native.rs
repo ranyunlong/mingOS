@@ -454,7 +454,8 @@ impl NativeDesktop {
                     return Ok(());
                 }
                 #[cfg(target_os = "linux")]
-                session.native_dock_launch(app.id);
+                return session.launch_from_native_dock(app.id);
+                #[cfg(not(target_os = "linux"))]
                 return self.action(DesktopAction::Launch { app: app.id });
             }
         }
@@ -1028,6 +1029,85 @@ mod input_tests {
             assert!(app.session.as_ref().unwrap().storage_prompt().is_none(), "duplicate up must not reopen a prompt");
             assert_eq!(app.session.as_ref().unwrap().catalog.apps.len(), 2);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_native_app() -> (tempfile::TempDir, NativeDesktop, DesktopShell) {
+        use base64::{Engine as _,engine::general_purpose::STANDARD};
+        use ed25519_dalek::{Signer,SigningKey};
+        use std::os::unix::fs::{PermissionsExt,OpenOptionsExt};
+        use std::io::Write;
+        let (temp,mut app,mut shell)=uninstall_native_app(Some("persistent-update-pointer-ready-v1"));
+        let session=app.session.as_mut().unwrap();
+        let old=session.catalog.apps.iter().find(|entry|entry.id==2).unwrap();
+        let mut package=crate::package::load_package(&old.manifest_path).unwrap();
+        package.manifest.version="2.0.0".into();package.manifest.publisher_signature=None;
+        package.manifest.publisher_signature=Some(STANDARD.encode(SigningKey::from_bytes(&[7;32]).sign(&package.signature_message("mingos-dev-2026").unwrap()).to_bytes()));
+        let candidate=temp.path().join("update-source"); std::fs::create_dir(&candidate).unwrap();
+        std::fs::set_permissions(&candidate,std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (name,bytes) in [("app.json",serde_json::to_vec(&package.manifest).unwrap()),("main.wasm",package.bytes)] {
+            std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(candidate.join(name)).unwrap().write_all(&bytes).unwrap();
+        }
+        session.options.install_source=Some(candidate.join("app.json"));
+        present_native(&mut app,&mut shell);
+        (temp,app,shell)
+    }
+    #[cfg(target_os = "linux")]
+    fn request_native_update(app:&mut NativeDesktop,shell:&mut DesktopShell) {
+        let install=install_cell(1280,800); app.mouse=Some((install.x+1,install.y+1));
+        app.mouse_button(true).unwrap();app.mouse_button(false).unwrap();present_native(app,shell);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_native_confirmation_requires_current_matching_edges() {
+        for invalid in ["up-only","different-control","different-frame","cancel"] {
+            let (_temp,mut app,mut shell)=update_native_app();
+            request_native_update(&mut app,&mut shell);
+            let before=crate::persistent_install::snapshot(app.session.as_ref().unwrap().options.install_registry.as_ref().unwrap()).unwrap();
+            let geometry=crate::graphics::desktop_shell::storage_prompt_geometry(1280,800,false).unwrap();
+            let allow=geometry.allow.unwrap();app.mouse=Some((allow.x+1,allow.y+1));
+            if invalid=="up-only" {
+                assert!(app.mouse_button(false).is_err());
+                assert_eq!(crate::persistent_install::snapshot(app.session.as_ref().unwrap().options.install_registry.as_ref().unwrap()).unwrap(),before);
+                continue;
+            }
+            if invalid=="cancel" { app.mouse=Some((geometry.deny.x+1,geometry.deny.y+1)); }
+            app.mouse_button(true).unwrap();
+            match invalid {
+                "different-control"=>app.mouse=Some((geometry.deny.x+1,geometry.deny.y+1)),
+                "different-frame"=>{ app.session.as_mut().unwrap().changed();present_native(&mut app,&mut shell); },
+                _=>{},
+            }
+            app.mouse_button(false).unwrap();
+            let session=app.session.as_ref().unwrap();
+            assert_eq!(session.storage_prompt().is_some(),invalid!="cancel","{invalid}");
+            assert_eq!(crate::persistent_install::snapshot(session.options.install_registry.as_ref().unwrap()).unwrap(),before);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_native_confirm_publishes_trial_then_dock_down_starts_once() {
+        let (temp,mut app,mut shell)=update_native_app();request_native_update(&mut app,&mut shell);
+        let geometry=crate::graphics::desktop_shell::storage_prompt_geometry(1280,800,false).unwrap();
+        let allow=geometry.allow.unwrap();app.mouse=Some((allow.x+1,allow.y+1));
+        app.mouse_button(true).unwrap();app.mouse_button(false).unwrap();
+        let session=app.session.as_ref().unwrap();
+        let trial=session.test_native_receipts.iter().find(|receipt|receipt["kind"]=="trial-published").unwrap();
+        assert_eq!(trial["receipt"]["confirmation"]["pressSequence"],3);
+        assert_eq!(trial["receipt"]["confirmation"]["releaseSequence"],4);
+        let state:serde_json::Value=serde_json::from_slice(&std::fs::read(temp.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["persistentUpdate"]["status"],"trial");
+        assert!(state["apps"].as_array().unwrap().is_empty());
+        assert!(session.options.install_registry.as_ref().unwrap().pending_update().unwrap().is_some());
+        present_native(&mut app,&mut shell);
+        let dock=dock_cell(1280,800,1,2);app.mouse=Some((dock.x+dock.width/2,dock.y+dock.height/2));
+        app.mouse_button(true).unwrap();
+        let session=app.session.as_ref().unwrap();
+        let down=session.test_native_receipts.iter().find(|receipt|receipt["kind"]=="native-input" && receipt["receipt"]["action"]=="launch").unwrap();
+        assert_eq!(down["receipt"]["edge"],"down"); assert_eq!(down["receipt"]["targetApp"],2);
+        assert_eq!(down["receipt"]["after"]["history"][0]["generation"],1);
+        app.mouse_button(false).unwrap();
+        app.session.as_mut().unwrap().finish().unwrap();
     }
 
     #[cfg(target_os = "linux")]
