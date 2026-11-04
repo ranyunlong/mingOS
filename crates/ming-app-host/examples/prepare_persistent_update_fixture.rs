@@ -192,6 +192,17 @@ mod tests {
         }
     }
     #[test]
+    fn first_role_preserves_exact_guest_boot_infrastructure_in_nested_data_root() {
+        let (temp,args)=input("seed");let data=Path::new(&args[2]);
+        for name in ["lost+found",".mingos-boot"] {let path=data.join(name);fs::create_dir(&path).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();}
+        let marker=data.join(".mingos-boot/current.json");
+        fs::write(&marker,serde_json::to_vec(&serde_json::json!({"bootId":fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),"counter":1})).unwrap()).unwrap();
+        fs::set_permissions(&marker,fs::Permissions::from_mode(0o600)).unwrap();
+        let boot=tree(&data.join(".mingos-boot"));let lost=tree(&data.join("lost+found"));run(args.clone(),&mut Vec::new()).unwrap();
+        assert_eq!(tree(&data.join(".mingos-boot")),boot);assert_eq!(tree(&data.join("lost+found")),lost);
+        let before=tree(data);call(&[Path::new("open-existing"),Path::new(&args[1]),data,&temp.path().join("boot-open.json")]).unwrap();assert_eq!(tree(data),before);
+    }
+    #[test]
     fn open_and_recover_never_create_or_repair_missing_roots_or_locks() {
         for role in ["open-existing","recover-update"] {
             let (temp,args)=input("seed");let root=Path::new(&args[1]);let data=Path::new(&args[2]);let receipt=temp.path().join("missing.json");

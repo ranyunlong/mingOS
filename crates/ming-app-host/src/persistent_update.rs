@@ -51,6 +51,52 @@ fn fixture_sync_tree(path:&Path) -> Result<()> {
     if info.is_dir() { for entry in fs::read_dir(path)? {fixture_sync_tree(&entry?.path())?;} }
     File::open(path)?.sync_all()?;Ok(())
 }
+// This only validates the infrastructure shape supplied by an explicitly
+// authorized first-initialization caller. A marker cannot authenticate a fresh
+// disk; the guest must first verify its disk identity and first-boot role.
+struct FixtureInfrastructure { root:TemporaryNode, gid:u32, nodes:Vec<TemporaryNode> }
+impl FixtureInfrastructure {
+    fn names(path:&Path)->Result<Vec<std::ffi::OsString>> {
+        let mut names=fs::read_dir(path)?.take(3).map(|entry|entry.map(|e|e.file_name())).collect::<std::io::Result<Vec<_>>>()?;
+        names.sort();Ok(names)
+    }
+    fn capture(data:&Path)->Result<Self> {
+        let root=TemporaryNode::capture(data,true,0)?;let gid=root.handle.metadata()?.gid();
+        let names=Self::names(data)?;let mut nodes=Vec::new();
+        if !names.is_empty() {
+            ensure!(names==[std::ffi::OsString::from(".mingos-boot"),std::ffi::OsString::from("lost+found")],"UPDATE_FIXTURE_DATA_NOT_EMPTY");
+            let boot=TemporaryNode::capture(&data.join(".mingos-boot"),true,0)?;
+            let lost=TemporaryNode::capture(&data.join("lost+found"),true,0)?;
+            ensure!(Self::names(&boot.path)?==[std::ffi::OsString::from("current.json")]&&Self::names(&lost.path)?.is_empty(),"UPDATE_FIXTURE_INFRA_CONTENT");
+            let marker=TemporaryNode::capture(&boot.path.join("current.json"),false,256)?;
+            #[derive(Deserialize)]
+            #[serde(rename_all="camelCase",deny_unknown_fields)]
+            struct BootMarker { boot_id:String,counter:u64 }
+            let value:BootMarker=serde_json::from_slice(&marker.bytes)?;
+            let boot_id=fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+            ensure!(value.counter==1&&value.boot_id==boot_id.trim(),"UPDATE_FIXTURE_INFRA_GENERATION");
+            nodes.extend([boot,lost,marker]);
+        }
+        let captured=Self{root,gid,nodes};captured.verify_initial()?;Ok(captured)
+    }
+    fn verify_initial(&self)->Result<()> {
+        self.verify()?;
+        let expected=if self.nodes.is_empty(){Vec::new()}else{vec![std::ffi::OsString::from(".mingos-boot"),std::ffi::OsString::from("lost+found")]};
+        ensure!(Self::names(&self.root.path)?==expected,"UPDATE_FIXTURE_DATA_NOT_EMPTY");Ok(())
+    }
+    fn verify(&self)->Result<()> {
+        self.root.verify_directory_identity()?;
+        ensure!(self.root.handle.metadata()?.gid()==self.gid&&fs::symlink_metadata(&self.root.path)?.gid()==self.gid,"UPDATE_FIXTURE_INFRA_GROUP");
+        for node in &self.nodes {
+            node.verify()?;let info=node.handle.metadata()?;
+            ensure!(info.dev()==self.root.stamp.0&&info.gid()==self.gid&&fs::symlink_metadata(&node.path)?.gid()==self.gid,"UPDATE_FIXTURE_INFRA_IDENTITY");
+        }
+        if !self.nodes.is_empty() {
+            ensure!(Self::names(&self.nodes[0].path)?==[std::ffi::OsString::from("current.json")]&&Self::names(&self.nodes[1].path)?.is_empty(),"UPDATE_FIXTURE_INFRA_CONTENT");
+        }
+        Ok(())
+    }
+}
 fn initialize_update_fixture(root:&Path,data_root:&Path,bootstrap:&Package,old_target:&Package,key_id:&str,
     public_key:&[u8;32],initial_catalog:&[u8],layout:UpdateFixtureLayout,mut checkpoint:impl FnMut(&str)->Result<()>) -> Result<ContentSnapshot> {
     use base64::{Engine as _,engine::general_purpose::STANDARD};
@@ -63,7 +109,7 @@ fn initialize_update_fixture(root:&Path,data_root:&Path,bootstrap:&Package,old_t
     let guard=parent.join(format!(".{name}.update-fixture-initializing"));
     ensure!(!data_root.starts_with(&guard),"UPDATE_FIXTURE_GUARD_OVERLAP");
     fixture_absent(root)?;fixture_absent(&guard)?;fixture_private_directory(data_root)?;
-    ensure!(fs::read_dir(data_root)?.next().is_none(),"UPDATE_FIXTURE_DATA_NOT_EMPTY");
+    let infrastructure=FixtureInfrastructure::capture(data_root)?;
     ensure!(initial_catalog.len()<=16*1024,"UPDATE_FIXTURE_CATALOG_LIMIT");
     #[derive(Deserialize)]
     #[serde(rename_all="camelCase",deny_unknown_fields)]
@@ -83,6 +129,7 @@ fn initialize_update_fixture(root:&Path,data_root:&Path,bootstrap:&Package,old_t
         let signature=Signature::from_slice(&STANDARD.decode(manifest.publisher_signature.as_deref().context("UPDATE_FIXTURE_SIGNATURE")?)?)?;
         key.verify(&package.signature_message(key_id)?,&signature)?;
     }
+    checkpoint("before-claim")?;infrastructure.verify_initial()?;
     // Atomic claim precedes every data mutation. On any error this private
     // container is deliberately retained; initialization never repairs/replays it.
     fs::DirBuilder::new().mode(0o700).create(&guard)?;File::open(parent)?.sync_all()?;
@@ -107,12 +154,12 @@ fn initialize_update_fixture(root:&Path,data_root:&Path,bootstrap:&Package,old_t
     checkpoint("after-seed")?;
     ensure!(persistent_install::snapshot(&opened.registry)?==content,"UPDATE_FIXTURE_CONTENT_DRIFT");
     fixture_sync_tree(&staging)?;drop(opened);
-    checkpoint("before-publish")?;
+    checkpoint("before-publish")?;infrastructure.verify()?;
     let source=CString::new(staging.as_os_str().as_bytes())?;let destination=CString::new(root.as_os_str().as_bytes())?;
     ensure!(unsafe{libc::renameat2(libc::AT_FDCWD,source.as_ptr(),libc::AT_FDCWD,destination.as_ptr(),libc::RENAME_NOREPLACE)}==0,
         "UPDATE_FIXTURE_PUBLISH {}",std::io::Error::last_os_error());
     checkpoint("published")?;File::open(parent)?.sync_all()?;checkpoint("parent-synced")?;
-    ensure!(persistent_install::open_existing(root)?.content==content,"UPDATE_FIXTURE_FINAL_READBACK");
+    ensure!(persistent_install::open_existing(root)?.content==content,"UPDATE_FIXTURE_FINAL_READBACK");infrastructure.verify()?;
     fs::remove_dir(&guard)?;File::open(parent)?.sync_all()?;
     Ok(content)
 }
@@ -175,6 +222,79 @@ mod fixture_initialization_tests {
         assert_eq!(content.apps.len(),2);assert_eq!(persistent_install::open_existing(&root).unwrap().content,content);
         assert_eq!(crate::app_data::snapshot_private_read_only(&data,&old.manifest.id).unwrap().files[0].sha256,sha256(b"alpha"));
         assert!(!data.join(".install-root.update-fixture-initializing").exists());
+    }
+    fn seed_boot_infrastructure(data:&Path) {
+        for name in ["lost+found",".mingos-boot"] {let path=data.join(name);fs::create_dir(&path).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();}
+        let bytes=serde_json::to_vec(&serde_json::json!({"bootId":fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),"counter":1})).unwrap();
+        let path=data.join(".mingos-boot/current.json");fs::write(&path,bytes).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    #[test]
+    fn fixture_supports_trusted_boot_infrastructure_without_modifying_it() {
+        for layout in [UpdateFixtureLayout::NoteAlpha,UpdateFixtureLayout::Absent] {
+            let (_temp,_root,data,bootstrap,old,key,catalog)=input();let root=data.join("install-root");seed_boot_infrastructure(&data);
+            let boot_before=tree(&data.join(".mingos-boot"));let lost_before=tree(&data.join("lost+found"));
+            let content=initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,layout).unwrap();
+            assert_eq!(content.apps.len(),2);assert_eq!(persistent_install::open_existing(&root).unwrap().content,content);
+            assert_eq!(tree(&data.join(".mingos-boot")),boot_before);assert_eq!(tree(&data.join("lost+found")),lost_before);
+            assert_eq!(crate::app_data::observe_private_update_read_only(&data,&old.manifest.id).unwrap().namespace_exists,layout==UpdateFixtureLayout::NoteAlpha);
+        }
+    }
+    #[test]
+    fn fixture_boot_infrastructure_rejects_extra_data_and_tampering_before_writes() {
+        for case in 0..22 {
+            let (temp,_root,data,bootstrap,old,key,catalog)=input();let root=data.join("install-root");seed_boot_infrastructure(&data);
+            let boot=data.join(".mingos-boot");let marker=boot.join("current.json");let lost=data.join("lost+found");
+            match case {
+                0=>{fs::write(data.join("old-user-data"),b"keep").unwrap();},
+                1=>{fs::write(lost.join("recovered"),b"keep").unwrap();},
+                2=>{fs::write(boot.join("extra"),b"keep").unwrap();},
+                3=>{fs::write(&marker,br#"{"bootId":"unused","counter":2}"#).unwrap();},
+                4=>{fs::write(&marker,br#"{"bootId":"00000000-0000-0000-0000-000000000000","counter":1}"#).unwrap();},
+                5=>{fs::write(&marker,br#"{"bootId":"unused","counter":1,"extra":0}"#).unwrap();},
+                6=>{fs::write(&marker,br#"{"bootId":"unused","counter":1,"counter":1}"#).unwrap();},
+                7=>{fs::remove_file(&marker).unwrap();fs::remove_dir(&boot).unwrap();},
+                8=>{fs::remove_dir(&lost).unwrap();},
+                9=>{fs::remove_dir(&lost).unwrap();std::os::unix::fs::symlink(temp.path(),&lost).unwrap();},
+                10=>{fs::remove_file(&marker).unwrap();fs::remove_dir(&boot).unwrap();std::os::unix::fs::symlink(temp.path(),&boot).unwrap();},
+                11=>{fs::remove_file(&marker).unwrap();std::os::unix::fs::symlink(temp.path().join("missing"),&marker).unwrap();},
+                12=>{fs::hard_link(&marker,temp.path().join("linked-marker")).unwrap();},
+                13=>{fs::set_permissions(&marker,fs::Permissions::from_mode(0o640)).unwrap();},
+                14=>{fs::set_permissions(&boot,fs::Permissions::from_mode(0o755)).unwrap();},
+                15=>{fs::set_permissions(&lost,fs::Permissions::from_mode(0o755)).unwrap();},
+                16=>{fs::remove_file(&marker).unwrap();fs::create_dir(&marker).unwrap();},
+                17=>{fs::write(&marker,vec![b' ';257]).unwrap();},
+                18=>{fs::write(&marker,br#"{"bootId":"unused","counter":"1"}"#).unwrap();},
+                19=>{fs::remove_file(&marker).unwrap();},
+                20=>{fs::set_permissions(&lost,fs::Permissions::from_mode(0o4700)).unwrap();},
+                _=>{fs::write(&marker,br#"{"bootId":"unused","counter":1.0}"#).unwrap();},
+            }
+            let before=tree(temp.path());
+            assert!(initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::NoteAlpha).is_err(),"case {case}");
+            assert_eq!(tree(temp.path()),before,"case {case}");assert!(!data.join(".install-root.update-fixture-initializing").exists());
+        }
+    }
+    #[test]
+    fn fixture_initial_data_is_rechecked_immediately_before_claim() {
+        let (_temp,_root,data,bootstrap,old,key,catalog)=input();let root=data.join("install-root");seed_boot_infrastructure(&data);
+        assert!(initialize_update_fixture(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::Absent,|stage| {
+            if stage=="before-claim" {fs::write(data.join("unexpected"),b"keep")?;}Ok(())
+        }).is_err());
+        assert!(!root.exists());assert!(!data.join(".install-root.update-fixture-initializing").exists());assert_eq!(fs::read(data.join("unexpected")).unwrap(),b"keep");
+    }
+    #[test]
+    fn fixture_boot_infrastructure_is_rechecked_before_publication() {
+        for case in 0..4 {
+            let (_temp,_root,data,bootstrap,old,key,catalog)=input();let root=data.join("install-root");seed_boot_infrastructure(&data);
+            let result=initialize_update_fixture(&root,&data,&bootstrap,&old,"mingos-dev-2026",key.verifying_key().as_bytes(),&catalog,UpdateFixtureLayout::Absent,|stage| {
+                if stage=="before-publish" {let marker=data.join(".mingos-boot/current.json");match case {
+                    0=>fs::write(marker,b"changed")?,
+                    1=>{let bytes=fs::read(&marker)?;fs::remove_file(&marker)?;fs::write(marker,bytes)?;},
+                    2=>fs::write(data.join("lost+found/unexpected"),b"keep")?,
+                    _=>fs::set_permissions(data.join(".mingos-boot"),fs::Permissions::from_mode(0o755))?,
+                }}Ok(())
+            });
+            assert!(result.is_err(),"case {case}");assert!(!root.exists());assert!(data.join(".install-root.update-fixture-initializing").exists());
+        }
     }
     #[test]
     fn fixture_preflight_rejects_existing_or_invalid_inputs_before_claim_or_data_writes() {
@@ -516,8 +636,23 @@ fn validate_transaction_snapshot_with_temporary(registry:&PackageInstallRegistry
     Ok(content)
 }
 
+/// A bounded observation made before the trial worker can launch. Journal bytes
+/// are included so a verifier hashes and parses the exact durable representation.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrialObservation {
+    pub schema_version: u32,
+    pub transaction_id: String,
+    pub outer_record_sha256: String,
+    pub inner_journal_sha256: String,
+    pub outer_record_base64: String,
+    pub inner_journal_base64: String,
+    pub inner_phase: String,
+    pub content: ContentSnapshot,
+    pub private_content: PrivateUpdateBaseline,
+}
 #[derive(Debug)]
-pub struct TrialUpdate { pub record: UpdateRecord, pub catalog: Catalog }
+pub struct TrialUpdate { pub record: UpdateRecord, pub catalog: Catalog, pub observation: TrialObservation }
 #[derive(Debug)]
 pub struct UpdateCommit { pub record: UpdateRecord, pub content: ContentSnapshot }
 #[derive(Debug)]
@@ -583,6 +718,33 @@ fn load_bound(registry: &PackageInstallRegistry, authority: &PackageStorageAutho
     validate_transaction_snapshot(registry, authority, data_root, &record, &raw, inner.as_deref())?;
     exact_marker(registry, &raw, identity)?;
     Ok((record, raw, identity))
+}
+// The caller owns the registry operation mutex and the target launch gate; the
+// authority rejects sessions throughout each coordinated private observation.
+fn observe_trial_locked(registry: &PackageInstallRegistry, authority: &PackageStorageAuthority, data_root: &Path,
+    expected: &UpdateRecord) -> Result<TrialObservation> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let (record, raw, identity) = load_bound(registry, authority, data_root)?;
+    ensure!(record == *expected && record.decision == UpdateDecision::Prepared, "UPDATE_TRIAL_TRANSACTION");
+    let outer = TemporaryNode::capture(&registry.root_path().join(UPDATE_PENDING_NAME), false, MAX_UPDATE_RECORD_BYTES)?;
+    ensure!(outer.bytes == raw, "UPDATE_TRIAL_OUTER_CHANGED");
+    let inner = TemporaryNode::capture(&registry.root_path().join(INNER_JOURNAL_NAME), false, 16*1024)?;
+    let bound = validate_inner(&record, Some(&inner.bytes))?.context("UPDATE_TRIAL_INNER_MISSING")?;
+    ensure!(bound.phase == "recordPublished", "UPDATE_TRIAL_INNER_PHASE");
+    let content = validate_transaction_snapshot(registry, authority, data_root, &record, &raw, Some(&inner.bytes))?;
+    let data = context(&record, data_root)?.data;
+    authority.validate_coordinated_rollback(&data, crate::app_data::PrivateUpdatePhase::SwappedUnconfirmed)?;
+    let private_content = authority.observe_coordinated_update(&data)?;
+    checkpoint("trial-observed")?;
+    ensure!(content == validate_transaction_snapshot(registry, authority, data_root, &record, &raw, Some(&inner.bytes))?, "UPDATE_TRIAL_CONTENT_CHANGED");
+    authority.validate_coordinated_rollback(&data, crate::app_data::PrivateUpdatePhase::SwappedUnconfirmed)?;
+    ensure!(private_content == authority.observe_coordinated_update(&data)?, "UPDATE_TRIAL_PRIVATE_CHANGED");
+    exact_marker(registry, &raw, identity)?;
+    outer.verify()?; inner.verify()?;
+    Ok(TrialObservation { schema_version: 1, transaction_id: record.transaction_id,
+        outer_record_sha256: sha256(&raw), inner_journal_sha256: sha256(&inner.bytes),
+        outer_record_base64: STANDARD.encode(&raw), inner_journal_base64: STANDARD.encode(&inner.bytes),
+        inner_phase: bound.phase, content, private_content })
 }
 // Unpublished objects never supply a decision. Only the exact transaction names
 // are admitted into a recovery-only view, after bounded no-follow captures.
@@ -871,13 +1033,12 @@ pub fn begin_existing_update(registry: &PackageInstallRegistry, authority: &Pack
     let publish = context(&record, data_root).and_then(|context| registry.publish_coordinated_update(package, authority, &context))
         .and_then(|_| checkpoint("trial-published"))
         .and_then(|_| registry.with_update_operation(|| {
-            let (current, _, _) = load_bound(registry, authority, data_root)?;
-            ensure!(current == record, "UPDATE_TRIAL_TRANSACTION");
+            let observation = observe_trial_locked(registry, authority, data_root, &record)?;
             let (catalog, grants) = load_catalog_with_install_registry(&registry.root_path().join(persistent_install::CATALOG_NAME), registry)?;
-            ensure!(grants.is_empty(), "UPDATE_CATALOG_GRANTS"); Ok(catalog)
+            ensure!(grants.is_empty(), "UPDATE_CATALOG_GRANTS"); Ok((catalog, observation))
         }));
     match publish {
-        Ok(catalog) => Ok(TrialUpdate { record, catalog }),
+        Ok((catalog, observation)) => Ok(TrialUpdate { record, catalog, observation }),
         Err(error) => match recover_loaded_update(registry, authority, data_root, &record.transaction_id) {
             Ok(UpdateRecovery::RolledBack(_)) => Err(failure("rolled-back", "publish", format!("{error:#}"))),
             Ok(UpdateRecovery::Committed(_)) => Err(block_failure(registry, &raw, "publish-decision-changed", format!("{error:#}"))),
@@ -1032,6 +1193,19 @@ mod recovery_tests {
             let before = authority.observe_update(&new.manifest.id).unwrap();
             let trial = begin_existing_update(&registry, &authority, &data_root, &new, 2).unwrap();
             assert_eq!(trial.record.private_before, before);
+            let outer=registry.read_coordinated_marker(UPDATE_PENDING_NAME,MAX_UPDATE_RECORD_BYTES as u64).unwrap().unwrap();
+            let inner=registry.read_coordinated_marker(INNER_JOURNAL_NAME,16*1024).unwrap().unwrap();
+            assert_eq!(trial.observation.schema_version,1);
+            assert_eq!(trial.observation.transaction_id,trial.record.transaction_id);
+            assert_eq!(trial.observation.inner_phase,"recordPublished");
+            assert_eq!(trial.observation.outer_record_sha256,sha256(&outer));
+            assert_eq!(trial.observation.inner_journal_sha256,sha256(&inner));
+            assert_eq!(STANDARD.decode(&trial.observation.outer_record_base64).unwrap(),outer);
+            assert_eq!(STANDARD.decode(&trial.observation.inner_journal_base64).unwrap(),inner);
+            assert_eq!(trial.observation.content,validate_transaction_snapshot(&registry,&authority,&data_root,&trial.record,&outer,Some(&inner)).unwrap());
+            assert_eq!(trial.observation.private_content,authority.observe_coordinated_update(&context(&trial.record,&data_root).unwrap().data).unwrap());
+            assert_eq!(trial.observation.private_content.non_files_sha256,before.non_files_sha256);
+            if migration { assert_ne!(trial.observation.private_content.files,before.files); }
             assert_eq!(trial.catalog.apps.iter().find(|entry| entry.id == 2).unwrap().package_id, new.manifest.id);
             assert!(persistent_install::snapshot(&registry).is_err());
             registry.begin_update_startup(&new.manifest.id, new.storage_fingerprint()).unwrap();
@@ -1043,6 +1217,48 @@ mod recovery_tests {
             assert_eq!(committed.content.apps.iter().find(|entry| entry.app == 2).unwrap().version, "2.0.0");
             assert!(!registry.root_path().join(UPDATE_PENDING_NAME).exists());
         } } }
+    }
+    #[test]
+    fn trial_observation_rejects_missing_wrong_or_advanced_inner_without_writes() {
+        for mutation in ["missing","identity","phase"] {
+            let (_temp,registry,authority,data,new)=fixture(3,true,false);
+            let trial=begin_existing_update(&registry,&authority,&data,&new,2).unwrap();
+            let journal=registry.root_path().join(INNER_JOURNAL_NAME);
+            let mut inner:serde_json::Value=serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+            match mutation {
+                "missing"=>fs::remove_file(&journal).unwrap(),
+                "identity"=>{inner["newFingerprint"]=serde_json::json!("0".repeat(64));write(&journal,&serde_json::to_vec(&inner).unwrap());},
+                "phase"=>{inner["phase"]=serde_json::json!("startupAttempted");write(&journal,&serde_json::to_vec(&inner).unwrap());},
+                _=>unreachable!(),
+            }
+            let before=tree(_temp.path());
+            assert!(registry.with_update_operation(||observe_trial_locked(&registry,&authority,&data,&trial.record)).is_err(),"{mutation}");
+            assert_eq!(tree(_temp.path()),before,"observer wrote on {mutation}");
+        }
+    }
+    #[test]
+    fn trial_observation_rejects_markers_content_and_private_tree_changed_during_read() {
+        for mutation in ["outer-replaced","inner-replaced","catalog","private"] {
+            let (_temp,registry,authority,data,new)=fixture(3,true,false);
+            let trial=begin_existing_update(&registry,&authority,&data,&new,2).unwrap();
+            let root=registry.root_path().to_owned();let data_copy=data.clone();let package_id=new.manifest.id.clone();
+            hook(move |stage| {
+                if stage=="trial-observed" {
+                    match mutation {
+                        "outer-replaced"|"inner-replaced"=>{
+                            let path=root.join(if mutation=="outer-replaced"{UPDATE_PENDING_NAME}else{INNER_JOURNAL_NAME});
+                            let replacement=root.join("marker-replacement");write(&replacement,&fs::read(&path).unwrap());fs::rename(replacement,path)?;
+                        },
+                        "catalog"=>write(&root.join("catalog.json"),b"{}"),
+                        "private"=>write(&data_copy.join(crate::app_data::package_directory_name(&package_id)).join("files/note"),b"changed"),
+                        _=>unreachable!(),
+                    }
+                }
+                Ok(())
+            });
+            let result=registry.with_update_operation(||observe_trial_locked(&registry,&authority,&data,&trial.record));clear_hook();
+            assert!(result.is_err(),"{mutation}");
+        }
     }
     #[test]
     fn persistent_update_commit_is_after_complete_proof() {

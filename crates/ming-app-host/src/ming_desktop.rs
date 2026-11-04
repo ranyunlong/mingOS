@@ -1065,7 +1065,7 @@ impl Session {
                     let output = (|| {
                         let anchor = self.native_anchor()?;
                         self.emit_native_receipt("trial-published", serde_json::json!({"record":trial.record,
-                            "confirmation":self.native_uninstall_confirm,"anchor":anchor}))
+                            "trialObservation":trial.observation,"confirmation":self.native_uninstall_confirm,"anchor":anchor}))
                     })();
                     if let Err(error) = output {
                         return Err(self.uninstall_session_failure("DESKTOP_PERSISTENT_UPDATE_TRIAL_OUTPUT", error));
@@ -5373,6 +5373,10 @@ mod persistent_update_runtime {
             MigrationStep::EnsureDir{path:"state".into()},MigrationStep::RenameFile{from:"note.txt".into(),to:"state/note.txt".into()}]});
         let new=sign(ID,"0.2.0",new_bytes,migration);
         let catalog=br#"{"schemaVersion":3,"apps":[{"id":1,"title":"Text Lab","packageId":"dev.ming.text-entry-demo"}],"autostart":[1]}"#;
+        for name in ["lost+found",".mingos-boot"] {let path=data.join(name);fs::create_dir(&path).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();}
+        let marker=data.join(".mingos-boot/current.json");
+        fs::write(&marker,serde_json::to_vec(&serde_json::json!({"bootId":fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(),"counter":1})).unwrap()).unwrap();
+        fs::set_permissions(marker,fs::Permissions::from_mode(0o600)).unwrap();
         persistent_update::initialize_update_fixture_first(&root,&data,&bootstrap,&old,"mingos-dev-2026",SigningKey::from_bytes(&[7;32]).verifying_key().as_bytes(),catalog,layout).unwrap();
         let source=parent.join("source");fs::create_dir(&source).unwrap();fs::write(source.join("main.wasm"),&new.bytes).unwrap();
         let manifest=source.join("app.json");fs::write(&manifest,serde_json::to_vec(&new.manifest).unwrap()).unwrap();
@@ -5397,6 +5401,29 @@ mod persistent_update_runtime {
         session.begin_native_input(true,None).unwrap();session.end_native_input().unwrap();
         session.begin_native_input(false,None).unwrap();session.respond_storage_prompt_from_native(true).unwrap();session.end_native_input().unwrap();
         assert!(session.persistent_update.is_some());assert!(session.instances.is_empty());
+        let receipt=&session.test_native_receipts.iter().find(|r|r["kind"]=="trial-published").unwrap()["receipt"];
+        let observation=&receipt["trialObservation"];
+        assert_eq!(observation["schemaVersion"],1,"trial receipt must observe durable transaction before launch");
+        let record=&session.persistent_update.as_ref().unwrap().record;
+        assert_eq!(observation["transactionId"],record.transaction_id);
+        assert_eq!(observation["innerPhase"],"recordPublished");
+        let registry=session.options.install_registry.as_ref().unwrap();
+        let outer=registry.read_coordinated_marker(persistent_update::UPDATE_PENDING_NAME,4096).unwrap().unwrap();
+        let inner=registry.read_coordinated_marker(persistent_update::INNER_JOURNAL_NAME,16*1024).unwrap().unwrap();
+        assert_eq!(observation["outerRecordSha256"],persistent_install::sha256(&outer));
+        assert_eq!(observation["innerJournalSha256"],persistent_install::sha256(&inner));
+        assert_eq!(STANDARD.decode(observation["outerRecordBase64"].as_str().unwrap()).unwrap(),outer);
+        assert_eq!(STANDARD.decode(observation["innerJournalBase64"].as_str().unwrap()).unwrap(),inner);
+        let authority=session.storage_authority.as_ref().unwrap();
+        let data=session.options.data_root_path.as_deref().unwrap();
+        let content=persistent_update::validate_transaction_snapshot(registry,authority,data,record,&outer,Some(&inner)).unwrap();
+        assert_eq!(observation["content"],serde_json::to_value(content).unwrap());
+        let private=authority.observe_coordinated_update(&crate::app_data::CoordinatedPrivateUpdate {
+            transaction_id:record.transaction_id.clone(),baseline:record.private_before.clone(),
+            backup_name:format!(".ming-update-backup-{}",record.transaction_id),
+        }).unwrap();
+        assert_eq!(observation["privateContent"],serde_json::to_value(private).unwrap());
+        assert!(persistent_install::open_existing(registry.root_path()).is_err(),"trial observation must not relax strict reopen");
         session.begin_native_input(true,None).unwrap();session.launch_from_native_dock(2).unwrap();session.end_native_input().unwrap();
         session.begin_native_input(false,None).unwrap();session.end_native_input().unwrap();
         assert_eq!(session.instances.len(),1,"native Dock must create exactly one real runtime");

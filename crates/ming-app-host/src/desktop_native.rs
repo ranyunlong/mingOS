@@ -901,6 +901,38 @@ fn window_error(error: softbuffer::SoftBufferError) -> anyhow::Error {
 mod input_tests {
     use super::*;
     #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_update_two_app_input_geometry() {
+        use crate::graphics::desktop_shell::{power_cell,storage_prompt_geometry,dock_storage_cell,StoragePrompt};
+        let (width,height)=(1280,800);
+        let mut model=crate::desktop_model::DesktopModel::new(width,height).unwrap();
+        model.open(1).unwrap();let (window,_)=model.open(2).unwrap();
+        let outer=model.view(window).unwrap().outer;
+        let install=install_cell(width,height);let power=power_cell(width,height);
+        let prompt=StoragePrompt::install("dev.ming.persistent-update-demo","0.2.0",&"0".repeat(64),true,false,false).unwrap();
+        assert_eq!(prompt.state_value()["mode"],17);
+        let allow=storage_prompt_geometry(width,height,!prompt.has_allow()).unwrap().allow.unwrap();
+        let dock=dock_cell(width,height,1,2);
+        let center=|r:Rect|[r.x+r.width/2,r.y+r.height/2];
+        let install_point=center(install);let allow_point=center(allow);let power_point=center(power);
+        let dock_point=[dock.x+dock.width/2,dock.y+30];
+        // NativeDesktop::down uses the first title control at outer+(16,16).
+        let close_point=[outer.x+16,outer.y+16];
+        assert!(dock.contains(dock_point[0],dock_point[1]));
+        for control in [dock_purge_cell(width,height,1,2),dock_uninstall_cell(width,height,1,2),dock_storage_cell(width,height,1,2)] {
+            assert!(!control.contains(dock_point[0],dock_point[1]));
+        }
+        assert_eq!(model.views().into_iter().rev().find(|v|v.outer.contains(close_point[0],close_point[1])).unwrap().app,2);
+        let boot1=[install_point,allow_point,dock_point,close_point,power_point];
+        assert_eq!(boot1,[[1148,12],[880,478],[676,766],[96,104],[1238,12]]);
+        let rect=|r:Rect|serde_json::json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height});
+        println!("MING_PERSISTENT_UPDATE_GEOMETRY {}",serde_json::json!({"schemaVersion":1,"width":width,"height":height,
+            "install":{"rect":rect(install),"point":install_point},"updateAllow":{"rect":rect(allow),"point":allow_point},
+            "app2Dock":{"index":1,"count":2,"rect":rect(dock),"point":dock_point},
+            "app2Window":{"outer":rect(outer),"closePoint":close_point},"power":{"rect":rect(power),"point":power_point},
+            "boot1Points":boot1,"boot2Points":[dock_point,power_point]}));
+    }
+    #[cfg(target_os = "linux")]
     fn uninstall_native_app(qualification: Option<&str>) -> (tempfile::TempDir, NativeDesktop, DesktopShell) {
         uninstall_native_app_with_wasm(qualification, None)
     }
