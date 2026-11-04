@@ -104,14 +104,19 @@ mod tests {
         }
         assert_eq!(styles.create(0, 0), FIRST);
     }
+    // Keep the case loop separate from the table scans during optimization.
+    #[inline(never)]
+    fn assert_invalid_handle(styles: &mut Styles, handle: i32) {
+        assert!(styles.get(handle).is_none());
+        assert!(!styles.close(handle));
+    }
     #[test]
     fn invalid_and_other_resource_handles_never_resolve() {
         let mut styles = Styles::default();
         let h = styles.create(4, 2);
         assert_eq!(h, FIRST);
         for bad in [i32::MIN, -1, 0, 1, 0x3000_0001, FIRST + 1, LAST] {
-            assert!(styles.get(bad).is_none());
-            assert!(!styles.close(bad));
+            assert_invalid_handle(&mut styles, bad);
         }
         assert_eq!(styles.get(h), Some(Style { radius: 4, blur: 2 }));
     }

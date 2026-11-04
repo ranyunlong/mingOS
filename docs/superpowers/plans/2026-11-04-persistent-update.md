@@ -308,6 +308,12 @@ pub fn initialize_update_fixture_first(root: &Path, data_root: &Path,
 
 **Files:** 新 `artifacts/persistent-update-20261104-qual1/`，更新 `docs/continuous-development.md`和本计划的实际完成记录。任何失败都新建独立代保留，不能回写旧成功或卸载候选。
 
+**实际执行进度（2026-11-04）：** 最终无 guest 开发准入 `development-admission-16a70c6cb970` 完成 checker `20/20`、driver `17/17` 与真实运行时边界；在本地 prepare/build 授权下，提交 `c87b671fb919131a6bfcdc02a06bfb4af9b47923` 的1425项正式 freeze 和 prepare 已封存，qualification=`persistent-update-20261104-qual1-f677613d9016`，新卷容量及UID65534实际读写/同步/删除预检通过。首条 `cargo +1.99.1 test --offline --locked --release -p ming-app-host -j1 --all-targets` 在 `ming_app_host --test -C opt-level=3` 编译时达到1800秒限制并失败，未执行测试或后续 Cargo 步骤；非 OOM，观测内存和卷余量未耗尽，未建立具体 compiler pass 的根因。失败容器已退出并精确删除，build/build-preflight卷与旧冻结均保留，未重试或修改预算。原始证据在 `artifacts/persistent-update-20261104-prep/{build/cargo-1,build/diagnostics,stages/build}/`。
+
+**后续单文件诊断范围：** 同一 Rust 1.99.1 的原 `shadow_service.rs` 独立 opt3 测试编译90秒超时；只把 invalid-handle 断言抽到测试专用 `#[inline(never)]` helper 后约0.479秒编译成功，原7项测试全部通过，生产代码字节不变。诊断全部原文件hash已核验，summary/输出日志保留于 `artifacts/persistent-update-20261104-prep/build/diagnostics/shadow-opt3-helper/`，原始 summary 为 `/var/folders/t7/8c0zz39j6dx21lhzl0y33kmh0000gn/T/ming-shadow-opt3-helper-12bjdcyt/output/summary.json`。此结果不等于完整 Cargo opt3 通过，当前完整构建仍待新冻结与新代重跑；测试及文档变化使旧freeze不再匹配当前源码，旧代不得续跑。payload/review/bundle及具体pair授权均未生成，资格数据盘和VM均未创建或启动；以下正式构建与双启动条目仍未完成，`finalSystemAccepted=false`。
+
+**新代路径修复验证：** driver 以 inventory 来源目录与实际 `/prep` 的唯一 `samefile` 匹配替代旧 prep 路径，并按该来源相对路径验证 host environment；保留完整集合/hash检查。新代 host/mapped freeze、新增/篡改拒绝、同字节不同目录及遗漏 driver 拒绝的3项新增回归先RED后GREEN；driver `20/20`、checker与driver合计 `40/40` 通过。实际 tools 容器仅只读绑定当前仓库与当前prep，`samefile=true`且当时1425项完整map一致，未创建新代、执行构建、启动guest或挂载volume，诊断容器删除已复验。新代目录在单元控制中覆盖，实际bind证据只覆盖当前prep，不能代替新代完整准入。独立只读复核无阻断，日志见 `artifacts/persistent-update-20261104-prep/build/diagnostics/preparation-path-fix-*`；旧freeze字节保留。
+
 - [ ] **执行前确认事实与授权。** 在独立实现checkout核对源码/lock/fixture/checker/driver冻结、镜像和依赖、空间/安全退出/锁、实际动作与既有用户授权是否一致。构建、VM、盘/卷动作未获覆盖则完成全部可审准备后报告具体缺项；本文不替代该授权。
 - [ ] **正式当前构建。** 新freeze下运行release all-targets、all-features/all-targets check、无default features check、Host/helper build、Task7显式真实worker，以及 `cargo test --offline --locked --release -p ming-app-host --lib persistent_update::recovery_tests -j1 -- --test-threads=1` 的实际父矩阵。独立核对退出码/匹配数/源码稳定、ELF动态闭包、模块adapter/signature、initramfs实际文件。失败先读原始错误，不换release为debug、增加watchdog或关掉边界来通过。
 

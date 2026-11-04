@@ -301,8 +301,16 @@ def absent(kind, name):
     if 'no such' not in result.stderr.lower(): raise RuntimeError('cannot prove resource absence: ' + result.stderr)
 
 
+def preparation_source_root(repo, root, names):
+    if root.is_relative_to(repo): return root
+    candidates = {relative(repo, name).parent for name in names
+                  if Path(name).name == 'run-stage.py' and relative(repo, name).parent.samefile(root)}
+    if len(candidates) != 1: raise ValueError('preparation source mount does not match inventory')
+    return candidates.pop()
+
+
 def source_names(repo, root):
-    if sys.platform == 'linux' and repo == Path('/repo'):
+    if not root.is_relative_to(repo):
         inventory = read(root / 'source-inventory.json')
         if not isinstance(inventory,list) or any(not isinstance(name,str) for name in inventory): raise ValueError('host source inventory required')
         names = set(inventory)
@@ -331,7 +339,7 @@ def source_names(repo, root):
             rel = path.relative_to(base)
             if any(part in ('build', 'builds', '.gradle', '.kotlin', '__pycache__', 'node_modules') for part in rel.parts): continue
             if path.is_file() or path.is_symlink(): names.add(str(path.relative_to(repo)))
-    logical_root = root if root.is_relative_to(repo) else repo / 'artifacts/persistent-update-20261104-prep'
+    logical_root = preparation_source_root(repo, root, names)
     for pattern in ('*.py', 'input-boot*.json', 'input-geometry.json', 'geometry.stdout.log', 'session-review.draft.json', 'runtime-inputs.json', 'bootstrap-external-input.json'):
         names.update(str(path.relative_to(repo)) for path in logical_root.glob(pattern))
     return names
@@ -537,7 +545,9 @@ def verify_freeze(root, repo):
         if len(raw) > 1048576 or hashlib.sha256(raw).hexdigest() != freeze['inputs']['boot%dSha256' % number]: raise ValueError('frozen input changed')
         specs.append(strict_json(raw))
     validate_inputs(*specs, root)
-    if freeze['budget'] != execution_budget(*input_contracts()) or freeze['environment'] != environment_contract(freeze['environment']['qualificationId'], Path(freeze['repo']) / 'artifacts/persistent-update-20261104-prep'): raise ValueError('frozen limits changed')
+    logical_root = preparation_source_root(repo, root, freeze['files'])
+    host_root = Path(freeze['repo']) / logical_root.relative_to(repo)
+    if freeze['budget'] != execution_budget(*input_contracts()) or freeze['environment'] != environment_contract(freeze['environment']['qualificationId'], host_root): raise ValueError('frozen limits changed')
     return freeze
 
 def product_hashes(root, names):

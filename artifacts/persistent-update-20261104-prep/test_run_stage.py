@@ -13,6 +13,73 @@ def driver():
 
 
 class DriverTests(unittest.TestCase):
+    def preparation_repo(self, work):
+        stage=driver();repo=Path(work).resolve()/'repo';repo.mkdir()
+        stage.subprocess.run(['git','init','-q',str(repo)],check=True)
+        (repo/'.gitignore').write_text('artifacts/\n')
+        prep=repo/'artifacts/prep2';prep.mkdir(parents=True)
+        (prep/'run-stage.py').write_text('pass\n')
+        (prep/'verify-persistent-update-evidence.py').write_text('pass\n')
+        for name in ('mingos-isolation-probe','vm-prepare.sh'):
+            path=repo/'probes/linux-isolation-source-v2/build-current'/name
+            path.parent.mkdir(parents=True,exist_ok=True);path.write_text(name)
+        return stage,repo,prep
+
+    def test_new_preparation_generation_freeze_uses_its_own_host_root(self):
+        with tempfile.TemporaryDirectory() as work:
+            stage,repo,prep=self.preparation_repo(work)
+            (prep/'inputs').mkdir()
+            inputs={}
+            for number,plan in enumerate(stage.input_contracts(),1):
+                path=prep/'inputs'/('input-boot%d.json'%number)
+                stage.write(path,plan);inputs['boot%dSha256'%number]=stage.sha(path)
+            files=stage.capture_source(repo,prep)
+            stage.write(prep/'source-inventory.json',sorted(files))
+            freeze={'schemaVersion':1,'profile':stage.PROFILE,'repo':str(repo),'preparedAt':'test',
+                    'sourceCommit':'test','files':files,'sourceInventorySha256':stage.sha(prep/'source-inventory.json'),
+                    'environment':stage.environment_contract('persistent-update-20261104-qual1-test',prep),
+                    'runtime':{},'budget':stage.execution_budget(*stage.input_contracts()),'inputs':inputs,
+                    'checker':{'path':str((prep/'verify-persistent-update-evidence.py').relative_to(repo)),
+                               'sha256':stage.sha(prep/'verify-persistent-update-evidence.py')},
+                    'fixture':{},'finalSystemAccepted':False}
+            stage.write(prep/'freeze.json',freeze)
+            with mock.patch.object(stage,'fixture_inputs',return_value={}),mock.patch.object(stage,'validate_runtime_inputs'):
+                self.assertEqual(stage.verify_freeze(prep,repo),freeze)
+                mapped=Path(work).resolve()/'mapped-prep';mapped.symlink_to(prep,target_is_directory=True)
+                self.assertEqual(stage.verify_freeze(mapped,repo),freeze)
+                freeze['environment']['hostBackingRoot']=str(repo/'artifacts/other/apfs-backing'/freeze['environment']['qualificationId'])
+                stage.write(prep/'freeze.json',freeze,exclusive=False)
+                with self.assertRaisesRegex(ValueError,'frozen limits'):
+                    stage.verify_freeze(prep,repo)
+
+    def test_mapped_new_generation_detects_prep_additions_and_byte_changes(self):
+        with tempfile.TemporaryDirectory() as work:
+            stage,repo,prep=self.preparation_repo(work)
+            frozen=stage.capture_source(repo,prep)
+            stage.write(prep/'source-inventory.json',sorted(frozen))
+            mapped=Path(work).resolve()/'mapped-prep';mapped.symlink_to(prep,target_is_directory=True)
+            self.assertEqual(stage.capture_source(repo,mapped),frozen)
+            (prep/'added.py').write_text('new\n')
+            with self.assertRaisesRegex(ValueError,'file set'):
+                stage.verify_source_files({'files':frozen},repo,mapped)
+            (prep/'added.py').unlink();(prep/'run-stage.py').write_text('changed\n')
+            with self.assertRaisesRegex(ValueError,'source changed'):
+                stage.verify_source_files({'files':frozen},repo,mapped)
+
+    def test_mapped_preparation_must_be_same_directory_as_inventory_source(self):
+        with tempfile.TemporaryDirectory() as work:
+            stage,repo,prep=self.preparation_repo(work)
+            frozen=stage.capture_source(repo,prep)
+            other=Path(work).resolve()/'other-prep';other.mkdir()
+            stage.write(other/'source-inventory.json',sorted(frozen))
+            (other/'run-stage.py').write_bytes((prep/'run-stage.py').read_bytes())
+            with self.assertRaisesRegex(ValueError,'preparation source mount'):
+                stage.capture_source(repo,other)
+            mapped=Path(work).resolve()/'mapped-prep';mapped.symlink_to(prep,target_is_directory=True)
+            stage.write(prep/'source-inventory.json',[name for name in frozen if not name.endswith('/run-stage.py')])
+            with self.assertRaisesRegex(ValueError,'preparation source mount'):
+                stage.capture_source(repo,mapped)
+
     def test_fixed_inputs_and_retained_budget(self):
         stage=driver();first,second=stage.input_contracts()
         self.assertEqual([len(first['steps']),len(second['steps'])],[5,2])
