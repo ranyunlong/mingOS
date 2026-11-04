@@ -97,7 +97,24 @@ fn relative(root: &Path, path: &Path) -> Result<String> {
     ensure!(!value.is_empty() && value.len() <= 768, "PERSISTENT_CONTENT_PATH");
     Ok(value.into())
 }
-fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>, total: &mut usize, pending: Option<&[u8]>) -> Result<()> {
+// Include directory identities and names, so checking known files a second time
+// cannot miss a replaced directory, added sibling, or replaced lock.
+type ContentStamp = (u64, u64, u32, u32, u64, u64, i64, i64, i64, i64);
+fn content_shape(root: &Path) -> Result<BTreeMap<PathBuf, ContentStamp>> {
+    fn visit(root: &Path, path: &Path, result: &mut BTreeMap<PathBuf, ContentStamp>) -> Result<()> {
+        ensure!(result.len() <= MAX_FILES * 2 && path.strip_prefix(root)?.components().count() <= 4, "PERSISTENT_CONTENT_LIMIT");
+        let info=fs::symlink_metadata(path)?;
+        ensure!(!info.file_type().is_symlink(), "PERSISTENT_FILE_TYPE");
+        metadata(path,info.is_dir())?;
+        result.insert(path.strip_prefix(root)?.to_path_buf(),(info.dev(),info.ino(),info.mode(),info.uid(),info.nlink(),info.len(),info.mtime(),info.mtime_nsec(),info.ctime(),info.ctime_nsec()));
+        if info.is_dir() {
+            for entry in fs::read_dir(path)?.take(MAX_FILES+1) { visit(root,&entry?.path(),result)?; }
+        }
+        Ok(())
+    }
+    let mut result=BTreeMap::new(); visit(root,root,&mut result)?; Ok(result)
+}
+fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>, total: &mut usize, markers: &[(&str, &[u8])]) -> Result<()> {
     metadata(directory, true)?;
     ensure!(directory.strip_prefix(root)?.components().count() <= 3, "PERSISTENT_CONTENT_DEPTH");
     let children = fs::read_dir(directory)?.take(MAX_FILES + 1).collect::<std::io::Result<Vec<_>>>()?;
@@ -117,14 +134,12 @@ fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>,
             ensure!(parts[0] == "packages" && parts.len() <= 3, "PERSISTENT_UNKNOWN_DIRECTORY");
             if parts.len() >= 2 { ensure!(!parts[1].is_empty() && parts[1].len() <= 512 && parts[1].len() % 2 == 0 && parts[1].bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)), "PERSISTENT_PACKAGE_DIRECTORY"); }
             if parts.len() == 3 { ensure!(parts[2].len() <= 160 && parts[2].bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c) || c == b'.' || c == b'-'), "PERSISTENT_VERSION_DIRECTORY"); }
-            collect(root, &path, files, total, pending)?;
+            collect(root, &path, files, total, markers)?;
         } else {
             let parts: Vec<_> = rel.split('/').collect();
-            if rel == PENDING_NAME {
-                if let Some(expected) = pending {
-                    ensure!(read_file(&path, 4096)? == expected, "PERSISTENT_PENDING_CHANGED");
-                    continue;
-                }
+            if let Some((_, expected)) = markers.iter().find(|(name, _)| *name == rel) {
+                ensure!(read_file(&path, 16 * 1024)? == *expected, "PERSISTENT_PENDING_CHANGED");
+                continue;
             }
             let limit = if parts.len() == 1 {
                 ensure!([CATALOG_NAME, BOOTSTRAP_NAME, REGISTRY_NAME, TRUST_NAME].contains(&rel.as_str()) || LOCKS.contains(&rel.as_str()), "PERSISTENT_UNKNOWN_FILE");
@@ -165,15 +180,39 @@ fn snapshot_while_pending(registry: &PackageInstallRegistry, pending: &Pending, 
 }
 
 fn snapshot_inner(registry: &PackageInstallRegistry, pending: Option<&[u8]>) -> Result<ContentSnapshot> {
+    snapshot_state(registry, pending, None).map(|state| state.0)
+}
+
+// The update module binds the record and inner identity before constructing this
+// content-only capability. Private layout and mutation authorization are separate.
+pub(crate) fn snapshot_for_update(registry: &PackageInstallRegistry, access: &crate::persistent_update::UpdateSnapshotAccess<'_>)
+    -> Result<(ContentSnapshot, BTreeMap<String, Vec<u8>>)> {
+    snapshot_state(registry, None, Some(access))
+}
+pub(crate) fn snapshot_before_update(registry: &PackageInstallRegistry) -> Result<(ContentSnapshot, BTreeMap<String, Vec<u8>>)> {
+    snapshot_state(registry, None, None)
+}
+fn snapshot_state(registry: &PackageInstallRegistry, pending: Option<&[u8]>, update: Option<&crate::persistent_update::UpdateSnapshotAccess<'_>>)
+    -> Result<(ContentSnapshot, BTreeMap<String, Vec<u8>>)> {
     let root = registry.root_path();
     check_path(root)?;
     metadata(root, true)?;
+    registry.verify_persistent_lock_binding()?;
     if let Some(expected) = pending {
         ensure!(read_file(&root.join(PENDING_NAME), 4096)? == expected, "PERSISTENT_PENDING_CHANGED");
     } else { absent(&root.join(PENDING_NAME))?; }
-    absent(&root.join("update-journal-v1"))?;
+    let mut markers = Vec::new();
+    if let Some(expected) = pending { markers.push((PENDING_NAME, expected)); }
+    if let Some(access) = update { markers.extend(access.markers()); }
+    for (name,expected) in &markers {
+        ensure!(read_file(&root.join(name),16*1024)?==*expected,"PERSISTENT_PENDING_CHANGED");
+    }
+    for name in [crate::persistent_update::UPDATE_PENDING_NAME, crate::persistent_update::INNER_JOURNAL_NAME] {
+        if !markers.iter().any(|(allowed, _)| *allowed == name) { absent(&root.join(name))?; }
+    }
+    let before_shape = content_shape(root)?;
     let mut files = BTreeMap::new();
-    collect(root, root, &mut files, &mut 0, pending)?;
+    collect(root, root, &mut files, &mut 0, &markers)?;
     let required = |name: &str| -> Result<&Vec<u8>> { files.get(name).with_context(|| format!("PERSISTENT_REQUIRED {name}")) };
     // The receipt hashes these bytes; validate the same bytes rather than
     // accidentally combining a changed disk registry with cached records.
@@ -222,9 +261,17 @@ fn snapshot_inner(registry: &PackageInstallRegistry, pending: Option<&[u8]>) -> 
     if let Some(expected) = pending {
         ensure!(read_file(&root.join(PENDING_NAME), 4096)? == expected, "PERSISTENT_PENDING_CHANGED");
     }
-    Ok(ContentSnapshot { catalog_sha256: sha256(required(CATALOG_NAME)?), registry_sha256: sha256(required(REGISTRY_NAME)?),
+    let mut after_files = BTreeMap::new();
+    collect(root, root, &mut after_files, &mut 0, &markers)?;
+    for (name,expected) in &markers {
+        ensure!(read_file(&root.join(name),16*1024)?==*expected,"PERSISTENT_PENDING_CHANGED");
+    }
+    registry.verify_persistent_lock_binding()?;
+    ensure!(files == after_files && before_shape == content_shape(root)?, "PERSISTENT_CONTENT_CHANGED");
+    let content = ContentSnapshot { catalog_sha256: sha256(required(CATALOG_NAME)?), registry_sha256: sha256(required(REGISTRY_NAME)?),
         trust_sha256: sha256(required(TRUST_NAME)?), bootstrap_sha256: sha256(required(BOOTSTRAP_NAME)?), apps,
-        files: files.iter().map(|(path, bytes)| ContentFile { path: path.clone(), sha256: sha256(bytes) }).collect() })
+        files: files.iter().map(|(path, bytes)| ContentFile { path: path.clone(), sha256: sha256(bytes) }).collect() };
+    Ok((content, files))
 }
 
 pub fn open_existing(root: &Path) -> Result<OpenedInstall> {
@@ -233,7 +280,7 @@ pub fn open_existing(root: &Path) -> Result<OpenedInstall> {
     absent(&root.join(PENDING_NAME))?;
     // Opening an existing root must never create either lock or repair state.
     let mut files = BTreeMap::new();
-    collect(root, root, &mut files, &mut 0, None)?;
+    collect(root, root, &mut files, &mut 0, &[])?;
     for name in [CATALOG_NAME, BOOTSTRAP_NAME, REGISTRY_NAME, TRUST_NAME] {
         ensure!(files.contains_key(name), "PERSISTENT_REQUIRED {name}");
     }

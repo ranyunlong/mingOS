@@ -66,6 +66,17 @@ impl std::fmt::Debug for PublisherTrustStore {
 }
 
 impl PublisherTrustStore {
+    pub(crate) fn verify_persistent_lock_binding(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let held=self.lock.metadata()?;
+        let current=fs::symlink_metadata(self.root.join(LOCK_NAME))?;
+        for info in [&held,&current] {
+            if !info.is_file() || info.file_type().is_symlink() || info.nlink()!=1
+                || info.uid()!=unsafe {libc::geteuid()} || info.mode() & 0o7777 != 0o600 {bail!("PUBLISHER_LOCK_PERMISSIONS");}
+        }
+        if held.dev()!=current.dev() || held.ino()!=current.ino() {bail!("PUBLISHER_LOCK_CHANGED");}
+        Ok(())
+    }
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         verify_root(root)?;

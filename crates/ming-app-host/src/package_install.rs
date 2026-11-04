@@ -119,6 +119,20 @@ impl std::fmt::Debug for PackageInstallRegistry {
 }
 
 impl PackageInstallRegistry {
+    /// Strict snapshots must keep using the locks acquired by this registry,
+    /// rather than validating an unrelated replacement lock at the same path.
+    pub(crate) fn verify_persistent_lock_binding(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let held=self.lock.metadata()?;
+        let current=fs::symlink_metadata(self.root.join(LOCK_NAME))?;
+        for info in [&held,&current] {
+            if !info.is_file() || info.file_type().is_symlink() || info.nlink()!=1
+                || info.uid()!=unsafe {libc::geteuid()} || info.mode() & 0o7777 != 0o600 {bail!("INSTALL_ROOT_LOCK_PERMISSIONS");}
+        }
+        if held.dev()!=current.dev() || held.ino()!=current.ino() {bail!("INSTALL_ROOT_LOCK_CHANGED");}
+        self.publisher_trust.as_ref().context("INSTALL_PUBLISHER_REQUIRED")?.verify_persistent_lock_binding()?;
+        Ok(())
+    }
     pub(crate) fn root_path(&self) -> &Path { &self.root }
 
     pub(crate) fn active_records(&self) -> Result<BTreeMap<String, (String, [u8; 32])>> {

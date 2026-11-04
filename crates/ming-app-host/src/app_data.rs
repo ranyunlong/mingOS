@@ -325,6 +325,10 @@ fn load_persistent_policy(
         if store.size(1).is_ok() { return Err(AppDataError::Io); }
         return Ok(BTreeMap::new());
     }
+    parse_persistent_policy_bytes(&bytes, legacy_header, bound_header)
+}
+#[cfg(target_os = "linux")]
+fn parse_persistent_policy_bytes(bytes: &[u8], legacy_header: &str, bound_header: &str) -> Result<BTreeMap<String, PackageAuthorization>> {
     let text = std::str::from_utf8(&bytes).map_err(|_| AppDataError::Io)?;
     let (lines, v2) = if let Some(lines) = text.strip_prefix(bound_header) {
         (lines, true)
@@ -397,6 +401,35 @@ impl PackageStorageAuthority {
         let _authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
         let _private = self.private.lock().map_err(|_| AppDataError::Denied)?;
         platform::observe_update_checked(&self.root.root, package_id, || {})
+    }
+    /// Bind the trusted explicit path to this authority's pinned root and held
+    /// policy locks. An absent slot is distinct from every existing byte string.
+    /// Reading never acquires another flock or creates a missing policy object.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observe_update_authority(&self, path: &Path) -> Result<(String, Option<(u64, String)>)> {
+        use sha2::{Digest, Sha256};
+        let _authorized=self.public_authorized.lock().map_err(|_| AppDataError::Denied)?;
+        let private=self._private_only_lock.as_ref().or(self.policy.as_ref()).ok_or(AppDataError::Denied)?;
+        let public=self.public_policy.as_ref().ok_or(AppDataError::Denied)?;
+        let root_before=platform::stamp_root(&self.root.root)?;
+        if root_before != platform::stamp_root(&platform::Root::open(path)?)? { return Err(AppDataError::Io); }
+        let private_before=private.store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.policy_binding(&private._lock)?;
+        let public_before=public.store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.policy_binding(&public._lock)?;
+        let bytes=public.store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.update_policy_slot()?;
+        if let Some(bytes)=&bytes { parse_persistent_policy_bytes(bytes, PUBLIC_POLICY_HEADER, PUBLIC_POLICY_HEADER_V2)?; }
+        if bytes != public.store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.update_policy_slot()? { return Err(AppDataError::Io); }
+        private.store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.verify_policy_binding(
+            &self.root.root,"system-private-storage-policy-v1",&private._lock,&private_before)?;
+        public.store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.verify_policy_binding(
+            &self.root.root,"system-public-storage-policy-v1",&public._lock,&public_before)?;
+        if root_before != platform::stamp_root(&self.root.root)? || root_before != platform::stamp_root(&platform::Root::open(path)?)? { return Err(AppDataError::Io); }
+        let mut hash=Sha256::new(); hash.update(b"ming-update-data-root-binding-v1\0");
+        use std::os::unix::ffi::OsStrExt;
+        let path_bytes=path.as_os_str().as_bytes(); hash.update((path_bytes.len() as u64).to_be_bytes()); hash.update(path_bytes);
+        for stamp in [&root_before,&private_before.0,&private_before.1,&public_before.0,&public_before.1] {
+            hash.update(stamp.identity_bytes());
+        }
+        Ok((format!("{:x}",hash.finalize()),bytes.map(|value|(value.len() as u64,format!("{:x}",Sha256::digest(value))))))
     }
     #[cfg(target_os = "linux")]
     fn with_coordinated_target<T>(&self, context: &CoordinatedPrivateUpdate, operation: impl FnOnce(&platform::Root) -> Result<T>) -> Result<T> {
@@ -1541,6 +1574,10 @@ mod platform {
         pub fn length(&self) -> u64 {
             self.size
         }
+        pub fn identity_bytes(&self) -> Vec<u8> {
+            [self.dev.to_be_bytes().as_slice(),self.ino.to_be_bytes().as_slice(),
+                self.mode.to_be_bytes().as_slice(),self.uid.to_be_bytes().as_slice()].concat()
+        }
     }
     fn cstring(value: &std::ffi::OsStr) -> Result<CString> {
         CString::new(value.as_bytes()).map_err(|_| AppDataError::InvalidArgument)
@@ -2389,6 +2426,23 @@ mod platform {
         }
         pub fn policy_binding(&self, lock: &File) -> Result<(Stamp, Stamp)> {
             Ok((update_directory_stamp(&self.0)?, stamp(lock)?))
+        }
+        pub fn update_policy_slot(&self) -> Result<Option<Vec<u8>>> {
+            let before=update_directory_stamp(&self.0)?;
+            let mut file=match self.read_file("slot-1") {
+                Ok(file)=>file, Err(AppDataError::NotFound)=> {
+                    if before != update_directory_stamp(&self.0)? { return Err(AppDataError::Io); }
+                    return Ok(None);
+                }, Err(error)=>return Err(error),
+            };
+            let slot=stamp(&file)?;
+            if file.metadata().map_err(io_error)?.mode() & 0o7777 != 0o600 { return Err(AppDataError::Io); }
+            let mut bytes=vec![0;slot.length() as usize]; file.read_exact(&mut bytes).map_err(io_error)?;
+            file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+            let mut again=vec![0;bytes.len()]; file.read_exact(&mut again).map_err(io_error)?;
+            self.unchanged("slot-1",&file,&slot)?;
+            if bytes != again || before != update_directory_stamp(&self.0)? { return Err(AppDataError::Io); }
+            Ok(Some(bytes))
         }
         pub fn verify_policy_binding(&self, root: &Root, name: &str, lock: &File, before: &(Stamp, Stamp)) -> Result<()> {
             let reopened = Self::open_existing(root, name)?;
