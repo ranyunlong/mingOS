@@ -34,7 +34,8 @@ def main():
             frozen_inputs[number], _ = validate_reviewed_input(review, source, boot_number=number)
             pointer = manifest.get("diagnosticProfile") == "input-pointer-ready-v1"
             InputPlan(reviewed_input_spec(review, frozen_inputs[number]), args.output / ("boot-%d.inputs.jsonl" % number),
-                      args.timeout, split_transactions=pointer, pointer_handshake=pointer)
+                      args.timeout, split_transactions=pointer, pointer_handshake=pointer,
+                      persistent_update_gate=review.get("profile") == "persistent-update")
     else:
         if args.boot1_input_script is not None or args.boot2_input_script is not None:
             raise ValueError("per-boot input scripts are reserved for persistent install")

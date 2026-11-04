@@ -6,11 +6,12 @@ import hashlib
 import json
 import base64
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
-from bootlib import PERSISTENT_PAYLOAD_PROFILES, Qmp, qemu_command, reviewed_input_spec, sha256, strict_json, validate_bundle, validate_reviewed_input
-from infra import InputPlan, STATE_PATH, classify_guest, state_ready, validate_fault_injection, validate_fault_receipt, validate_state
+from bootlib import PERSISTENT_UPDATE_PROFILE, persistent_update_session_contract, PERSISTENT_PAYLOAD_PROFILES, Qmp, qemu_command, reviewed_input_spec, sha256, strict_json, validate_bundle, validate_reviewed_input
+from infra import InputPlan, STATE_PATH, classify_guest, integer, state_ready, validate_fault_injection, validate_fault_receipt, validate_persistent_update, validate_state
 
 
 def fault_result(fault_config, receipt, failure_state=None):
@@ -43,6 +44,39 @@ class GuestStream:
         self.pointer_receipt = None
         self.fault_receipt = None
         self.fault_failure_state = None
+        self.persistent_receipt_end = 0
+
+    def bind_persistent_trial(self, event):
+        """Consume the trusted guest parser relay, preserving its native identity."""
+        if not self.plan or not self.plan.persistent_update_gate: return
+        record = event.get('record')
+        start, end = event.get('logStartOffset'), event.get('logEndOffset')
+        if (not isinstance(record, dict) or not integer(start, self.persistent_receipt_end)
+            or not integer(end, start + 1) or end - start > 262145
+            or event.get('bootId') != self.boot_id or not self.boot_id
+            or event.get('desktopPid') != self.desktop_pid or not integer(self.desktop_pid, 2)
+            or not isinstance(event.get('sessionId'), str) or not event['sessionId']
+            or self.state and event['sessionId'] != self.state['sessionId']
+            or any(record.get(key) != event.get(key) for key in ('bootId', 'sessionId', 'desktopPid'))):
+            raise ValueError('persistent update relay identity/offset mismatch')
+        self.persistent_receipt_end = end
+        if record.get('kind') != 'trial-published': return
+        receipt = record.get('receipt') or {}
+        anchor = (receipt.get('anchor') or {}).get('state')
+        validate_state(anchor, self.boot_id, event['sessionId'])
+        update = validate_persistent_update(anchor.get('persistentUpdate'))
+        transaction = receipt.get('record') or {}
+        observation = receipt.get('trialObservation') or {}
+        target = transaction.get('new') or {}
+        if (update['status'] != 'trial' or update['transactionId'] != transaction.get('transactionId')
+            or update['app'] != transaction.get('app') or update['packageId'] != target.get('packageId')
+            or update['newVersion'] != target.get('version')
+            or type(observation.get('schemaVersion')) is not int or observation['schemaVersion'] != 1
+            or observation.get('transactionId') != update['transactionId'] or observation.get('innerPhase') != 'recordPublished'
+            or any(not isinstance(observation.get(key), str) or re.fullmatch('[0-9a-f]{64}', observation[key]) is None
+                   for key in ('outerRecordSha256', 'innerJournalSha256'))):
+            raise ValueError('persistent update trial transaction/observation mismatch')
+        self.plan.bind_persistent_update_trial(update, self.boot_id, event['sessionId'], self.desktop_pid, start, end)
 
     def pointer_context(self):
         return {"desktopPid": self.desktop_pid, "logOffset": max(self.desktop_log_offset, self.desktop_capture_offset), "receipt": self.pointer_receipt}
@@ -80,6 +114,9 @@ class GuestStream:
                     raise ValueError("pointer receipt identity mismatch")
                 self.pointer_receipt = dict(event["receipt"], bootId=event["bootId"], sessionId=event["sessionId"], desktopPid=event["desktopPid"])
                 self.advance_plan(self.state, qmp)
+            elif kind == 'desktop-persistent-receipt':
+                self.bind_persistent_trial(event)
+                if self.state: self.advance_plan(self.state, qmp)
             elif kind == "fault-injection":
                 if self.fault_config is None or self.fault_receipt is not None:
                     raise ValueError("unexpected fault receipt")
@@ -181,7 +218,13 @@ def main():
     else:
         lease_context = contextlib.nullcontext()
     args.output.mkdir(parents=True, exist_ok=False)
-    plan = InputPlan(input_spec, args.output / "inputs.jsonl", args.timeout, split_transactions=args.diagnostic_split_input, pointer_handshake=args.diagnostic_pointer_handshake) if input_bytes is not None else None
+    update_gate = bool(review and review.get("profile") == "persistent-update")
+    if update_gate:
+        persistent_update_session_contract(review)
+        if review.get("instrumentedProfile") != PERSISTENT_UPDATE_PROFILE:
+            raise ValueError("persistent update requires its independent qualification")
+    plan = InputPlan(input_spec, args.output / "inputs.jsonl", args.timeout, split_transactions=args.diagnostic_split_input,
+                     pointer_handshake=args.diagnostic_pointer_handshake, persistent_update_gate=update_gate) if input_bytes is not None else None
     with lease_context:
         if disk:
             disk = load_disk(args.work_root, args.data_manifest)

@@ -2,11 +2,13 @@
 import re
 PERSISTENT_INSTALL_PREFIX = b'MING_PERSISTENT_INSTALL '
 PERSISTENT_UNINSTALL_PREFIX = b'MING_PERSISTENT_UNINSTALL '
+PERSISTENT_UPDATE_PREFIX = b'MING_PERSISTENT_UPDATE '
 
 def check_line_size(raw):
-    persistent = raw.startswith((PERSISTENT_INSTALL_PREFIX, PERSISTENT_UNINSTALL_PREFIX))
+    persistent = raw.startswith((PERSISTENT_INSTALL_PREFIX, PERSISTENT_UNINSTALL_PREFIX, PERSISTENT_UPDATE_PREFIX))
     if len(raw) > (262144 if persistent else 65536):
-        label = 'persistent uninstall receipt' if raw.startswith(PERSISTENT_UNINSTALL_PREFIX) else 'persistent install receipt'
+        label = ('persistent update receipt' if raw.startswith(PERSISTENT_UPDATE_PREFIX) else
+                 'persistent uninstall receipt' if raw.startswith(PERSISTENT_UNINSTALL_PREFIX) else 'persistent install receipt')
         raise ValueError(label + ' line limit' if persistent else 'Wayland diagnostic line limit')
     return persistent
 

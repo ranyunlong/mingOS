@@ -63,6 +63,18 @@ def regular_file(path):
 def integer(value, low=0, high=2**64-1):
     return type(value) is int and low <= value <= high
 
+def validate_persistent_update(value, *, expectation=False):
+    if (not isinstance(value, dict) or set(value) != {"transactionId", "app", "packageId", "newVersion", "status"}
+        or not isinstance(value.get("transactionId"), str)
+        or (not (expectation and value["transactionId"] == "$trial")
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,96}", value["transactionId"]) is None)
+        or not integer(value.get("app"), 1, 65535)
+        or not isinstance(value.get("packageId"), str) or not 1 <= len(value["packageId"]) <= 256
+        or not isinstance(value.get("newVersion"), str) or not 1 <= len(value["newVersion"]) <= 160
+        or value.get("status") not in ("trial", "committed", "blocked", "rolled-back", "uncertain", "commit-decided")):
+        raise ValueError("invalid persistent update state")
+    return value
+
 def validate_state(state, boot_id, session_id=None, revision=None):
     if not isinstance(state, dict) or state.get("schemaVersion") != 1:
         raise ValueError("state schemaVersion")
@@ -115,6 +127,8 @@ def validate_state(state, boot_id, session_id=None, revision=None):
             raise ValueError("state inputReady")
     if state.get("error") is not None and (not isinstance(state["error"], str) or len(state["error"]) > 2048):
         raise ValueError("state error bound")
+    if "persistentUpdate" in state:
+        validate_persistent_update(state["persistentUpdate"])
     return state
 
 def state_ready(state, required):
@@ -216,13 +230,16 @@ def append_record(path, record):
         os.fsync(output.fileno())
 
 class InputPlan:
-    def __init__(self, spec, output, timeout, split_transactions=False, pointer_handshake=False):
+    def __init__(self, spec, output, timeout, split_transactions=False, pointer_handshake=False, persistent_update_gate=False):
+        if type(persistent_update_gate) is not bool:
+            raise ValueError("persistent update gate must be boolean")
         if spec.get("schemaVersion") != 1 or not isinstance(spec.get("steps"), list) or not 1 <= len(spec["steps"]) <= 64:
             raise ValueError("input script schema/steps")
         required = spec.get("requireApps")
         if not isinstance(required, list) or any(not integer(x, 1, 65535) for x in required) or len(set(required)) != len(required):
             raise ValueError("input requireApps")
         self.spec, self.output = spec, output
+        self.persistent_update_gate, self.persistent_update_trial = persistent_update_gate, None
         self.index, self.base, self.waiting = 0, None, False
         self.held = {}
         self.split_transactions, self.routing_recorded = split_transactions, False
@@ -238,8 +255,18 @@ class InputPlan:
             if not isinstance(apps, list) or any(not integer(x, 1, 65535) for x in apps):
                 raise ValueError("step requireApps")
             expect = step.get("expect", {})
-            if not isinstance(expect, dict) or set(expect) - {"phase", "rootAdvance", "sourceAdvance", "apps", "storagePrompt", "storagePromptPresented"}:
+            allowed = {"phase", "rootAdvance", "sourceAdvance", "apps", "storagePrompt", "storagePromptPresented"}
+            if persistent_update_gate: allowed.add("persistentUpdate")
+            if not isinstance(expect, dict) or set(expect) - allowed:
                 raise ValueError("input expectation")
+            if "persistentUpdate" in expect:
+                update = validate_persistent_update(expect["persistentUpdate"], expectation=True)
+                if (update["status"] != "committed" or update["transactionId"] != "$trial"
+                    or update["app"] != 2 or update["packageId"] != "dev.ming.persistent-update-demo"
+                    or update["newVersion"] != "0.2.0"
+                    or not isinstance(expect.get("apps"), list)
+                    or {"app": 2, "generation": 1, "state": "closed"} not in expect["apps"]):
+                    raise ValueError("persistent update requires committed trial and closed app2")
             if "phase" in expect and expect["phase"] not in ("ready", "stopping", "stopped", "failed"):
                 raise ValueError("input expected phase")
             if "rootAdvance" in expect and type(expect["rootAdvance"]) is not bool:
@@ -268,6 +295,17 @@ class InputPlan:
                         or condition.get("state") not in ("starting", "running", "ready", "closing", "minimized", "closed", "failed")):
                         raise ValueError("input app expectation fields")
                     seen.add(condition["app"])
+
+    def bind_persistent_update_trial(self, update, boot_id, session_id, desktop_pid, start, end):
+        validate_persistent_update(update)
+        if (not self.persistent_update_gate or self.persistent_update_trial is not None
+            or update["status"] != "trial" or update["app"] != 2
+            or update["packageId"] != "dev.ming.persistent-update-demo" or update["newVersion"] != "0.2.0"
+            or not isinstance(boot_id, str) or not boot_id or not isinstance(session_id, str) or not session_id
+            or not integer(desktop_pid, 2) or not integer(start) or not integer(end, start + 1)):
+            raise ValueError("invalid persistent update trial binding")
+        self.persistent_update_trial = dict(update=update.copy(), bootId=boot_id, sessionId=session_id,
+                                            desktopPid=desktop_pid, logStartOffset=start, logEndOffset=end)
 
     @property
     def complete(self):
@@ -327,6 +365,12 @@ class InputPlan:
                    or now[condition["app"]]["state"] != condition["state"]
                    for condition in expected.get("apps", [])):
                 return
+            if "persistentUpdate" in expected:
+                trial = self.persistent_update_trial
+                if trial is None or state["bootId"] != trial["bootId"] or state["sessionId"] != trial["sessionId"]:
+                    return
+                committed = dict(expected["persistentUpdate"], transactionId=trial["update"]["transactionId"])
+                if state.get("persistentUpdate") != committed: return
             append_record(self.output, {"type": "input-expectation", "step": step["name"], "state": state})
             self.index += 1; self.waiting = False
             return

@@ -10,10 +10,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from bootlib import PERSISTENT_INSTALL_PROFILE, PERSISTENT_UNINSTALL_PROFILE, PERSISTENT_PAYLOAD_PROFILES, checked_path, checked_session, sha256, strict_json, validate_kernel_config
+from bootlib import PERSISTENT_INSTALL_PROFILE, PERSISTENT_UNINSTALL_PROFILE, PERSISTENT_UPDATE_PROFILE, PERSISTENT_PAYLOAD_PROFILES, checked_path, checked_session, sha256, strict_json, validate_kernel_config
 from infra import validate_fault_injection
 from isolation_profiles import verify_review_and_files
-from payload_profiles import verify_data_text, verify_data_text_update, verify_install_lifecycle, verify_persistent_install, verify_persistent_uninstall, verify_data_text_private_probe, verify_data_text_public_probe, verify_public_probe
+from payload_profiles import verify_data_text, verify_data_text_update, verify_install_lifecycle, verify_persistent_install, verify_persistent_uninstall, verify_persistent_update, verify_data_text_private_probe, verify_data_text_public_probe, verify_public_probe
 from wayland_receipt import POINTER_SYNC_POLICY
 
 MODULES = ("virtio_pci", "virtio_gpu", "virtio_input", "virtio_console", "virtio_rng", "evdev", "virtio_blk", "ext4")
@@ -40,7 +40,7 @@ def install_fault_injection(root, scripts, fault_config):
 def verify_payload(payload, review):
     checked_session(review, payload)
     profile = review.get("profile", "desktop")
-    if profile not in ("desktop", "data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "data-text-private-probe", "data-text-public-probe", "public-probe"):
+    if profile not in ("desktop", "data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "persistent-update", "data-text-private-probe", "data-text-public-probe", "public-probe"):
         raise ValueError("unknown reviewed payload profile")
     if any(item.is_symlink() for item in payload.rglob("*")):
         raise ValueError("frozen payload must contain no symlinks")
@@ -58,6 +58,8 @@ def verify_payload(payload, review):
         return verify_install_lifecycle(payload, review, catalog)
     if profile == "persistent-install":
         return verify_persistent_install(payload, review, catalog)
+    if profile == "persistent-update":
+        return verify_persistent_update(payload, review, catalog)
     if profile == "persistent-uninstall":
         return verify_persistent_uninstall(payload, review, catalog)
     if profile == "data-text-private-probe":
@@ -92,6 +94,7 @@ def copy_guest_scripts(root, scripts, profile):
     names = ("init", "bootlib.py", "guest.py", "guest_platform.py", "infra.py", "bounded_log.py",
              "wayland_receipt.py", "worker_resources.py", "weston.ini")
     if profile == "persistent-uninstall": names += ("persistent_uninstall_receipt.py",)
+    if profile == "persistent-update": names += ("persistent_update_receipt.py",)
     hashes = {}
     for name in names:
         raw = (scripts / name).read_bytes()
@@ -182,14 +185,15 @@ def main():
     if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES: review = strict_json(raw_review)
     fault_config = fault_config_from_review(review)
     catalog = verify_payload(args.payload, review)  # before any large filesystem write
-    if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "data-text-private-probe", "data-text-public-probe", "public-probe") or not args.isolation_probes):
+    if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "persistent-update", "data-text-private-probe", "data-text-public-probe", "public-probe") or not args.isolation_probes):
         raise ValueError("input diagnostics requires reviewed data-text with strict probes")
     if args.wayland_client_diagnostics and not args.input_diagnostics:
         raise ValueError("Wayland client logging requires diagnostic-only input bundle")
     if args.pointer_handshake_diagnostics and not args.wayland_client_diagnostics:
         raise ValueError("pointer handshake requires instrumented Wayland client receipts")
     qualification = review.get("instrumentedQualification") is True
-    qualification_profile = (PERSISTENT_UNINSTALL_PROFILE if review.get("profile") == "persistent-uninstall"
+    qualification_profile = (PERSISTENT_UPDATE_PROFILE if review.get("profile") == "persistent-update"
+                             else PERSISTENT_UNINSTALL_PROFILE if review.get("profile") == "persistent-uninstall"
                              else PERSISTENT_INSTALL_PROFILE if review.get("profile") == "persistent-install"
                              else "install-lifecycle-pointer-ready-v1" if review.get("profile") == "install-lifecycle"
                              else "data-text-pointer-ready-v1")

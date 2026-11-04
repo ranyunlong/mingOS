@@ -48,6 +48,41 @@ class ProfileTests(unittest.TestCase):
                   'hostSha256': sha256(root / 'ming-app-host'), 'catalogSha256': sha256(root / 'catalog.json')}
         return catalog, review
 
+    def update_fixture(self, root):
+        from bootlib import PERSISTENT_UPDATE_ARGS, PERSISTENT_UPDATE_FIXTURE, PERSISTENT_UPDATE_PROFILE
+        catalog, review = self.persistent_fixture(root)
+        (root / 'prepare-persistent-install-fixture').rename(root / 'prepare-persistent-update-fixture')
+        (root / 'packages/initial').rename(root / 'packages/bootstrap')
+        (root / 'packages/old').mkdir()
+        (root / 'packages/old/main.wasm').write_bytes(b'\0asm\x01\0\0\0old')
+        review.pop('persistentInstallFixture'); review.pop('persistentInstallFixtureSha256')
+        review.update(profile='persistent-update', extraArgs=PERSISTENT_UPDATE_ARGS.copy(),
+                      instrumentedProfile=PERSISTENT_UPDATE_PROFILE,
+                      persistentUpdateFixture=PERSISTENT_UPDATE_FIXTURE.copy(),
+                      persistentUpdateFixtureSha256={key: sha256(root / PERSISTENT_UPDATE_FIXTURE[key].removeprefix('/opt/mingos/'))
+                          for key in ('helper', 'bootstrapWasm', 'oldWasm', 'newWasm')})
+        return catalog, review
+
+    def test_persistent_update_freezes_three_modules_helper_and_own_qualification(self):
+        from bootlib import qemu_command
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work); catalog, review = self.update_fixture(root)
+            self.assertEqual(verify_payload(root, review), catalog)
+            command = qemu_command(root, root, data_disk={'imagePath':'disk', 'serial':'disk', 'uuid':'uuid'},
+                                   boot_number=2, persistent_profile='persistent-update')
+            self.assertIn('mingos.persistent_update_boot=2 mingos.persistent_update_role=open-existing', command[-1])
+            self.assertNotIn('mingos.persistent_install_boot', command[-1])
+            for key in ('helper', 'bootstrapWasm', 'oldWasm', 'newWasm'):
+                file = root / review['persistentUpdateFixture'][key].removeprefix('/opt/mingos/')
+                raw = file.read_bytes(); file.write_bytes(raw + b'drift')
+                with self.subTest(key=key), self.assertRaises(ValueError): verify_payload(root, review)
+                file.write_bytes(raw)
+            for change in ({'persistentInstallFixture': {}}, {'persistentUninstallFixture': {}},
+                           {'updateFixture': {}}, {'inputScriptSha256':'1'*64},
+                           {'instrumentedProfile':'persistent-install-pointer-ready-v1'}):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    verify_payload(root, dict(review, **change))
+
     def uninstall_fixture(self, root):
         catalog, review = self.persistent_fixture(root)
         (root / 'prepare-persistent-install-fixture').rename(root / 'prepare-persistent-uninstall-fixture')

@@ -1,0 +1,7 @@
+
+running 1 test
+test desktop_native::input_tests::persistent_update_two_app_input_geometry ... MING_PERSISTENT_UPDATE_GEOMETRY {"app2Dock":{"count":2,"index":1,"point":[676,766],"rect":{"height":64,"width":64,"x":644,"y":736}},"app2Window":{"closePoint":[96,104],"outer":{"height":480,"width":720,"x":80,"y":88}},"boot1Points":[[1148,12],[880,478],[676,766],[96,104],[1238,12]],"boot2Points":[[676,766],[1238,12]],"height":800,"install":{"point":[1148,12],"rect":{"height":24,"width":96,"x":1100,"y":0}},"power":{"point":[1238,12],"rect":{"height":24,"width":84,"x":1196,"y":0}},"schemaVersion":1,"updateAllow":{"point":[880,478],"rect":{"height":28,"width":80,"x":840,"y":464}},"width":1280}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 464 filtered out; finished in 0.01s
+

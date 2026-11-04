@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "requireApps": [
+    1
+  ],
+  "steps": [
+    {
+      "name": "native-install",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 1148,
+          "y": 12
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "storagePrompt": {
+          "mode": 17,
+          "packageId": "dev.ming.persistent-update-demo",
+          "version": "0.2.0",
+          "hasAllow": true
+        },
+        "rootAdvance": true,
+        "storagePromptPresented": true
+      }
+    },
+    {
+      "name": "confirm-update",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 880,
+          "y": 478
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "storagePrompt": null,
+        "rootAdvance": true
+      }
+    },
+    {
+      "name": "dock-launch-app2",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 676,
+          "y": 766
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "apps": [
+          {
+            "app": 2,
+            "generation": 1,
+            "state": "running"
+          }
+        ]
+      }
+    },
+    {
+      "name": "close-app2-after-ready",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 96,
+          "y": 104
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "apps": [
+          {
+            "app": 2,
+            "generation": 1,
+            "state": "closed"
+          }
+        ],
+        "persistentUpdate": {
+          "transactionId": "$trial",
+          "app": 2,
+          "packageId": "dev.ming.persistent-update-demo",
+          "newVersion": "0.2.0",
+          "status": "committed"
+        }
+      },
+      "requireApps": [
+        1,
+        2
+      ]
+    },
+    {
+      "name": "power-off-after-commit",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 1238,
+          "y": 12
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "phase": "stopped"
+      }
+    }
+  ]
+}

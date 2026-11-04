@@ -373,6 +373,65 @@ class InfraTests(unittest.TestCase):
                 "apps": [{"app": 1, "generation": 1, "workerPid": 20, "state": "ready",
                           "sourceSequence": 5, "presentedSourceSequence": 5, "inputReady": True}], "error": None}
 
+    def test_persistent_update_state_rejects_incomplete_and_malformed_objects(self):
+        update = {'transactionId':'update-1', 'app':2, 'packageId':'dev.ming.persistent-update-demo',
+                  'newVersion':'0.2.0', 'status':'committed'}
+        validate_state(dict(self.state(), persistentUpdate=update), 'boot-1')
+        for key in update:
+            bad = update.copy(); bad.pop(key)
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                validate_state(dict(self.state(), persistentUpdate=bad), 'boot-1')
+        for key, value in [('app',True), ('transactionId','../bad'), ('status','done'),
+                           ('packageId',''), ('newVersion',''), ('extra',1)]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                validate_state(dict(self.state(), persistentUpdate=dict(update, **{key:value})), 'boot-1')
+
+    def test_update_close_gate_requires_bound_trial_identity_and_committed_state(self):
+        update = {'transactionId':'update-1', 'app':2, 'packageId':'dev.ming.persistent-update-demo',
+                  'newVersion':'0.2.0', 'status':'committed'}
+        expect = dict(update, transactionId='$trial')
+        spec = {'schemaVersion':1, 'requireApps':[1], 'steps':[{'name':'close',
+            'events':[{'kind':'key','qcode':'esc','down':True}],
+            'expect':{'apps':[{'app':2,'generation':1,'state':'closed'}], 'persistentUpdate':expect}}]}
+        with tempfile.TemporaryDirectory() as work:
+            output=Path(work)/'inputs.jsonl'
+            with self.assertRaises(ValueError): InputPlan(spec, output, 30)
+            plan=InputPlan(spec, output, 30, persistent_update_gate=True)
+            qmp=mock.Mock(); before=self.state()
+            before['apps'].append({'app':2,'generation':1,'state':'ready'})
+            plan.advance(before,qmp)
+            after=copy.deepcopy(before); after['revision']+=1; after['apps'][-1]['state']='closed'
+            after['persistentUpdate']=update
+            plan.advance(after,qmp); self.assertFalse(plan.complete)
+            plan.bind_persistent_update_trial(dict(update, status='trial'), 'boot-1', 'session-1', 42, 10, 20)
+            for key,value in [('status','trial'),('status','blocked'),('transactionId','other'),('newVersion','0.1.0')]:
+                bad=copy.deepcopy(after); bad['persistentUpdate'][key]=value
+                plan.advance(bad,qmp); self.assertFalse(plan.complete)
+            plan.advance(after,qmp); self.assertTrue(plan.complete)
+
+    def test_guest_stream_binds_trial_only_from_current_validated_native_relay(self):
+        from vm import GuestStream
+        update={'transactionId':'update-1','app':2,'packageId':'dev.ming.persistent-update-demo','newVersion':'0.2.0','status':'trial'}
+        state=dict(self.state(),persistentUpdate=update)
+        native={'kind':'trial-published','bootId':'boot-1','sessionId':'session-1','desktopPid':42,
+                'receipt':{'record':{'transactionId':'update-1','app':2,'new':{'packageId':update['packageId'],'version':'0.2.0'}},
+                           'anchor':{'state':state},'trialObservation':{'schemaVersion':1,'transactionId':'update-1',
+                           'outerRecordSha256':'a'*64,'innerJournalSha256':'b'*64,'innerPhase':'recordPublished'}}}
+        relay={'type':'desktop-persistent-receipt','bootId':'boot-1','sessionId':'session-1','desktopPid':42,
+               'logStartOffset':10,'logEndOffset':20,'record':native}
+        with tempfile.TemporaryDirectory() as work:
+            root=Path(work)
+            for key,value in [('bootId','old'),('desktopPid',41),('logEndOffset',10),('sessionId','wrong')]:
+                plan=mock.Mock(persistent_update_gate=True)
+                stream=GuestStream(root/'bad',plan);stream.boot_id='boot-1';stream.desktop_pid=42;stream.state=self.state()
+                with self.subTest(key=key),self.assertRaises(ValueError):
+                    stream.bind_persistent_trial(dict(relay,**{key:value}))
+                plan.bind_persistent_update_trial.assert_not_called()
+            plan=mock.Mock(persistent_update_gate=True)
+            stream=GuestStream(root/'good',plan);stream.boot_id='boot-1';stream.desktop_pid=42;stream.state=self.state()
+            stream.bind_persistent_trial(relay)
+            plan.bind_persistent_update_trial.assert_called_once_with(update,'boot-1','session-1',42,10,20)
+
     def test_state_binds_boot_session_revision(self):
         s = self.state()
         validate_state(s, "boot-1", "session-1", 2)

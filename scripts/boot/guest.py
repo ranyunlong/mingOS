@@ -10,7 +10,7 @@ import subprocess
 import time
 import traceback
 from pathlib import Path, PurePosixPath
-from bootlib import PERSISTENT_INSTALL_CATALOG, PERSISTENT_INSTALL_ROOT, persistent_boot_role, persistent_session_contract, strict_json
+from bootlib import PERSISTENT_INSTALL_CATALOG, PERSISTENT_INSTALL_ROOT, PERSISTENT_UPDATE_ROOT, PERSISTENT_UPDATE_CATALOG, persistent_boot_role, persistent_session_contract, persistent_update_boot_role, persistent_update_session_contract, strict_json
 from infra import STATE_PATH, integer, state_ready, validate_fault_injection, validate_state
 from guest_platform import Platform
 from bounded_log import BoundedLog, LogLimitExceeded
@@ -160,15 +160,19 @@ class PersistentDesktopReceipts:
                 or self.launches.get(self.app2_down, (None,))[0] != 'ready'):
             raise ValueError('missing/out-of-role persistent native/install evidence')
 
-def persistent_context(session, platform, command_line, *, uninstall=False):
+def persistent_context(session, platform, command_line, *, uninstall=False, update=False):
     contract, boot_role, prefix = persistent_session_contract, persistent_boot_role, 'persistent_install'
     if uninstall:
         from bootlib import persistent_uninstall_boot_role, persistent_uninstall_session_contract
         contract, boot_role, prefix = persistent_uninstall_session_contract, persistent_uninstall_boot_role, 'persistent_uninstall'
+    if update:
+        contract, boot_role, prefix = persistent_update_session_contract, persistent_update_boot_role, 'persistent_update'
     contract(session)
     params = {}
     for part in command_line.split():
         key, _, value = part.partition("=")
+        if update and key.startswith(('mingos.persistent_install_', 'mingos.persistent_uninstall_')):
+            raise ValueError('foreign persistent boot parameter in update profile')
         if uninstall and key in ('mingos.persistent_install_boot', 'mingos.persistent_install_role'):
             raise ValueError('old persistent install boot parameter in uninstall profile')
         if key in (f"mingos.{prefix}_boot", f"mingos.{prefix}_role"):
@@ -192,9 +196,46 @@ def persistent_context(session, platform, command_line, *, uninstall=False):
           or type(previous["counter"]) is not int or previous["counter"] != 1
           or not isinstance(previous["bootId"], str) or not previous["bootId"] or previous["bootId"] == platform.boot_id):
         raise ValueError("persistent second boot requires distinct previous marker1")
-    return {"schemaVersion": 1, "bootId": platform.boot_id, "bootNumber": number, "role": role,
+    context = {"schemaVersion": 1, "bootId": platform.boot_id, "bootNumber": number, "role": role,
             "marker": marker, "previousMarker": previous, "diskUuid": platform.disk_uuid,
             "registryRoot": PERSISTENT_INSTALL_ROOT, "catalogPath": PERSISTENT_INSTALL_CATALOG}
+    if update:
+        context.update(registryRoot=PERSISTENT_UPDATE_ROOT, catalogPath=PERSISTENT_UPDATE_CATALOG, dataRoot='/data/mingos')
+    return context
+
+def persistent_update_context(session, platform, command_line):
+    return persistent_context(session, platform, command_line, update=True)
+
+def persistent_update_helper_argv(session, context, phase):
+    persistent_update_session_contract(session)
+    if phase not in ('pre-desktop', 'post-desktop') or context.get('role') != persistent_update_boot_role(context.get('bootNumber')):
+        raise ValueError('invalid persistent update snapshot phase/role')
+    fixture = session['persistentUpdateFixture']
+    argv = [fixture['helper'], 'open-existing', fixture['installRoot'], fixture['dataRoot']]
+    if context['bootNumber'] == 1 and phase == 'pre-desktop':
+        argv[1] = 'initialize-first'
+        argv += [fixture['bootstrapWasm'], fixture['oldWasm'], fixture['newWasm'], fixture['sourceManifest'],
+                 '/opt/mingos/catalog.json', session['catalogSha256'], 'seed']
+    return argv + [fixture['receipt']]
+
+def persistent_update_expected_private(initial, non_files_sha256):
+    entries = [] if initial else [{'path': 'state', 'type': 'directory', 'length': 0, 'sha256': None}]
+    entries.append({'path': 'note.txt' if initial else 'state/note.txt', 'type': 'file', 'length': 5,
+                    'sha256': hashlib.sha256(b'alpha').hexdigest()})
+    raw = json.dumps(entries, ensure_ascii=False, separators=(',', ':')).encode()
+    return {'schemaVersion': 1, 'packageId': 'dev.ming.persistent-update-demo', 'namespaceExists': True,
+            'files': {'entries': len(entries), 'bytes': 5,
+                      'sha256': hashlib.sha256(b'ming-private-update-tree-v1\0' + raw).hexdigest()},
+            'nonFilesSha256': non_files_sha256}
+
+def persistent_update_private(value, initial):
+    if (not isinstance(value, dict) or not isinstance(value.get('nonFilesSha256'), str)
+        or re.fullmatch('[0-9a-f]{64}', value['nonFilesSha256']) is None
+        or value != persistent_update_expected_private(initial, value['nonFilesSha256'])
+        or type(value['schemaVersion']) is not int or type(value['namespaceExists']) is not bool
+        or any(type(value['files'][key]) is not int for key in ('entries', 'bytes'))):
+        raise ValueError('persistent update private tree mismatch')
+    return value
 
 def persistent_uninstall_context(session, platform, command_line):
     return persistent_context(session, platform, command_line, uninstall=True)
@@ -239,7 +280,7 @@ def read_persistent_receipt(path):
     finally:
         os.close(fd)
 
-def persistent_content(content, initialize):
+def persistent_content(content, initialize, update_version=None):
     def exact(value, keys):
         if not isinstance(value, dict) or set(value) != set(keys): raise ValueError("persistent receipt schema mismatch")
     def digest(value):
@@ -251,7 +292,7 @@ def persistent_content(content, initialize):
     exact(content, ("catalogSha256", "registrySha256", "trustSha256", "bootstrapSha256", "apps", "files"))
     for field in ("catalogSha256", "registrySha256", "trustSha256", "bootstrapSha256"): digest(content[field])
     apps, files = content["apps"], content["files"]
-    if (not isinstance(apps, list) or len(apps) != (1 if initialize else 2)
+    if (not isinstance(apps, list) or len(apps) != (2 if update_version else 1 if initialize else 2)
             or not isinstance(files, list) or not 1 <= len(files) <= 256):
         raise ValueError("persistent content app/file list mismatch")
     identities = {}
@@ -262,7 +303,8 @@ def persistent_content(content, initialize):
         for field in ("fingerprint", "manifestSha256", "wasmSha256"): digest(app[field])
         for field in ("manifestPath", "wasmPath"): relative(app[field])
     expected = {1: ("dev.ming.text-entry-demo", "0.1.0")}
-    if not initialize: expected[2] = ("dev.ming.install-demo", "1.0.0")
+    if update_version: expected[2] = ("dev.ming.persistent-update-demo", update_version)
+    elif not initialize: expected[2] = ("dev.ming.install-demo", "1.0.0")
     if identities != expected or [app["packageId"] for app in apps] != sorted(app["packageId"] for app in apps):
         raise ValueError("persistent app identity/order mismatch")
     for app in apps:
@@ -295,6 +337,32 @@ def persistent_content(content, initialize):
     if any(file_hashes.get(path) != expected_hash for path, expected_hash in bindings.items()):
         raise ValueError("persistent file hashes disagree with content identities")
     return content
+
+def persistent_update_snapshot(receipt, context, phase, session_id, desktop_pid=None):
+    if (not isinstance(receipt, dict) or set(receipt) != {'schemaVersion', 'status', 'actions', 'content', 'privateContent'}
+        or type(receipt['schemaVersion']) is not int or receipt['schemaVersion'] != 1
+        or phase not in ('pre-desktop', 'post-desktop')
+        or context.get('role') != persistent_update_boot_role(context.get('bootNumber'))):
+        raise ValueError('invalid persistent update helper receipt role/schema')
+    initial = context['bootNumber'] == 1 and phase == 'pre-desktop'
+    if ((phase == 'pre-desktop' and (session_id is not None or desktop_pid is not None))
+        or (phase == 'post-desktop' and (not isinstance(session_id, str) or not session_id or not integer(desktop_pid, 2)))
+        or receipt['status'] != ('initialized-first' if initial else 'opened-existing')):
+        raise ValueError('invalid persistent update helper session/status')
+    expected = {'initializedRoots': 1, 'packagesInstalled': 2, 'publisherProvisioned': 1, 'bootstrapPublished': 1,
+                'catalogWrites': 2, 'rootPublished': 1, 'sourceBundlesCreated': 1, 'privateSeedWrites': 1,
+                'recoveryInvocations': 0, 'uiUpdatesCommitted': 0}
+    if (not isinstance(receipt['actions'], dict) or set(receipt['actions']) != set(expected)
+        or any(type(value) is not int or value != (expected[key] if initial else 0)
+               for key, value in receipt['actions'].items())):
+        raise ValueError('persistent update helper physical action counts mismatch')
+    content = persistent_content(receipt['content'], False, '0.1.0' if initial else '0.2.0')
+    private = persistent_update_private(receipt['privateContent'], initial)
+    if initial and len(content['files']) != 8:
+        raise ValueError('persistent update initial content has unexpected history')
+    return {'envelope': dict(context, sessionId=session_id, desktopPid=desktop_pid, phase=phase,
+                            status=receipt['status'], actions=receipt['actions']),
+            'content': content, 'privateContent': private}
 
 def persistent_snapshot(receipt, context, phase, session_id):
     def exact(value, keys):
@@ -346,12 +414,15 @@ def persistent_uninstall_snapshot(receipt, context, phase, session_id, desktop_p
                              status=receipt['status'], actions=receipt['actions']),
             'content': content, 'removed': receipt['removed'], 'privateContent': receipt['privateContent']}
 
-def prepare_persistent_snapshot(session, context, phase, session_id=None, *, uninstall=False, desktop_pid=None):
-    argv = (persistent_uninstall_helper_argv if uninstall else persistent_helper_argv)(session, context, phase)
-    event = 'persistent-uninstall-state' if uninstall else 'persistent-install-state'
-    snapshot_of = (lambda value: persistent_uninstall_snapshot(value, context, phase, session_id, desktop_pid)) if uninstall else (lambda value: persistent_snapshot(value, context, phase, session_id))
+def prepare_persistent_snapshot(session, context, phase, session_id=None, *, uninstall=False, update=False, desktop_pid=None):
+    argv_of = persistent_update_helper_argv if update else persistent_uninstall_helper_argv if uninstall else persistent_helper_argv
+    argv = argv_of(session, context, phase)
+    event = 'persistent-update-state' if update else 'persistent-uninstall-state' if uninstall else 'persistent-install-state'
+    snapshot_of = ((lambda value: persistent_update_snapshot(value, context, phase, session_id, desktop_pid)) if update else
+                   (lambda value: persistent_uninstall_snapshot(value, context, phase, session_id, desktop_pid)) if uninstall else
+                   (lambda value: persistent_snapshot(value, context, phase, session_id)))
     helper = Path(argv[0])
-    expected = session.get("persistentUninstallFixtureSha256" if uninstall else "persistentInstallFixtureSha256", {}).get("helper")
+    expected = session.get("persistentUpdateFixtureSha256" if update else "persistentUninstallFixtureSha256" if uninstall else "persistentInstallFixtureSha256", {}).get("helper")
     if expected != hashlib.sha256(helper.read_bytes()).hexdigest(): raise ValueError("persistent helper hash drift")
     path = Path(argv[-1])
     path.unlink(missing_ok=True)
@@ -368,7 +439,9 @@ def prepare_persistent_snapshot(session, context, phase, session_id=None, *, uni
         raise
     emit(event, argv=argv, code=result.returncode, stdout=result.stdout,
          stderr=result.stderr, receipt=snapshot)
-    if result.returncode: raise RuntimeError("persistent uninstall helper failed" if uninstall else "persistent install helper failed")
+    if result.returncode:
+        raise RuntimeError('persistent update helper failed' if update else
+                           'persistent uninstall helper failed' if uninstall else 'persistent install helper failed')
     return snapshot
 
 def verify_persistent_uninstall_after(before, after, parser, boot_number):
@@ -378,7 +451,22 @@ def verify_persistent_uninstall_after(before, after, parser, boot_number):
     if any(after[key] != expected[key] for key in fields):
         raise RuntimeError('persistent uninstall post-desktop content/identity/private evidence mismatch')
 
+def verify_persistent_update_after(before, after, parser, boot_number):
+    expected = ({'content': parser.committed_content, 'privateContent': parser.private_content}
+                if boot_number == 1 else before)
+    if (any(after[key] != expected[key] for key in ('content', 'privateContent'))
+        or after['privateContent']['nonFilesSha256'] != before['privateContent']['nonFilesSha256']):
+        raise RuntimeError('persistent update post-desktop content/private evidence mismatch')
+
 def desktop_argv(session, context=None):
+    if session.get('profile') == 'persistent-update':
+        persistent_update_session_contract(session)
+        if not context or context.get('role') != persistent_update_boot_role(context.get('bootNumber')):
+            raise ValueError('persistent update desktop requires verified context')
+        argv = ['/opt/mingos/ming-app-host', 'desktop', PERSISTENT_UPDATE_CATALOG, '--renderer', 'cpu'] + session['extraArgs']
+        argv += ['--persistent-install-state', PERSISTENT_UPDATE_ROOT]
+        if context['bootNumber'] == 1: argv += ['--install-source', session['installSource']]
+        return argv
     if session.get('profile') == 'persistent-uninstall':
         from bootlib import persistent_uninstall_boot_role, persistent_uninstall_session_contract
         persistent_uninstall_session_contract(session)
@@ -436,7 +524,7 @@ def main():
     stderr_limited = False
     diagnostic = {}
     persistent = persistent_before = None
-    persistent_uninstall = False
+    persistent_uninstall = persistent_update = False
     fault_config = fault_receipt = None
     fault_receipt_path = LOG / "fault-injection.json"
     ready_capture_deadline = None
@@ -552,11 +640,16 @@ def main():
             if weston.poll() is not None or time.monotonic() >= deadline: raise RuntimeError("Weston DRM socket not ready")
             time.sleep(0.1)
         session = json.loads(Path("/etc/mingos/session.json").read_text())
-        if session.get("profile") in ("persistent-install", "persistent-uninstall"):
+        if session.get("profile") in ("persistent-install", "persistent-uninstall", "persistent-update"):
             session = strict_json(Path("/etc/mingos/session.json").read_text())
             persistent_uninstall = session['profile'] == 'persistent-uninstall'
-            persistent = persistent_context(session, platform, Path("/proc/cmdline").read_text(), uninstall=persistent_uninstall)
-            persistent_before = prepare_persistent_snapshot(session, persistent, "pre-desktop", uninstall=persistent_uninstall)
+            persistent_update = session['profile'] == 'persistent-update'
+            if persistent_update:
+                from persistent_update_receipt import PersistentUpdateReceipts
+            persistent = persistent_context(session, platform, Path("/proc/cmdline").read_text(),
+                                            uninstall=persistent_uninstall, update=persistent_update)
+            persistent_before = prepare_persistent_snapshot(session, persistent, "pre-desktop",
+                uninstall=persistent_uninstall, update=persistent_update)
         fixture = session.get("updateFixture")
         if fixture is not None:
             expected = {
@@ -621,7 +714,10 @@ def main():
         desktop = launch(argv, "desktop", desktop_debug=True)
         if persistent:
             if stderr_capture is None: raise RuntimeError("persistent desktop requires captured diagnostic stderr")
-            if persistent_uninstall:
+            if persistent_update:
+                persistent_parser = PersistentUpdateReceipts(platform.boot_id, desktop.pid, persistent['bootNumber'],
+                                                             before=persistent_before)
+            elif persistent_uninstall:
                 from persistent_uninstall_receipt import PersistentUninstallReceipts
                 persistent_parser = PersistentUninstallReceipts(platform.boot_id, desktop.pid, persistent['bootNumber'])
             else:
@@ -662,8 +758,11 @@ def main():
             if not state: raise RuntimeError("persistent desktop ended without session state")
             persistent_parser.complete(persistent['bootNumber'])
             after = prepare_persistent_snapshot(session, persistent, "post-desktop", state["sessionId"],
-                uninstall=persistent_uninstall, desktop_pid=desktop.pid if persistent_uninstall else None)
-            if persistent_uninstall:
+                uninstall=persistent_uninstall, update=persistent_update,
+                desktop_pid=desktop.pid if persistent_uninstall or persistent_update else None)
+            if persistent_update:
+                verify_persistent_update_after(persistent_before, after, persistent_parser, persistent['bootNumber'])
+            elif persistent_uninstall:
                 verify_persistent_uninstall_after(persistent_before, after, persistent_parser, persistent['bootNumber'])
             else:
                 if persistent_parser.installed_content is not None and after['content'] != persistent_parser.installed_content:

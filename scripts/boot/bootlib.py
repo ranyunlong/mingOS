@@ -37,7 +37,38 @@ PERSISTENT_UNINSTALL_FIXTURE = {
     "sourceManifest": INSTALL_LIFECYCLE_SOURCE,
     "receipt": "/run/evidence/persistent-uninstall-fixture.json",
 }
-PERSISTENT_PAYLOAD_PROFILES = ("persistent-install", "persistent-uninstall")
+PERSISTENT_UPDATE_ROOT = "/data/mingos/install-root"
+PERSISTENT_UPDATE_CATALOG = PERSISTENT_UPDATE_ROOT + "/catalog.json"
+PERSISTENT_UPDATE_PROFILE = "persistent-update-pointer-ready-v1"
+PERSISTENT_UPDATE_ARGS = ["--duration-ms", "0", "--isolation", "strict", "--data-root", "/data/mingos",
+                          "--state-file", "/run/evidence/desktop-state.json",
+                          "--qualification-receipts", PERSISTENT_UPDATE_PROFILE]
+PERSISTENT_UPDATE_FIXTURE = {
+    "helper": "/opt/mingos/prepare-persistent-update-fixture",
+    "installRoot": PERSISTENT_UPDATE_ROOT,
+    "dataRoot": "/data/mingos",
+    "bootstrapWasm": "/opt/mingos/packages/bootstrap/main.wasm",
+    "oldWasm": "/opt/mingos/packages/old/main.wasm",
+    "newWasm": "/opt/mingos/packages/new/main.wasm",
+    "sourceManifest": "/opt/mingos/install-source/app.json",
+    "receipt": "/run/evidence/persistent-update-fixture.json",
+}
+PERSISTENT_PAYLOAD_PROFILES = ("persistent-install", "persistent-uninstall", "persistent-update")
+
+def persistent_update_session_contract(review):
+    if (review.get("persistentInstallState") != PERSISTENT_UPDATE_ROOT
+            or review.get("catalogPath") != PERSISTENT_UPDATE_CATALOG
+            or review.get("installSource") != PERSISTENT_UPDATE_FIXTURE["sourceManifest"]
+            or review.get("persistentUpdateFixture") != PERSISTENT_UPDATE_FIXTURE
+            or review.get("extraArgs") != PERSISTENT_UPDATE_ARGS
+            or any(key in review for key in ("installRoot", "installFixture", "updateFixture", "installEvents", "installEventsSha256",
+                "persistentInstallFixture", "persistentInstallFixtureSha256", "persistentUninstallFixture", "persistentUninstallFixtureSha256"))):
+        raise ValueError("persistent update requires exact update paths/args without legacy fixture overrides")
+
+def persistent_update_boot_role(number):
+    if type(number) is not int or number not in (1, 2):
+        raise ValueError("persistent update requires fixed boot number 1 or 2")
+    return "initialize-first" if number == 1 else "open-existing"
 
 def persistent_uninstall_session_contract(review):
     if (review.get("persistentInstallState") != PERSISTENT_INSTALL_ROOT
@@ -127,7 +158,8 @@ def checked_session(review, payload):
     if review.get("profile") == "install-lifecycle" and review.get("installSource") != INSTALL_LIFECYCLE_SOURCE:
         raise ValueError("install profile requires reviewed install source")
     if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES:
-        if review["profile"] == "persistent-uninstall": persistent_uninstall_session_contract(review)
+        if review["profile"] == "persistent-update": persistent_update_session_contract(review)
+        elif review["profile"] == "persistent-uninstall": persistent_uninstall_session_contract(review)
         else: persistent_session_contract(review)
         persistent_input_hashes(review)
     if any(not isinstance(arg, str) or "\0" in arg for arg in extra):
@@ -149,7 +181,8 @@ def checked_session(review, payload):
 def validate_reviewed_input(review, path, boot_number=None):
     """Return frozen input bytes and their digest for both validation and use."""
     if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES:
-        if review["profile"] == "persistent-uninstall": persistent_uninstall_boot_role(boot_number)
+        if review["profile"] == "persistent-update": persistent_update_boot_role(boot_number)
+        elif review["profile"] == "persistent-uninstall": persistent_uninstall_boot_role(boot_number)
         else: persistent_boot_role(boot_number)
         expected = persistent_input_hashes(review)["boot%dSha256" % boot_number]
         mismatch = "reviewed persistent input script hash mismatch for boot " + str(boot_number)
@@ -202,9 +235,11 @@ def qemu_command(bundle, out, paused=False, data_disk=None, input_diagnostics=Fa
     if persistent_profile is not None and boot_number is None:
         raise ValueError("persistent profile requires fixed boot number")
     role = None
-    kernel_prefix = "persistent_uninstall" if persistent_profile == "persistent-uninstall" else "persistent_install"
+    kernel_prefix = {"persistent-update": "persistent_update", "persistent-uninstall": "persistent_uninstall"}.get(persistent_profile, "persistent_install")
     if boot_number is not None:
-        role = persistent_uninstall_boot_role(boot_number) if persistent_profile == "persistent-uninstall" else persistent_boot_role(boot_number)
+        boot_role = (persistent_update_boot_role if persistent_profile == "persistent-update" else
+                     persistent_uninstall_boot_role if persistent_profile == "persistent-uninstall" else persistent_boot_role)
+        role = boot_role(boot_number)
         if paused or not data_disk:
             raise ValueError("persistent install requires a running guest with persistent data disk")
     command = ["qemu-system-x86_64", "-machine", "q35", "-accel", "tcg,thread=multi",

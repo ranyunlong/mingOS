@@ -6,12 +6,25 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from bundle import Rootfs, copy_runtime
+from bundle import Rootfs, copy_runtime, copy_guest_scripts
 from bootlib import validate_kernel_config
+
+def check_guest_python(root, scripts, profile):
+    hashes = copy_guest_scripts(root, scripts, profile)
+    code = 'import sys; sys.path.insert(0, ' + repr(str(root / 'etc/mingos')) + '); import guest'
+    if profile == 'persistent-update':
+        code += '; from persistent_update_receipt import PersistentUpdateReceipts'
+    try:
+        subprocess.run([sys.executable, '-I', '-B', '-c', code], check=True, timeout=30,
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError('guest Python import failed: ' + (error.stderr or error.stdout or str(error))) from error
+    return hashes
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--profile", choices=('desktop', 'persistent-update'), default='desktop')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     report = {"bootAttempted": False, "payloadUsed": False, "archiveCreated": False}
@@ -22,6 +35,9 @@ def main():
             root = Path(temporary)
             runtime = Rootfs(root)
             copy_runtime(runtime)
+            if args.profile == 'persistent-update':
+                report['guestScriptSha256'] = check_guest_python(root, Path(__file__).resolve().parent, args.profile)
+                report['guestPythonImportPassed'] = True
             report["copiedSourcePaths"] = len(runtime.copied)
             regular = [p for p in root.rglob("*") if p.is_file() and not p.is_symlink()]
             report["regularFiles"] = len(regular)

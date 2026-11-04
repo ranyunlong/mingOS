@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 from bootlib import INSTALL_LIFECYCLE_EVENTS, INSTALL_LIFECYCLE_INSTALL_ROOT, INSTALL_LIFECYCLE_SOURCE, PERSISTENT_INSTALL_ARGS, PERSISTENT_INSTALL_FIXTURE, PERSISTENT_INSTALL_PROFILE, PERSISTENT_UPDATE_INSTALL_ROOT, PERSISTENT_UNINSTALL_ARGS, PERSISTENT_UNINSTALL_FIXTURE, PERSISTENT_UNINSTALL_PROFILE, checked_path, persistent_input_hashes, sha256
+from bootlib import PERSISTENT_UPDATE_ARGS, PERSISTENT_UPDATE_FIXTURE, PERSISTENT_UPDATE_PROFILE, persistent_update_session_contract
 from wayland_receipt import POINTER_SYNC_POLICY
 
 DATA_TEXT_ARGS = ['--duration-ms', '0', '--isolation', 'strict', '--data-root', '/data/mingos',
@@ -226,6 +227,33 @@ def verify_persistent_uninstall(payload, review, catalog):
             header = source.read(8)
         require(header[:4] == b'\x7fELF' if field == 'helper' else header == b'\0asm\x01\0\0\0',
                 'persistent uninstall fixture executable format: ' + field)
+    return catalog
+
+def verify_persistent_update(payload, review, catalog):
+    """Freeze the three distinct update inputs and its independent qualification."""
+    persistent_update_session_contract(review)
+    require(review.get('sessionMode') == 'long-lived' and review.get('extraArgs') == PERSISTENT_UPDATE_ARGS,
+            'exact persistent update session required')
+    require(catalog == {'schemaVersion': 3, 'apps': [
+        {'id': 1, 'title': 'Text Lab', 'packageId': 'dev.ming.text-entry-demo'}], 'autostart': [1]}
+        and type(catalog['schemaVersion']) is int and type(catalog['apps'][0]['id']) is int
+        and type(catalog['autostart'][0]) is int, 'persistent update requires bootstrap only catalog')
+    require(review.get('instrumentedQualification') is True
+            and review.get('instrumentedProfile') == PERSISTENT_UPDATE_PROFILE
+            and review.get('inputSynchronization') == POINTER_SYNC_POLICY, 'persistent update qualification required')
+    persistent_input_hashes(review)
+    require(not any((payload / name).exists() for name in ('install-root', 'install-source', 'install-events.json')),
+            'persistent update payload must not contain registry/source/events')
+    expected = review.get('persistentUpdateFixtureSha256')
+    fields = ('helper', 'bootstrapWasm', 'oldWasm', 'newWasm')
+    require(isinstance(expected, dict) and set(expected) == set(fields), 'reviewed update helper and three modules required')
+    for field in fields:
+        path = checked_path(payload, PERSISTENT_UPDATE_FIXTURE[field].removeprefix('/opt/mingos/'))
+        require(path.is_file() and expected[field] == sha256(path), 'persistent update fixture hash mismatch: ' + field)
+        with path.open('rb') as source: header = source.read(8)
+        require(header[:4] == b'\x7fELF' if field == 'helper' else header == b'\0asm\x01\0\0\0',
+                'persistent update executable format: ' + field)
+    require(expected['oldWasm'] != expected['newWasm'], 'persistent update old/new modules must differ')
     return catalog
 
 def verify_data_text_private_probe(payload, review, catalog):

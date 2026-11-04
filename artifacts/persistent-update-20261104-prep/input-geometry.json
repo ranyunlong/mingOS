@@ -1,0 +1,114 @@
+{
+  "schemaVersion": 1,
+  "geometry": {
+    "app2Dock": {
+      "count": 2,
+      "index": 1,
+      "point": [
+        676,
+        766
+      ],
+      "rect": {
+        "height": 64,
+        "width": 64,
+        "x": 644,
+        "y": 736
+      }
+    },
+    "app2Window": {
+      "closePoint": [
+        96,
+        104
+      ],
+      "outer": {
+        "height": 480,
+        "width": 720,
+        "x": 80,
+        "y": 88
+      }
+    },
+    "boot1Points": [
+      [
+        1148,
+        12
+      ],
+      [
+        880,
+        478
+      ],
+      [
+        676,
+        766
+      ],
+      [
+        96,
+        104
+      ],
+      [
+        1238,
+        12
+      ]
+    ],
+    "boot2Points": [
+      [
+        676,
+        766
+      ],
+      [
+        1238,
+        12
+      ]
+    ],
+    "height": 800,
+    "install": {
+      "point": [
+        1148,
+        12
+      ],
+      "rect": {
+        "height": 24,
+        "width": 96,
+        "x": 1100,
+        "y": 0
+      }
+    },
+    "power": {
+      "point": [
+        1238,
+        12
+      ],
+      "rect": {
+        "height": 24,
+        "width": 84,
+        "x": 1196,
+        "y": 0
+      }
+    },
+    "schemaVersion": 1,
+    "updateAllow": {
+      "point": [
+        880,
+        478
+      ],
+      "rect": {
+        "height": 28,
+        "width": 80,
+        "x": 840,
+        "y": 464
+      }
+    },
+    "width": 1280
+  },
+  "sourceSha256": {
+    "crates/ming-app-host/src/graphics/desktop_shell.rs": "249908bb7b43d73bbc90799ca8302b74c50ef3d10af5d0a3dfa9b18b2263d6ed",
+    "crates/ming-app-host/src/desktop_model.rs": "b3920265e8e0165550fcc03b003a7731681462af80c09a5ca5490b87cc85baa3",
+    "crates/ming-app-host/src/desktop_native.rs": "2580f978754347a220796e71dc6c6339d46e94546ee34b3ba1b4649555a9e634"
+  },
+  "test": {
+    "matched": 1,
+    "passed": 1,
+    "failed": 0,
+    "ignored": 0
+  },
+  "stdoutSha256": "bdcc88816fef74ad70c3c791f1b380af943819677a52702ab951206d6fac59d3"
+}

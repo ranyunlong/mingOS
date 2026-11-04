@@ -99,6 +99,22 @@ class WaylandReceiptTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'persistent install receipt line limit'):
                     parser.feed(b'x'+(b'\n' if complete else b''))
 
+    def test_update_receipts_have_independent_bound_and_never_create_pointer_readiness(self):
+        prefix=b'MING_PERSISTENT_UPDATE '
+        line=prefix+b'x'*(262144-len(prefix))
+        parser=self.parser()
+        self.assertEqual(parser.feed(line+b'\n'),[])
+        self.assertEqual(parser.offset,262145)
+        for complete in (False,True):
+            with self.subTest(complete=complete),self.assertRaisesRegex(ValueError,'persistent update receipt line limit'):
+                self.parser().feed(line+b'x'+(b'\n' if complete else b''))
+        for wrong in (b' MING_PERSISTENT_UPDATE ',b'MING_PERSISTENT_UPDATER ',b'MING_PERSISTENT_UPDATE\t'):
+            with self.subTest(prefix=wrong),self.assertRaisesRegex(ValueError,'Wayland diagnostic line limit'):
+                self.parser().feed(wrong+b'x'*65537+b'\n')
+        parser=self.parser()
+        parser.feed(prefix+b'-> wl_seat#8.get_pointer(new id wl_pointer#99)\n')
+        self.assertIsNone(parser.pointer)
+
     def test_power_move_accepts_motion_on_current_pointer_and_surface(self):
         parser=self.parser();parser.feed(b'-> wl_seat#8.get_pointer(new id wl_pointer#36)\nwl_pointer#36.enter(0, wl_surface#15, 120, 200)\nwl_pointer#36.frame()\n')
         records=parser.feed(b'wl_pointer#36.motion(10, 1250.3, 12.2)\nwl_pointer#36.frame()\n')
