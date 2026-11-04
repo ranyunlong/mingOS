@@ -314,6 +314,8 @@ pub fn initialize_update_fixture_first(root: &Path, data_root: &Path,
 
 **新代路径修复验证：** driver 以 inventory 来源目录与实际 `/prep` 的唯一 `samefile` 匹配替代旧 prep 路径，并按该来源相对路径验证 host environment；保留完整集合/hash检查。新代 host/mapped freeze、新增/篡改拒绝、同字节不同目录及遗漏 driver 拒绝的3项新增回归先RED后GREEN；driver `20/20`、checker与driver合计 `40/40` 通过。实际 tools 容器仅只读绑定当前仓库与当前prep，`samefile=true`且当时1425项完整map一致，未创建新代、执行构建、启动guest或挂载volume，诊断容器删除已复验。新代目录在单元控制中覆盖，实际bind证据只覆盖当前prep，不能代替新代完整准入。独立只读复核无阻断，日志见 `artifacts/persistent-update-20261104-prep/build/diagnostics/preparation-path-fix-*`；旧freeze字节保留。
 
+**固定 tools 的测试准备修复：** 独立 prep2 的开发准入 `b187dfe4a06c` 保留为失败记录：checker `20/20`，driver 原17项通过、新3项因测试调用 `git init` 而在无Git镜像报错，未freeze/build/启动guest。测试改为只模拟 host `git ls-files` 并严格核对调用参数，保留真实路径/目录身份/文件集合/hash/冻结验证；固定 tools 镜像最终 checker+driver `40/40` 通过、五项源码hash前后稳定，证据 `artifacts/persistent-update-20261104-prep/build/diagnostics/git-free-tools-controls-final/`。旧build卷只读盘点后保留，空且无引用的本任务预检卷已按授权删除并留证；新代须重生draft与完整准入、重新实际测量容量，不沿用旧代结果。
+
 - [ ] **执行前确认事实与授权。** 在独立实现checkout核对源码/lock/fixture/checker/driver冻结、镜像和依赖、空间/安全退出/锁、实际动作与既有用户授权是否一致。构建、VM、盘/卷动作未获覆盖则完成全部可审准备后报告具体缺项；本文不替代该授权。
 - [ ] **正式当前构建。** 新freeze下运行release all-targets、all-features/all-targets check、无default features check、Host/helper build、Task7显式真实worker，以及 `cargo test --offline --locked --release -p ming-app-host --lib persistent_update::recovery_tests -j1 -- --test-threads=1` 的实际父矩阵。独立核对退出码/匹配数/源码稳定、ELF动态闭包、模块adapter/signature、initramfs实际文件。失败先读原始错误，不换release为debug、增加watchdog或关掉边界来通过。
 

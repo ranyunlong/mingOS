@@ -15,8 +15,15 @@ def driver():
 class DriverTests(unittest.TestCase):
     def preparation_repo(self, work):
         stage=driver();repo=Path(work).resolve()/'repo';repo.mkdir()
-        stage.subprocess.run(['git','init','-q',str(repo)],check=True)
         (repo/'.gitignore').write_text('artifacts/\n')
+        # The tools image has no Git; only the host's source-list boundary is
+        # synthetic. File enumeration, mount identity and hashes remain real.
+        def host_source_listing(argv,**kwargs):
+            self.assertEqual(argv,['git','ls-files','-z','--cached','--others','--exclude-standard'])
+            self.assertEqual(kwargs,{'cwd':repo,'capture_output':True,'check':True})
+            return mock.Mock(stdout=b'.gitignore\0')
+        listing=mock.patch.object(stage.subprocess,'run',side_effect=host_source_listing)
+        listing.start();self.addCleanup(listing.stop)
         prep=repo/'artifacts/prep2';prep.mkdir(parents=True)
         (prep/'run-stage.py').write_text('pass\n')
         (prep/'verify-persistent-update-evidence.py').write_text('pass\n')
