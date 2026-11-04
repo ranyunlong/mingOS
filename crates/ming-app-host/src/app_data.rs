@@ -117,6 +117,37 @@ pub struct PrivateContentFile { pub path: String, pub size: u64, pub sha256: Str
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PrivateContentSnapshot { pub package_id: String, pub files: Vec<PrivateContentFile> }
 
+/// Versioned digest of a complete bounded tree, including empty directories.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TreeDigest { pub entries: u32, pub bytes: u64, pub sha256: String }
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrivateUpdateBaseline {
+    pub schema_version: u32,
+    pub package_id: String,
+    pub namespace_exists: bool,
+    #[serde(deserialize_with = "required_optional_tree")]
+    pub files: Option<TreeDigest>,
+    pub non_files_sha256: String,
+}
+#[cfg(target_os = "linux")]
+fn required_optional_tree<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<TreeDigest>, D::Error> {
+    serde::Deserialize::deserialize(deserializer)
+}
+
+/// Observes existing storage without creating directories, policies, locks, or grants.
+/// A missing namespace or files tree is a valid, distinct baseline.
+/// Callers must stop workers or serialize writers for this observation. This does not
+/// provide a globally atomic snapshot against arbitrary external concurrent writes.
+#[cfg(target_os = "linux")]
+pub fn observe_private_update_read_only(root: &Path, package_id: &str) -> Result<PrivateUpdateBaseline> {
+    if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+    platform::observe_private_update_read_only_checked(root, package_id, || {})
+}
+
 /// Never initializes storage, grants, policies, or locks. Only single-level regular files
 /// are accepted; every directory entry counts toward the bound before validation.
 #[cfg(target_os = "linux")]
@@ -148,7 +179,14 @@ impl AppDataRoot {
     }
     fn grant_directory(&self, name: &str, mask: u8) -> Result<AppDataGrant> {
         let directory = platform::Directory::open(&self.root, name)?;
-        Ok(AppDataGrant {
+        Ok(self.grant_opened_directory(directory, mask))
+    }
+    #[cfg(target_os = "linux")]
+    fn grant_existing_directory(&self, name: &str, mask: u8) -> Result<AppDataGrant> {
+        Ok(self.grant_opened_directory(platform::Directory::open_existing(&self.root, name)?, mask))
+    }
+    fn grant_opened_directory(&self, directory: platform::Directory, mask: u8) -> AppDataGrant {
+        AppDataGrant {
             shared: Arc::new(Mutex::new(State {
                 directory,
                 slots: mask,
@@ -160,7 +198,7 @@ impl AppDataRoot {
                 #[cfg(test)]
                 change_read: None,
             })),
-        })
+        }
     }
 }
 /// Matches the package manifest identity contract.
@@ -285,6 +323,49 @@ fn load_persistent_policy(
 impl PackageStorageAuthority {
     pub fn new(root: AppDataRoot) -> Self {
         Self { root, authorized: Mutex::new(BTreeMap::new()), #[cfg(target_os = "linux")] private: Mutex::new(BTreeMap::new()), public_authorized: Mutex::new(BTreeMap::new()), policy: None, public_policy: None, #[cfg(target_os = "linux")] _private_only_lock: None }
+    }
+    /// The registry lock must already be held. No absent policy directory or lock is created.
+    /// As with default private mode, an absent public slot means first-use empty authorization.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_update_recovery_existing(path: &Path) -> Result<Self> {
+        Self::open_update_recovery_existing_checked(path, || {})
+    }
+    #[cfg(target_os = "linux")]
+    fn open_update_recovery_existing_checked(path: &Path, after_policy_read: impl FnOnce()) -> Result<Self> {
+        let root = AppDataRoot::open(path)?;
+        let before = platform::stamp_root(&root.root)?;
+        let store = root.grant_existing_directory("system-private-storage-policy-v1", 1)?;
+        let lock = store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.lock_policy_existing()?;
+        let private_binding = store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.policy_binding(&lock)?;
+        let public_store = root.grant_existing_directory("system-public-storage-policy-v1", 1)?;
+        let public_lock = public_store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.lock_policy_existing()?;
+        let public_binding = public_store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.policy_binding(&public_lock)?;
+        let public_authorized = load_persistent_policy(&public_store, PUBLIC_POLICY_HEADER, PUBLIC_POLICY_HEADER_V2)?;
+        after_policy_read();
+        store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.verify_policy_binding(
+            &root.root, "system-private-storage-policy-v1", &lock, &private_binding)?;
+        public_store.shared.lock().map_err(|_| AppDataError::Denied)?.directory.verify_policy_binding(
+            &root.root, "system-public-storage-policy-v1", &public_lock, &public_binding)?;
+        if before != platform::stamp_root(&root.root)? || before != platform::stamp_root(&platform::Root::open(path)?)? {
+            return Err(AppDataError::Io);
+        }
+        Ok(Self {
+            root,
+            authorized: Mutex::new(BTreeMap::new()),
+            private: Mutex::new(BTreeMap::new()),
+            public_authorized: Mutex::new(public_authorized),
+            policy: None,
+            public_policy: Some(PersistentPolicy { store: public_store, _lock: public_lock }),
+            _private_only_lock: Some(PersistentPolicy { store, _lock: lock }),
+        })
+    }
+    /// Reuses the authority's pinned root and serializes with its private-file operations.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observe_update(&self, package_id: &str) -> Result<PrivateUpdateBaseline> {
+        if !valid_package_id(package_id) { return Err(AppDataError::InvalidArgument); }
+        let _authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        let _private = self.private.lock().map_err(|_| AppDataError::Denied)?;
+        platform::observe_update_checked(&self.root.root, package_id, || {})
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn open_default_private(root: AppDataRoot) -> Result<Self> {
@@ -1443,6 +1524,178 @@ mod platform {
     pub fn stamp_private(file: &File) -> Result<Stamp> {
         file_stamp_with_limit(file.metadata().map_err(io_error)?, MAX_PRIVATE_FILE_BYTES)
     }
+    fn update_directory_stamp(file: &File) -> Result<Stamp> {
+        private_directory(file)?;
+        let m = file.metadata().map_err(io_error)?;
+        Ok(Stamp { dev: m.dev(), ino: m.ino(), size: m.len(), mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()), mode: m.mode(), uid: m.uid(), nlink: m.nlink() })
+    }
+    pub fn stamp_root(root: &Root) -> Result<Stamp> { update_directory_stamp(&root.0) }
+    fn update_names(dir: &File, limit: usize) -> Result<Vec<String>> {
+        let raw = open_at(dir, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?.into_raw_fd();
+        let stream = unsafe { libc::fdopendir(raw) };
+        if stream.is_null() { unsafe { libc::close(raw); } return Err(AppDataError::Io); }
+        let result = (|| {
+            let mut names = Vec::new();
+            loop {
+                unsafe { *libc::__errno_location() = 0; }
+                let entry = unsafe { libc::readdir(stream) };
+                if entry.is_null() {
+                    if unsafe { *libc::__errno_location() } != 0 { return Err(AppDataError::Io); }
+                    break;
+                }
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_str().map_err(|_| AppDataError::Io)?;
+                if name == "." || name == ".." { continue; }
+                names.push(name.to_owned());
+                if names.len() > limit { return Err(AppDataError::Io); }
+            }
+            names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            Ok(names)
+        })();
+        unsafe { libc::closedir(stream); }
+        result
+    }
+    fn update_read(mut file: &File) -> Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file).take(MAX_PRIVATE_FILE_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(io_error)?;
+        if bytes.len() > MAX_PRIVATE_FILE_BYTES { return Err(AppDataError::Io); }
+        Ok(bytes)
+    }
+    // Field order, explicit directory records and UTF-8 path ordering form the v1 encoding.
+    #[derive(serde::Serialize)]
+    struct UpdateTreeEntry {
+        path: String,
+        #[serde(rename = "type")]
+        kind: &'static str,
+        length: u64,
+        sha256: Option<String>,
+    }
+    fn update_digest(mut entries: Vec<UpdateTreeEntry>, domain: &[u8]) -> Result<TreeDigest> {
+        use sha2::{Digest, Sha256};
+        entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let bytes = entries.iter().map(|entry| entry.length).sum();
+        let encoded = serde_json::to_vec(&entries).map_err(|_| AppDataError::Io)?;
+        let mut hash = Sha256::new(); hash.update(domain); hash.update(encoded);
+        Ok(TreeDigest { entries: entries.len() as u32, bytes, sha256: format!("{:x}", hash.finalize()) })
+    }
+    // Retain content and identity, keeping open descriptors bounded by tree depth.
+    // The authority serializes mutation; the read-only helper requires stopped workers.
+    enum UpdateNode {
+        Directory(UpdateDirectory),
+        File { stamp: Stamp, bytes: Vec<u8> },
+    }
+    struct UpdateDirectory {
+        stamp: Stamp,
+        names: Vec<String>,
+        children: Vec<(String, UpdateNode)>,
+    }
+    #[derive(Default)]
+    struct UpdateBudget { entries: usize, bytes: usize }
+    impl UpdateDirectory {
+        fn capture(file: File, prefix: &str, skip_files: bool, entries: &mut Vec<UpdateTreeEntry>, budget: &mut UpdateBudget) -> Result<Self> {
+            use sha2::{Digest, Sha256};
+            let stamp = update_directory_stamp(&file)?;
+            let names = update_names(&file, MAX_PRIVATE_ENTRIES + usize::from(skip_files))?;
+            let mut children = Vec::new();
+            for name in &names {
+                if skip_files && name == "files" { continue; }
+                let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+                validate_private_path(&path).map_err(|_| AppDataError::Io)?;
+                budget.entries += 1;
+                if budget.entries > MAX_PRIVATE_ENTRIES { return Err(AppDataError::Io); }
+                let child = open_at(&file, name, libc::O_RDONLY, 0)?;
+                let metadata = child.metadata().map_err(io_error)?;
+                let node = if metadata.is_dir() {
+                    entries.push(UpdateTreeEntry { path: path.clone(), kind: "directory", length: 0, sha256: None });
+                    Self::capture(child, &path, false, entries, budget).map(UpdateNode::Directory)?
+                } else {
+                    let stamp = file_stamp_with_limit(metadata, MAX_PRIVATE_FILE_BYTES)?;
+                    budget.bytes = budget.bytes.checked_add(stamp.size as usize).ok_or(AppDataError::Io)?;
+                    if budget.bytes > MAX_PRIVATE_TOTAL_BYTES { return Err(AppDataError::Io); }
+                    let bytes = update_read(&child)?;
+                    if bytes.len() as u64 != stamp.size || stamp_private(&child)? != stamp
+                        || update_read(&child)? != bytes || stamp_private(&child)? != stamp { return Err(AppDataError::Io); }
+                    entries.push(UpdateTreeEntry { path, kind: "file", length: stamp.size, sha256: Some(format!("{:x}", Sha256::digest(&bytes))) });
+                    UpdateNode::File { stamp, bytes }
+                };
+                children.push((name.clone(), node));
+            }
+            if update_directory_stamp(&file)? != stamp || update_names(&file, MAX_PRIVATE_ENTRIES + 1)? != names { return Err(AppDataError::Io); }
+            Ok(Self { stamp, names, children })
+        }
+        fn verify(&self, reopened: &File) -> Result<()> {
+            if update_directory_stamp(reopened)? != self.stamp
+                || update_names(reopened, MAX_PRIVATE_ENTRIES + 1)? != self.names { return Err(AppDataError::Io); }
+            for (name, node) in &self.children {
+                let current = open_at(reopened, name, libc::O_RDONLY, 0)?;
+                match node {
+                    UpdateNode::Directory(directory) => directory.verify(&current)?,
+                    UpdateNode::File { stamp, bytes } => {
+                        if stamp_private(&current)? != *stamp || update_read(&current)? != *bytes
+                            || stamp_private(&current)? != *stamp || update_read(&current)? != *bytes
+                            || stamp_private(&current)? != *stamp { return Err(AppDataError::Io); }
+                    }
+                }
+            }
+            if update_directory_stamp(reopened)? != self.stamp
+                || update_names(reopened, MAX_PRIVATE_ENTRIES + 1)? != self.names { return Err(AppDataError::Io); }
+            Ok(())
+        }
+    }
+    pub(super) fn observe_private_update_read_only_checked(path: &Path, package_id: &str, after_read: impl FnOnce()) -> Result<PrivateUpdateBaseline> {
+        let root = Root::open(path)?;
+        let before = stamp_root(&root)?;
+        let baseline = observe_update_checked(&root, package_id, after_read)?;
+        if stamp_root(&root)? != before || stamp_root(&Root::open(path)?)? != before { return Err(AppDataError::Io); }
+        Ok(baseline)
+    }
+    pub(super) fn observe_update_checked(root: &Root, package_id: &str, after_read: impl FnOnce()) -> Result<PrivateUpdateBaseline> {
+        let root_before = stamp_root(root)?;
+        let name = package_directory_name(package_id);
+        let package = match Directory::open_existing(root, &name) {
+            Ok(package) => Some(package),
+            Err(AppDataError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        let mut non_files_entries = Vec::new();
+        let mut files_entries = Vec::new();
+        let non_files = package.as_ref().map(|package| {
+            UpdateDirectory::capture(open_at(&package.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?, "", true, &mut non_files_entries, &mut UpdateBudget::default())
+        }).transpose()?;
+        let files_directory = if let Some(package) = &package {
+            match package.child("files", false) {
+                Ok(files) => Some(files),
+                Err(AppDataError::NotFound) => None,
+                Err(error) => return Err(error),
+            }
+        } else { None };
+        let files = files_directory.as_ref().map(|files| {
+            UpdateDirectory::capture(open_at(&files.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?, "", false, &mut files_entries, &mut UpdateBudget::default())
+        }).transpose()?;
+        after_read();
+        match (&package, &non_files) {
+            (Some(package), Some(non_files)) => {
+                let reopened = Directory::open_existing(root, &name)?;
+                if let (Some(files), Some(pinned)) = (&files, &files_directory) {
+                    files.verify(&reopened.child("files", false)?.0)?;
+                    if update_directory_stamp(&pinned.0)? != files.stamp { return Err(AppDataError::Io); }
+                }
+                non_files.verify(&reopened.0)?;
+                if update_directory_stamp(&package.0)? != non_files.stamp { return Err(AppDataError::Io); }
+            }
+            (None, None) => {
+                if !matches!(Directory::open_existing(root, &name), Err(AppDataError::NotFound)) { return Err(AppDataError::Io); }
+            }
+            _ => return Err(AppDataError::Io),
+        }
+        if stamp_root(root)? != root_before { return Err(AppDataError::Io); }
+        Ok(PrivateUpdateBaseline {
+            schema_version: 1, package_id: package_id.to_owned(), namespace_exists: package.is_some(),
+            files: files.map(|_| update_digest(files_entries, b"ming-private-update-tree-v1\0")).transpose()?,
+            non_files_sha256: update_digest(non_files_entries, b"ming-private-update-non-files-v1\0")?.sha256,
+        })
+    }
     pub fn snapshot_private_read_only(path: &Path, package_id: &str) -> Result<PrivateContentSnapshot> {
         snapshot_private_read_only_checked(path, package_id, || {})
     }
@@ -1760,13 +2013,41 @@ mod platform {
             Ok((bytes, entries))
         }
         pub fn lock_policy(&self) -> Result<File> {
+            self.lock_policy_open(true)
+        }
+        pub fn lock_policy_existing(&self) -> Result<File> {
+            self.lock_policy_open(false)
+        }
+        pub fn policy_binding(&self, lock: &File) -> Result<(Stamp, Stamp)> {
+            Ok((update_directory_stamp(&self.0)?, stamp(lock)?))
+        }
+        pub fn verify_policy_binding(&self, root: &Root, name: &str, lock: &File, before: &(Stamp, Stamp)) -> Result<()> {
+            let reopened = Self::open_existing(root, name)?;
+            if update_directory_stamp(&self.0)? != before.0 || update_directory_stamp(&reopened.0)? != before.0 {
+                return Err(AppDataError::Io);
+            }
+            self.unchanged(".policy-lock", lock, &before.1)?;
+            reopened.unchanged(".policy-lock", lock, &before.1)?;
+            if update_directory_stamp(&self.0)? != before.0 || update_directory_stamp(&reopened.0)? != before.0 {
+                return Err(AppDataError::Io);
+            }
+            Ok(())
+        }
+        fn lock_policy_open(&self, create: bool) -> Result<File> {
             private_directory(&self.0)?;
-            let file = open_at(&self.0, ".policy-lock", libc::O_RDWR | libc::O_CREAT, 0o600)?;
-            stamp(&file)?;
+            let file = open_at(&self.0, ".policy-lock", libc::O_RDWR | if create { libc::O_CREAT } else { 0 }, 0o600)?;
+            let before = stamp(&file)?;
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(AppDataError::Io);
             }
+            self.unchanged(".policy-lock", &file, &before)?;
             Ok(file)
+        }
+        pub fn open_existing(root: &Root, key: &str) -> Result<Self> {
+            private_directory(&root.0)?;
+            let file = open_at(&root.0, key, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            private_directory(&file)?;
+            Ok(Self(file))
         }
         pub fn open(root: &Root, key: &str) -> Result<Self> {
             let dir = &root.0;
@@ -2249,6 +2530,278 @@ mod snapshot_tests {
             if m.is_dir() { let mut children: Vec<_> = fs::read_dir(path).unwrap().map(|e|e.unwrap().path()).collect(); children.sort(); for child in children { walk(&child,out); } }
         }
         let mut out=Vec::new(); walk(path,&mut out); out
+    }
+    #[test]
+    fn update_observation_preserves_missing_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        assert!(observe_private_update_read_only(&root, ID).is_err());
+        assert!(!root.exists());
+        directory(&root);
+        let before = tree(&root);
+        let baseline = observe_private_update_read_only(&root, ID).unwrap();
+        assert_eq!(baseline.schema_version, 1);
+        assert_eq!(baseline.package_id, ID);
+        assert!(!baseline.namespace_exists);
+        assert_eq!(baseline.files, None);
+        assert_eq!(tree(&root), before);
+    }
+    #[test]
+    fn update_observation_distinguishes_missing_and_empty_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data"); directory(&root);
+        let package = root.join(package_directory_name(ID)); directory(&package);
+        let before = tree(&root);
+        let missing = observe_private_update_read_only(&root, ID).unwrap();
+        assert!(missing.namespace_exists);
+        assert_eq!(missing.files, None);
+        assert_eq!(tree(&root), before);
+        directory(&package.join("files"));
+        let before = tree(&root);
+        let empty = observe_private_update_read_only(&root, ID).unwrap();
+        let digest = empty.files.unwrap();
+        assert_eq!((digest.entries, digest.bytes), (0, 0));
+        assert_eq!(empty.non_files_sha256, missing.non_files_sha256);
+        assert_eq!(tree(&root), before);
+    }
+    #[test]
+    fn update_observation_includes_nested_empty_directories() {
+        let (_temp, root, files) = fixture();
+        let plain = observe_private_update_read_only(&root, ID).unwrap();
+        directory(&files.join("中文\"目录"));
+        directory(&files.join("中文\"目录/empty"));
+        file(&files.join("中文\"目录/note"), b"beta");
+        let before = tree(&root);
+        let nested = observe_private_update_read_only(&root, ID).unwrap();
+        let digest = nested.files.as_ref().unwrap();
+        assert_eq!((digest.entries, digest.bytes), (4, 9));
+        assert_ne!(nested.files, plain.files);
+        assert_eq!(nested.non_files_sha256, plain.non_files_sha256);
+        assert_eq!(tree(&root), before);
+        fs::remove_dir(files.join("中文\"目录/empty")).unwrap();
+        assert_ne!(observe_private_update_read_only(&root, ID).unwrap().files, nested.files);
+    }
+    #[test]
+    fn update_existing_authority_never_creates_policy_or_lock() {
+        for missing in 0..6 {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("data");
+            if missing != 0 { directory(&root); }
+            if missing == 2 { directory(&root.join("system-private-storage-policy-v1")); }
+            if missing == 3 {
+                directory(&root.join("system-private-storage-policy-v1"));
+                directory(&root.join("system-public-storage-policy-v1"));
+            }
+            if missing >= 4 {
+                drop(PackageStorageAuthority::open_default_private(AppDataRoot::open(&root).unwrap()).unwrap());
+                let policy = if missing == 4 { "system-private-storage-policy-v1" } else { "system-public-storage-policy-v1" };
+                fs::remove_file(root.join(policy).join(".policy-lock")).unwrap();
+            }
+            let before = root.exists().then(|| tree(&root));
+            assert!(PackageStorageAuthority::open_update_recovery_existing(&root).is_err(), "missing case {missing}");
+            assert_eq!(root.exists().then(|| tree(&root)), before);
+        }
+    }
+    #[test]
+    fn update_observation_has_canonical_hashes_and_strict_fields() {
+        let (_temp, root, files) = fixture();
+        fs::rename(files.join("note.txt"), files.join("a")).unwrap();
+        directory(&files.join("中文\"目录"));
+        let baseline = observe_private_update_read_only(&root, ID).unwrap();
+        assert_eq!(baseline.files.as_ref().unwrap().sha256, "695cbca5446af29000369fd84a61836a0835224aa8b1bba5b03312d8573f7d33");
+        assert_eq!(baseline.non_files_sha256, "714c462ccccbf70a67fa4851e4a64832c2acd042d1716b41f2c24b42abf271a1");
+        let encoded = serde_json::to_value(&baseline).unwrap();
+        assert_eq!(encoded["namespaceExists"], true);
+        assert_eq!(serde_json::from_value::<PrivateUpdateBaseline>(encoded.clone()).unwrap(), baseline);
+        for field in ["files", "schemaVersion", "packageId", "namespaceExists", "nonFilesSha256"] {
+            let mut missing = encoded.clone(); missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<PrivateUpdateBaseline>(missing).is_err(), "missing {field}");
+        }
+        let mut unknown = encoded.clone(); unknown["unknown"] = true.into();
+        assert!(serde_json::from_value::<PrivateUpdateBaseline>(unknown).is_err());
+        let raw = serde_json::to_string(&baseline).unwrap();
+        assert!(serde_json::from_str::<PrivateUpdateBaseline>(&raw.replacen('{', "{\"schemaVersion\":1,", 1)).is_err());
+        assert!(serde_json::from_str::<TreeDigest>(r#"{"entries":0,"entries":1,"bytes":0,"sha256":"x"}"#).is_err());
+        assert!(serde_json::from_str::<TreeDigest>(r#"{"entries":0,"bytes":0,"sha256":"x","other":0}"#).is_err());
+        assert_eq!(observe_private_update_read_only(&root, "../invalid"), Err(AppDataError::InvalidArgument));
+    }
+    #[test]
+    fn update_observation_keeps_non_files_content_and_empty_directories() {
+        let (_temp, root, _files) = fixture();
+        let package = root.join(package_directory_name(ID));
+        let initial = observe_private_update_read_only(&root, ID).unwrap();
+        file(&package.join("slot-1"), b"metadata");
+        directory(&package.join("empty"));
+        let before = tree(&root);
+        let changed = observe_private_update_read_only(&root, ID).unwrap();
+        assert_eq!(changed.files, initial.files);
+        assert_ne!(changed.non_files_sha256, initial.non_files_sha256);
+        assert_eq!(tree(&root), before);
+        file(&package.join(".ming-update-backup-other"), b"unexpected");
+        assert_ne!(observe_private_update_read_only(&root, ID).unwrap().non_files_sha256, changed.non_files_sha256);
+        file(&package.join(".ming-data-unknown"), b"temporary");
+        assert!(observe_private_update_read_only(&root, ID).is_err());
+    }
+    #[test]
+    fn update_observation_enforces_entries_bytes_depth_and_path_bounds() {
+        let (_temp, root, files) = fixture();
+        fs::remove_file(files.join("note.txt")).unwrap();
+        for index in 0..1024 { file(&files.join(format!("f{index}")), b""); }
+        assert_eq!(observe_private_update_read_only(&root, ID).unwrap().files.unwrap().entries, 1024);
+        file(&files.join("overflow"), b"");
+        assert!(observe_private_update_read_only(&root, ID).is_err());
+
+        let (_temp, root, files) = fixture();
+        file(&files.join("note.txt"), &vec![0; 8 * 1024 * 1024]);
+        assert_eq!(observe_private_update_read_only(&root, ID).unwrap().files.unwrap().bytes, 8 * 1024 * 1024);
+        file(&files.join("extra"), b"x");
+        assert!(observe_private_update_read_only(&root, ID).is_err());
+        fs::remove_file(files.join("extra")).unwrap();
+        file(&files.join("note.txt"), &vec![0; 8 * 1024 * 1024 + 1]);
+        assert!(observe_private_update_read_only(&root, ID).is_err());
+
+        let (_temp, root, files) = fixture();
+        let mut deepest = files.clone();
+        for _ in 0..16 { deepest.push("a"); directory(&deepest); }
+        assert!(observe_private_update_read_only(&root, ID).is_ok());
+        directory(&deepest.join("a"));
+        assert!(observe_private_update_read_only(&root, ID).is_err());
+
+        let (_temp, root, files) = fixture();
+        let mut deepest = files;
+        for _ in 0..4 { deepest.push("a".repeat(255)); directory(&deepest); }
+        assert!(observe_private_update_read_only(&root, ID).is_ok());
+        directory(&deepest.join("aa"));
+        assert!(observe_private_update_read_only(&root, ID).is_err());
+    }
+    #[test]
+    fn update_observation_low_fd_child() {
+        let Some(root) = std::env::var_os("MING_UPDATE_OBSERVER_FD_ROOT") else { return; };
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        limit.rlim_cur = 1024;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let digest = observe_private_update_read_only(Path::new(&root), ID).unwrap().files.unwrap();
+        assert_eq!(digest.entries, 1024);
+    }
+    #[test]
+    fn update_observation_accepts_1024_entries_with_1024_open_file_limit() {
+        let (_temp, root, files) = fixture();
+        fs::remove_file(files.join("note.txt")).unwrap();
+        for index in 0..1024 { file(&files.join(format!("f{index}")), b""); }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "app_data::snapshot_tests::update_observation_low_fd_child", "--nocapture"])
+            .env("MING_UPDATE_OBSERVER_FD_ROOT", &root).output().unwrap();
+        assert!(output.status.success(), "1024-entry observation under RLIMIT_NOFILE=1024 failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
+    #[test]
+    fn update_observation_rejects_links_special_files_and_unsafe_modes_without_writes() {
+        for case in 0..7 {
+            let (_temp, root, files) = fixture();
+            let package = root.join(package_directory_name(ID));
+            match case {
+                0 => symlink("note.txt", files.join("link")).unwrap(),
+                1 => fs::hard_link(files.join("note.txt"), files.join("hard")).unwrap(),
+                2 => {
+                    use std::os::unix::ffi::OsStrExt;
+                    let path = std::ffi::CString::new(files.join("fifo").as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                3 => fs::set_permissions(files.join("note.txt"), fs::Permissions::from_mode(0o644)).unwrap(),
+                4 => fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap(),
+                5 => symlink(&files, package.join("non-files-link")).unwrap(),
+                _ => { fs::rename(&files, package.join("actual")).unwrap(); symlink("actual", &files).unwrap(); }
+            }
+            let before = tree(&root);
+            assert!(observe_private_update_read_only(&root, ID).is_err(), "unsafe case {case}");
+            assert_eq!(tree(&root), before);
+        }
+    }
+    #[test]
+    fn update_observation_rejects_replacement_addition_and_deletion_during_read() {
+        for case in 0..9 {
+            let (_temp, root, files) = fixture();
+            directory(&files.join("empty"));
+            let result = platform::observe_private_update_read_only_checked(&root, ID, || {
+                match case {
+                    0 => file(&files.join("note.txt"), b"bravo"),
+                    1 => { fs::remove_file(files.join("note.txt")).unwrap(); file(&files.join("note.txt"), b"alpha"); }
+                    2 => file(&files.join("extra"), b"x"),
+                    3 => fs::remove_file(files.join("note.txt")).unwrap(),
+                    4 => { fs::remove_dir(files.join("empty")).unwrap(); directory(&files.join("empty")); }
+                    5 => { fs::rename(&files, files.with_file_name("previous")).unwrap(); directory(&files); }
+                    6 => file(&files.parent().unwrap().join("metadata"), b"x"),
+                    7 => {
+                        let package = files.parent().unwrap();
+                        fs::rename(package, package.with_file_name("replaced")).unwrap(); directory(package); directory(&files);
+                    }
+                    _ => { fs::rename(&root, root.with_file_name("replaced-root")).unwrap(); directory(&root); }
+                }
+            });
+            assert!(result.is_err(), "unstable case {case}");
+        }
+        for namespace_exists in [false, true] {
+            let temp = tempfile::tempdir().unwrap(); let root = temp.path().join("data"); directory(&root);
+            let package = root.join(package_directory_name(ID));
+            if namespace_exists { directory(&package); }
+            assert!(platform::observe_private_update_read_only_checked(&root, ID, || {
+                if !namespace_exists { directory(&package); }
+                directory(&package.join("files"));
+            }).is_err());
+        }
+    }
+    #[test]
+    fn update_existing_authority_reuses_locks_and_reads_existing_public_policy() {
+        for public_slot in 0..3 {
+            let temp = tempfile::tempdir().unwrap(); let root = temp.path().join("data"); directory(&root);
+            let authority = PackageStorageAuthority::open_default_private(AppDataRoot::open(&root).unwrap()).unwrap();
+            let before = tree(&root);
+            assert!(PackageStorageAuthority::open_update_recovery_existing(&root).is_err());
+            assert_eq!(tree(&root), before);
+            drop(authority);
+            let slot = root.join("system-public-storage-policy-v1/slot-1");
+            match public_slot { 1 => file(&slot, format!("{PUBLIC_POLICY_HEADER}{ID}\n").as_bytes()), 2 => file(&slot, b"damaged\n"), _ => {} }
+            let before = tree(&root);
+            let recovery = PackageStorageAuthority::open_update_recovery_existing(&root);
+            if public_slot == 2 { assert!(recovery.is_err()); }
+            else {
+                let recovery = recovery.unwrap();
+                assert_eq!(recovery.public_authorized.lock().unwrap().contains_key(ID), public_slot == 1);
+                assert_eq!(recovery.observe_update(ID).unwrap(), observe_private_update_read_only(&root, ID).unwrap());
+                assert!(PackageStorageAuthority::open_update_recovery_existing(&root).is_err());
+                drop(recovery);
+                assert!(PackageStorageAuthority::open_update_recovery_existing(&root).is_ok());
+            }
+            assert_eq!(tree(&root), before);
+        }
+    }
+    #[test]
+    fn update_existing_authority_rejects_replaced_policy_locks_after_acquisition() {
+        for policy in ["system-private-storage-policy-v1", "system-public-storage-policy-v1"] {
+            let temp = tempfile::tempdir().unwrap(); let root = temp.path().join("data"); directory(&root);
+            drop(PackageStorageAuthority::open_default_private(AppDataRoot::open(&root).unwrap()).unwrap());
+            let mut after_mutation = None;
+            let result = PackageStorageAuthority::open_update_recovery_existing_checked(&root, || {
+                let lock = root.join(policy).join(".policy-lock");
+                fs::remove_file(&lock).unwrap(); file(&lock, b"");
+                after_mutation = Some(tree(&root));
+            });
+            assert!(matches!(result, Err(AppDataError::Io)), "replacement accepted for {policy}");
+            assert_eq!(tree(&root), after_mutation.unwrap());
+        }
+    }
+    #[test]
+    fn update_existing_authority_rejects_policy_directory_replacement() {
+        let temp = tempfile::tempdir().unwrap(); let root = temp.path().join("data"); directory(&root);
+        drop(PackageStorageAuthority::open_default_private(AppDataRoot::open(&root).unwrap()).unwrap());
+        let result = PackageStorageAuthority::open_update_recovery_existing_checked(&root, || {
+            let policy = root.join("system-private-storage-policy-v1");
+            fs::rename(&policy, root.join("previous-policy")).unwrap();
+            directory(&policy); file(&policy.join(".policy-lock"), b"");
+        });
+        assert!(matches!(result, Err(AppDataError::Io)));
     }
     #[test]
     fn missing_components_are_not_created() {

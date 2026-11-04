@@ -245,3 +245,5 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 2026-11-04 持久更新设计准备：持久 catalog 当前仍拒绝更新，普通更新迁移的既有资格不能直接转用。新增 [持久 catalog 下的应用更新与失败恢复设计](superpowers/specs/2026-11-04-persistent-update-design.md)，保持 catalog 原字节，并定义协调记录、完整启动确认、显式中断恢复、原私有目录缺失及备份清理中断的处理；经独立源码与设计复核。设计未实现、未构建或执行 VM，持久更新和正式卸载双启动均未验收；卸载 candidate2 的 1214 项冻结输入未改变，`finalSystemAccepted=false`。
 
 2026-11-04 持久更新实施计划：在已审设计基础上新增 [九项实施与验证计划](superpowers/plans/2026-11-04-persistent-update.md)，覆盖无创建观察、原缺失数据恢复、外层协调及 inner journal、真实故障与跨进程恢复、桌面确认、独立 fixture/boot checker 和正常重启资格。计划经独立复核；其命令和预期不是实际测试结果，本阶段未实施功能或运行 VM。卸载 candidate2 的冻结源码未改变，`finalSystemAccepted=false`。
+
+2026-11-04 持久更新 Task 1（隔离工作区）：新增完整私有树只读摘要和无创建恢复 authority，区分缺失与空目录，并限制描述符占用随目录深度增长；最终核对 policy 目录和锁的名称绑定。锁替换和 soft `RLIMIT_NOFILE=1024` 下 1024 项观察均先以真实行为测试失败，再修复通过。固定 Linux、Rust 1.99.1 下最终 `app_data` 测试目标 `76 passed, 0 failed`，证据见 `artifacts/persistent-update-task1-20261104/`；完整 Host `--lib` 构建主动停止，未计为通过。观察器要求受控写者串行，不能声称任意外部并发写入下的全局原子快照。后续协调器仍须绑定公共 policy slot 原始存在性及 hash。本阶段尚未接入更新事务或完成持久更新资格，`finalSystemAccepted=false`。

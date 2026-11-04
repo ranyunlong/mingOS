@@ -57,6 +57,25 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn update_observation_preserves_missing_namespace() {
+    let f = Fixture::new();
+    let package_id = "dev.example.alpha";
+    let baseline = observe_private_update_read_only(&f.0, package_id).unwrap();
+
+    assert_eq!(baseline.schema_version, 1);
+    assert_eq!(baseline.package_id, package_id);
+    assert!(!baseline.namespace_exists);
+    assert_eq!(baseline.files, None);
+    assert_eq!(fs::read_dir(&f.0).unwrap().count(), 0);
+
+    let missing_root = f.0.join("missing-root");
+    assert!(observe_private_update_read_only(&missing_root, package_id).is_err());
+    assert!(!missing_root.exists());
+}
+
 #[test]
 fn private_file_paths_accept_normal_relative_components() {
     assert_eq!(validate_private_path("documents/报告.txt"), Ok(vec!["documents", "报告.txt"]));
