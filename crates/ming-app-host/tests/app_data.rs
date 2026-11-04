@@ -1119,6 +1119,47 @@ mod migration_tests {
             MigrationStep::RenameFile { from: "counter".into(), to: "state/counter".into() },
         ])
     }
+    fn coordinated_context(f: &MigrationFixture) -> CoordinatedPrivateUpdate {
+        CoordinatedPrivateUpdate { transaction_id: "steps-1".into(), backup_name: ".ming-update-backup-steps-1".into(), baseline: observe_private_update_read_only(&f.root.0, APP).unwrap() }
+    }
+    #[test]
+    fn coordinated_migration_copy_preserves_identical_destination_semantics() {
+        let f = MigrationFixture::new();
+        let context = coordinated_context(&f);
+        let migration = plan(vec![MigrationStep::CopyFile { from: "counter".into(), to: "copy".into() }, MigrationStep::CopyFile { from: "counter".into(), to: "copy".into() }]);
+        f.authority.prepare_coordinated_update(&context, Some(&migration)).unwrap();
+        assert_eq!(fs::read(f.package.join("files/copy")).unwrap(), b"42");
+        f.authority.rollback_coordinated_update(&context, PrivateUpdatePhase::SwappedUnconfirmed).unwrap();
+        f.assert_original_files();
+    }
+    #[test]
+    fn coordinated_migration_rename_preserves_completed_destination_semantics() {
+        let f = MigrationFixture::new();
+        let context = coordinated_context(&f);
+        let migration = plan(vec![MigrationStep::RenameFile { from: "counter".into(), to: "moved".into() }, MigrationStep::RenameFile { from: "counter".into(), to: "moved".into() }]);
+        f.authority.prepare_coordinated_update(&context, Some(&migration)).unwrap();
+        assert_eq!(fs::read(f.package.join("files/moved")).unwrap(), b"42");
+        assert!(!f.package.join("files/counter").exists());
+        f.authority.rollback_coordinated_update(&context, PrivateUpdatePhase::SwappedUnconfirmed).unwrap();
+        f.assert_original_files();
+    }
+    #[test]
+    fn coordinated_migration_applies_all_steps_and_rejects_conflicting_targets() {
+        let f = MigrationFixture::new();
+        let context = coordinated_context(&f);
+        let migration = plan(vec![MigrationStep::EnsureDir { path: "state".into() }, MigrationStep::RenameFile { from: "counter".into(), to: "state/counter".into() }, MigrationStep::CopyFile { from: "state/counter".into(), to: "state/copy".into() }, MigrationStep::DeleteFile { path: "obsolete".into() }, MigrationStep::DeleteFile { path: "obsolete".into() }]);
+        f.authority.prepare_coordinated_update(&context, Some(&migration)).unwrap();
+        assert_eq!(fs::read(f.package.join("files/state/counter")).unwrap(), b"42");
+        assert_eq!(fs::read(f.package.join("files/state/copy")).unwrap(), b"42");
+        assert!(!f.package.join("files/obsolete").exists());
+        f.authority.rollback_coordinated_update(&context, PrivateUpdatePhase::SwappedUnconfirmed).unwrap();
+        f.assert_original_files();
+        for step in [MigrationStep::CopyFile { from: "counter".into(), to: "obsolete".into() }, MigrationStep::RenameFile { from: "counter".into(), to: "obsolete".into() }, MigrationStep::EnsureDir { path: "counter/nested".into() }, MigrationStep::DeleteFile { path: "../outside".into() }] {
+            assert!(f.authority.prepare_coordinated_update(&context, Some(&plan(vec![step]))).is_err());
+            assert_eq!(observe_private_update_read_only(&f.root.0, APP).unwrap(), context.baseline);
+            f.assert_no_transaction_directories();
+        }
+    }
 
     #[test]
     fn private_migration_commit_applies_all_steps_and_removes_backup() {

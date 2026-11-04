@@ -247,3 +247,5 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 2026-11-04 持久更新实施计划：在已审设计基础上新增 [九项实施与验证计划](superpowers/plans/2026-11-04-persistent-update.md)，覆盖无创建观察、原缺失数据恢复、外层协调及 inner journal、真实故障与跨进程恢复、桌面确认、独立 fixture/boot checker 和正常重启资格。计划经独立复核；其命令和预期不是实际测试结果，本阶段未实施功能或运行 VM。卸载 candidate2 的冻结源码未改变，`finalSystemAccepted=false`。
 
 2026-11-04 持久更新 Task 1（隔离工作区）：新增完整私有树只读摘要和无创建恢复 authority，区分缺失与空目录，并限制描述符占用随目录深度增长；最终核对 policy 目录和锁的名称绑定。锁替换和 soft `RLIMIT_NOFILE=1024` 下 1024 项观察均先以真实行为测试失败，再修复通过。固定 Linux、Rust 1.99.1 下最终 `app_data` 测试目标 `76 passed, 0 failed`，证据见 `artifacts/persistent-update-task1-20261104/`；完整 Host `--lib` 构建主动停止，未计为通过。观察器要求受控写者串行，不能声称任意外部并发写入下的全局原子快照。后续协调器仍须绑定公共 policy slot 原始存在性及 hash。本阶段尚未接入更新事务或完成持久更新资格，`finalSystemAccepted=false`。
+
+2026-11-04 持久更新 Task 2（隔离工作区）：新增原私有目录缺失状态的受限回滚、已有数据备份和迁移交换、阶段约束及提交后清理。审查发现的父目录同步重入、不可达临时布局、原迁移幂等语义及已有目录丢失确认均以行为反例复现后修正。固定 Linux、Rust 1.99.1 下 `coordinated_` 定向 `22/22`、默认 features 的 `app_data` `98/98` 通过；证据见 `artifacts/persistent-update-task2-20261104/`。本阶段的 checkpoint 错误及对象重开不代表真实进程 SIGKILL；后续协调器须在持锁状态下校验原回滚阶段，并按绑定迁移和完成阶段验证新树存在性，提交后部分 backup 清理须走确认状态路径。桌面接线和持久更新资格尚未完成，`finalSystemAccepted=false`。

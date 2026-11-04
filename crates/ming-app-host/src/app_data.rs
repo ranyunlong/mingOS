@@ -243,6 +243,37 @@ pub struct PrivateMigrationTransaction {
     pub(crate) backup_name: String,
 }
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub(crate) struct CoordinatedPrivateUpdate {
+    pub transaction_id: String,
+    pub baseline: PrivateUpdateBaseline,
+    pub backup_name: String,
+}
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivateUpdatePhase { BeforeSwap, SwappedUnconfirmed, RestoringOld, CommittedCleaning }
+#[cfg(target_os = "linux")]
+impl CoordinatedPrivateUpdate {
+    fn validate(&self) -> Result<()> {
+        let valid_hash = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if self.transaction_id.is_empty() || self.transaction_id.len() > 96
+            || !self.transaction_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || self.backup_name != format!(".ming-update-backup-{}", self.transaction_id)
+            || !valid_migration_backup_name(&self.backup_name)
+            || self.baseline.schema_version != 1 || !valid_package_id(&self.baseline.package_id)
+            || !valid_hash(&self.baseline.non_files_sha256)
+            || (!self.baseline.namespace_exists && self.baseline.files.is_some())
+            || self.baseline.files.as_ref().is_some_and(|tree| tree.entries > MAX_PRIVATE_ENTRIES as u32
+                || tree.bytes > MAX_PRIVATE_TOTAL_BYTES as u64 || !valid_hash(&tree.sha256)) {
+            return Err(AppDataError::InvalidArgument);
+        }
+        Ok(())
+    }
+    fn names(&self) -> [String; 3] {
+        [self.backup_name.clone(), format!("{}.staging", self.backup_name), format!("{}.discard", self.backup_name)]
+    }
+}
+#[cfg(target_os = "linux")]
 impl AuthorizationSnapshot {
     pub(crate) fn revocation_pending(&self) -> bool { !self.generation.load(Ordering::Acquire) }
 }
@@ -366,6 +397,49 @@ impl PackageStorageAuthority {
         let _authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
         let _private = self.private.lock().map_err(|_| AppDataError::Denied)?;
         platform::observe_update_checked(&self.root.root, package_id, || {})
+    }
+    #[cfg(target_os = "linux")]
+    fn with_coordinated_target<T>(&self, context: &CoordinatedPrivateUpdate, operation: impl FnOnce(&platform::Root) -> Result<T>) -> Result<T> {
+        context.validate()?;
+        let id = &context.baseline.package_id;
+        let authorized = self.authorized.lock().map_err(|_| AppDataError::Denied)?;
+        if authorized.contains_key(id) { return Err(AppDataError::Denied); }
+        let mut private = self.private.lock().map_err(|_| AppDataError::Denied)?;
+        if let Some(entry) = private.get_mut(id) {
+            entry.sessions.retain(|session| session.strong_count() != 0);
+            if !entry.sessions.is_empty() { return Err(AppDataError::Denied); }
+        }
+        let result = operation(&self.root.root);
+        if result.is_ok() {
+            if let Some(entry) = private.remove(id) { entry.generation.store(false, Ordering::Release); }
+        }
+        result
+    }
+    /// Only the parent coordinator may call these after binding its outer and inner journals.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_coordinated_update(&self, context: &CoordinatedPrivateUpdate, migration: Option<&DataMigration>) -> Result<()> {
+        self.with_coordinated_target(context, |root| platform::prepare_coordinated(root, context, migration, &mut |_| Ok(())))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observe_coordinated_update(&self, context: &CoordinatedPrivateUpdate) -> Result<PrivateUpdateBaseline> {
+        self.with_coordinated_target(context, |root| platform::observe_coordinated(root, context))
+    }
+    /// The phase must be read and bound by the registry under the same operation mutex.
+    /// In particular, validate the original phase before persisting RollingBack.
+    /// Keep that mutex, exclusive authority and the target launch gate through the
+    /// journal write and rollback; this check is never a reusable mutation permit.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_coordinated_rollback(&self, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase) -> Result<()> {
+        self.with_coordinated_target(context, |root| platform::validate_coordinated_rollback(root, context, phase))
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn rollback_coordinated_update(&self, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase) -> Result<()> {
+        self.with_coordinated_target(context, |root| platform::rollback_coordinated(root, context, phase, &mut |_| Ok(())))
+    }
+    /// Requires the durable outer commit decision and inner StartupConfirmed state.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn finish_coordinated_update(&self, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase, confirmed: &PrivateUpdateBaseline) -> Result<()> {
+        self.with_coordinated_target(context, |root| platform::finish_coordinated(root, context, phase, confirmed, &mut |_| Ok(())))
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn open_default_private(root: AppDataRoot) -> Result<Self> {
@@ -1594,12 +1668,15 @@ mod platform {
     struct UpdateBudget { entries: usize, bytes: usize }
     impl UpdateDirectory {
         fn capture(file: File, prefix: &str, skip_files: bool, entries: &mut Vec<UpdateTreeEntry>, budget: &mut UpdateBudget) -> Result<Self> {
+            Self::capture_excluding(file, prefix, if skip_files { &["files"] } else { &[] }, entries, budget)
+        }
+        fn capture_excluding(file: File, prefix: &str, excluded: &[&str], entries: &mut Vec<UpdateTreeEntry>, budget: &mut UpdateBudget) -> Result<Self> {
             use sha2::{Digest, Sha256};
             let stamp = update_directory_stamp(&file)?;
-            let names = update_names(&file, MAX_PRIVATE_ENTRIES + usize::from(skip_files))?;
+            let names = update_names(&file, MAX_PRIVATE_ENTRIES + excluded.len())?;
             let mut children = Vec::new();
             for name in &names {
-                if skip_files && name == "files" { continue; }
+                if excluded.contains(&name.as_str()) { continue; }
                 let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
                 validate_private_path(&path).map_err(|_| AppDataError::Io)?;
                 budget.entries += 1;
@@ -1621,12 +1698,12 @@ mod platform {
                 };
                 children.push((name.clone(), node));
             }
-            if update_directory_stamp(&file)? != stamp || update_names(&file, MAX_PRIVATE_ENTRIES + 1)? != names { return Err(AppDataError::Io); }
+            if update_directory_stamp(&file)? != stamp || update_names(&file, names.len())? != names { return Err(AppDataError::Io); }
             Ok(Self { stamp, names, children })
         }
         fn verify(&self, reopened: &File) -> Result<()> {
             if update_directory_stamp(reopened)? != self.stamp
-                || update_names(reopened, MAX_PRIVATE_ENTRIES + 1)? != self.names { return Err(AppDataError::Io); }
+                || update_names(reopened, self.names.len())? != self.names { return Err(AppDataError::Io); }
             for (name, node) in &self.children {
                 let current = open_at(reopened, name, libc::O_RDONLY, 0)?;
                 match node {
@@ -1639,7 +1716,7 @@ mod platform {
                 }
             }
             if update_directory_stamp(reopened)? != self.stamp
-                || update_names(reopened, MAX_PRIVATE_ENTRIES + 1)? != self.names { return Err(AppDataError::Io); }
+                || update_names(reopened, self.names.len())? != self.names { return Err(AppDataError::Io); }
             Ok(())
         }
     }
@@ -1695,6 +1772,298 @@ mod platform {
             files: files.map(|_| update_digest(files_entries, b"ming-private-update-tree-v1\0")).transpose()?,
             non_files_sha256: update_digest(non_files_entries, b"ming-private-update-non-files-v1\0")?.sha256,
         })
+    }
+    struct CoordinatedTree { captured: UpdateDirectory, digest: TreeDigest }
+    impl CoordinatedTree {
+        fn read(directory: &Directory) -> Result<Self> {
+            let mut entries = Vec::new();
+            let captured = UpdateDirectory::capture(open_at(&directory.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?, "", false, &mut entries, &mut UpdateBudget::default())?;
+            captured.verify(&directory.0)?;
+            Ok(Self { captured, digest: update_digest(entries, b"ming-private-update-tree-v1\0")? })
+        }
+    }
+    struct CoordinatedView {
+        package: Option<Directory>,
+        files: Option<CoordinatedTree>,
+        temporary: [Option<CoordinatedTree>; 3],
+        current: PrivateUpdateBaseline,
+    }
+    fn existing_child(parent: &Directory, name: &str) -> Result<Option<Directory>> {
+        match parent.child(name, false) { Ok(child) => Ok(Some(child)), Err(AppDataError::NotFound) => Ok(None), Err(error) => Err(error) }
+    }
+    fn coordinated_view(root: &Root, context: &CoordinatedPrivateUpdate) -> Result<CoordinatedView> {
+        context.validate()?;
+        let root_stamp = stamp_root(root)?;
+        let package = match Directory::open_existing(root, &package_directory_name(&context.baseline.package_id)) {
+            Ok(package) => Some(package), Err(AppDataError::NotFound) => None, Err(error) => return Err(error),
+        };
+        let names = context.names();
+        let mut files = None;
+        let mut temporary = [None, None, None];
+        let mut entries = Vec::new();
+        if let Some(package) = &package {
+            let raw_names = update_names(&package.0, MAX_PRIVATE_ENTRIES + 4)?;
+            if raw_names.iter().any(|name| name.starts_with(".ming-update-") && !names.contains(name)) { return Err(AppDataError::Io); }
+            let excluded = ["files", names[0].as_str(), names[1].as_str(), names[2].as_str()];
+            let non_files = UpdateDirectory::capture_excluding(open_at(&package.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?, "", &excluded, &mut entries, &mut UpdateBudget::default())?;
+            files = existing_child(package, "files")?.as_ref().map(CoordinatedTree::read).transpose()?;
+            for (index, name) in names.iter().enumerate() {
+                temporary[index] = existing_child(package, name)?.as_ref().map(CoordinatedTree::read).transpose()?;
+            }
+            // Each business tree has its own quota; at most three copies may coexist.
+            let copies: Vec<_> = files.iter().chain(temporary.iter().flatten()).collect();
+            if copies.len() > 3 || copies.iter().map(|tree| tree.digest.bytes).sum::<u64>() > 3 * MAX_PRIVATE_TOTAL_BYTES as u64
+                || copies.iter().map(|tree| tree.digest.entries as usize).sum::<usize>() > 3 * MAX_PRIVATE_ENTRIES { return Err(AppDataError::Io); }
+            let reopened = Directory::open_existing(root, &package_directory_name(&context.baseline.package_id))?;
+            non_files.verify(&reopened.0)?;
+            for (name, captured) in std::iter::once(("files", files.as_ref())).chain(names.iter().zip(temporary.iter()).map(|(name, tree)| (name.as_str(), tree.as_ref()))) {
+                if let Some(tree) = captured { tree.captured.verify(&reopened.child(name, false)?.0)?; }
+            }
+        }
+        let current = PrivateUpdateBaseline { schema_version: 1, package_id: context.baseline.package_id.clone(), namespace_exists: package.is_some(),
+            files: files.as_ref().map(|tree| tree.digest.clone()), non_files_sha256: update_digest(entries, b"ming-private-update-non-files-v1\0")?.sha256 };
+        if root_stamp != stamp_root(root)? || current.non_files_sha256 != context.baseline.non_files_sha256
+            || (context.baseline.namespace_exists && !current.namespace_exists)
+            || (context.baseline.files.is_none() && temporary[0].is_some()) { return Err(AppDataError::Io); }
+        Ok(CoordinatedView { package, files, temporary, current })
+    }
+    pub(super) fn observe_coordinated(root: &Root, context: &CoordinatedPrivateUpdate) -> Result<PrivateUpdateBaseline> {
+        let view = coordinated_view(root, context)?;
+        if view.temporary[0].as_ref().is_some_and(|tree| Some(&tree.digest) != context.baseline.files.as_ref()) { return Err(AppDataError::Io); }
+        Ok(view.current)
+    }
+    fn coordinated_sync(directory: &Directory, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        checkpoint("before-sync")?;
+        directory.0.sync_all().map_err(io_error)?;
+        checkpoint("sync")
+    }
+    fn coordinated_rename(package: &Directory, from: &str, to: &str, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        checkpoint("before-rename")?;
+        package.rename_no_replace(from, package, to)?;
+        checkpoint("rename")?;
+        coordinated_sync(package, checkpoint)
+    }
+    fn coordinated_new_child(parent: &Directory, name: &str, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<Directory> {
+        let name_c = CString::new(name).map_err(|_| AppDataError::InvalidArgument)?;
+        if unsafe { libc::mkdirat(parent.0.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 { return Err(io_error(std::io::Error::last_os_error())); }
+        checkpoint("mkdir")?;
+        coordinated_sync(parent, checkpoint)?;
+        parent.child(name, false)
+    }
+    fn same_directory_identity(actual: &Stamp, expected: &Stamp) -> bool {
+        actual.dev == expected.dev && actual.ino == expected.ino && actual.mode == expected.mode && actual.uid == expected.uid
+    }
+    fn coordinated_remove_captured(parent: &Directory, name: &str, captured: &UpdateDirectory, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        let directory = parent.child(name, false)?;
+        captured.verify(&directory.0)?;
+        for (child_name, node) in &captured.children {
+            match node {
+                UpdateNode::Directory(child) => coordinated_remove_captured(&directory, child_name, child, checkpoint)?,
+                UpdateNode::File { stamp, bytes } => {
+                    checkpoint("before-unlink")?;
+                    let file = open_at(&directory.0, child_name, libc::O_RDONLY, 0)?;
+                    if stamp_private(&file)? != *stamp || update_read(&file)? != *bytes || stamp_private(&file)? != *stamp { return Err(AppDataError::Io); }
+                    directory.unchanged_private(child_name, &file, stamp)?;
+                    directory.delete(child_name)?;
+                    checkpoint("unlink")?;
+                    coordinated_sync(&directory, checkpoint)?;
+                }
+            }
+        }
+        checkpoint("before-rmdir")?;
+        let reopened = parent.child(name, false)?;
+        if !same_directory_identity(&update_directory_stamp(&reopened.0)?, &captured.stamp) || !update_names(&reopened.0, 0)?.is_empty() { return Err(AppDataError::Io); }
+        parent.remove_directory(name)?;
+        checkpoint("rmdir")?;
+        coordinated_sync(parent, checkpoint)
+    }
+    fn coordinated_remove(parent: &Directory, name: &str, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        if let Some(directory) = existing_child(parent, name)? {
+            let tree = CoordinatedTree::read(&directory)?;
+            coordinated_remove_captured(parent, name, &tree.captured, checkpoint)?;
+        }
+        Ok(())
+    }
+    fn coordinated_write(parent: &Directory, name: &str, bytes: &[u8], checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        // The unpublished staging tree uses exclusive final names, so an interrupted
+        // write leaves a bounded regular file rather than an unrecognized temp name.
+        let mut file = open_at(&parent.0, name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
+        file.write_all(bytes).map_err(io_error)?;
+        checkpoint("write")?;
+        file.sync_all().map_err(io_error)?;
+        checkpoint("file-sync")?;
+        coordinated_sync(parent, checkpoint)
+    }
+    fn coordinated_copy(captured: &UpdateDirectory, destination: &Directory, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        for (name, node) in &captured.children {
+            match node {
+                UpdateNode::Directory(child) => {
+                    let directory = coordinated_new_child(destination, name, checkpoint)?;
+                    coordinated_copy(child, &directory, checkpoint)?;
+                    coordinated_sync(&directory, checkpoint)?;
+                }
+                UpdateNode::File { bytes, .. } => coordinated_write(destination, name, bytes, checkpoint)?,
+            }
+        }
+        Ok(())
+    }
+    fn coordinated_apply(staging: &Directory, step: &MigrationStep, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        match step {
+            MigrationStep::EnsureDir { path } => {
+                let components = validate_private_path(path)?;
+                let mut current = Directory(open_at(&staging.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?);
+                for component in components {
+                    current = match existing_child(&current, component)? { Some(child) => child, None => {
+                        if staging.usage()?.1 >= MAX_PRIVATE_ENTRIES { return Err(AppDataError::Io); }
+                        coordinated_new_child(&current, component, checkpoint)?
+                    } };
+                }
+                coordinated_sync(&current, checkpoint)
+            }
+            MigrationStep::DeleteFile { path } => {
+                let (parent, name) = file_parent(staging, path)?;
+                let file = match parent.read_private_file(name) { Ok(file) => file, Err(AppDataError::NotFound) => return Ok(()), Err(error) => return Err(error) };
+                let stamp = stamp_private(&file)?;
+                checkpoint("before-unlink")?;
+                parent.unchanged_private(name, &file, &stamp)?;
+                parent.delete(name)?;
+                checkpoint("unlink")?;
+                coordinated_sync(&parent, checkpoint)
+            }
+            MigrationStep::RenameFile { from, to } => {
+                let (source, source_name) = file_parent(staging, from)?;
+                let (destination, destination_name) = file_parent(staging, to)?;
+                let file = match source.read_private_file(source_name) {
+                    Ok(file) => file,
+                    Err(AppDataError::NotFound) => { destination.read_private_file(destination_name)?; return Ok(()); }
+                    Err(error) => return Err(error),
+                };
+                let stamp = stamp_private(&file)?;
+                checkpoint("before-rename")?;
+                source.unchanged_private(source_name, &file, &stamp)?;
+                source.rename_no_replace(source_name, &destination, destination_name)?;
+                checkpoint("rename")?;
+                coordinated_sync(&source, checkpoint)?;
+                coordinated_sync(&destination, checkpoint)
+            }
+            MigrationStep::CopyFile { from, to } => {
+                let (source, source_name) = file_parent(staging, from)?;
+                let (destination, destination_name) = file_parent(staging, to)?;
+                let file = source.read_private_file(source_name)?;
+                let stamp = stamp_private(&file)?;
+                let bytes = update_read(&file)?;
+                if stamp_private(&file)? != stamp || update_read(&file)? != bytes { return Err(AppDataError::Io); }
+                source.unchanged_private(source_name, &file, &stamp)?;
+                match destination.read_private_file(destination_name) {
+                    Ok(existing) => {
+                        let before = stamp_private(&existing)?;
+                        if update_read(&existing)? != bytes || stamp_private(&existing)? != before { return Err(AppDataError::Io); }
+                        destination.unchanged_private(destination_name, &existing, &before)?;
+                        return Ok(());
+                    }
+                    Err(AppDataError::NotFound) => {}
+                    Err(error) => return Err(error),
+                }
+                let (used_bytes, used_entries) = staging.usage()?;
+                if used_entries >= MAX_PRIVATE_ENTRIES || used_bytes.checked_add(bytes.len()).ok_or(AppDataError::Io)? > MAX_PRIVATE_TOTAL_BYTES { return Err(AppDataError::Io); }
+                coordinated_write(&destination, destination_name, &bytes, checkpoint)
+            }
+        }
+    }
+    fn coordinated_remove_new_namespace(root: &Root, context: &CoordinatedPrivateUpdate, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        if !context.baseline.namespace_exists {
+            let parent = Directory(open_at(&root.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?);
+            let name = package_directory_name(&context.baseline.package_id);
+            if let Some(package) = existing_child(&parent, &name)? {
+                if !update_names(&package.0, 0)?.is_empty() { return Err(AppDataError::Io); }
+                coordinated_remove(&parent, &name, checkpoint)?;
+            } else {
+                // A prior rmdir may have completed before its root sync failed.
+                coordinated_sync(&parent, checkpoint)?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn prepare_coordinated(root: &Root, context: &CoordinatedPrivateUpdate, migration: Option<&DataMigration>, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        let view = coordinated_view(root, context)?;
+        if view.current != context.baseline || view.temporary.iter().any(Option::is_some) { return Err(AppDataError::Io); }
+        if context.baseline.files.is_none() && migration.is_none() { return Ok(()); }
+        let parent = Directory(open_at(&root.0, ".", libc::O_RDONLY | libc::O_DIRECTORY, 0)?);
+        let package = match view.package { Some(package) => package, None => coordinated_new_child(&parent, &package_directory_name(&context.baseline.package_id), checkpoint)? };
+        let names = context.names();
+        let staging = coordinated_new_child(&package, &names[1], checkpoint)?;
+        let population = (|| {
+            if let Some(files) = view.files { coordinated_copy(&files.captured, &staging, checkpoint)?; }
+            if let Some(migration) = migration {
+                for step in &migration.steps { coordinated_apply(&staging, step, checkpoint)?; CoordinatedTree::read(&staging)?; }
+            }
+            CoordinatedTree::read(&staging)?;
+            coordinated_sync(&staging, checkpoint)
+        })();
+        if let Err(error) = population {
+            coordinated_remove(&package, &names[1], checkpoint)?;
+            coordinated_remove_new_namespace(root, context, checkpoint)?;
+            return Err(error);
+        }
+        if context.baseline.files.is_some() { coordinated_rename(&package, "files", &names[0], checkpoint)?; }
+        coordinated_rename(&package, &names[1], "files", checkpoint)?;
+        observe_coordinated(root, context)?;
+        Ok(())
+    }
+    fn validate_rollback(view: &CoordinatedView, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase) -> Result<()> {
+        if phase == PrivateUpdatePhase::CommittedCleaning { return Err(AppDataError::Io); }
+        let files = view.files.is_some();
+        let backup = view.temporary[0].as_ref();
+        let staging = view.temporary[1].is_some();
+        let discard = view.temporary[2].is_some();
+        if let Some(expected) = &context.baseline.files {
+            if backup.is_some_and(|backup| &backup.digest != expected) { return Err(AppDataError::Io); }
+            // F/B/S/D: prepare F(+S) -> B+S -> F+B; rollback F+B -> B+D
+            // -> F+D -> F. RollingBack can also resume every Planned window.
+            let layout = (files, backup.is_some(), staging, discard);
+            let reachable = match phase {
+                PrivateUpdatePhase::BeforeSwap => matches!(layout, (true, false, _, false) | (false, true, true, false) | (true, true, false, false)),
+                PrivateUpdatePhase::SwappedUnconfirmed => layout == (true, true, false, false),
+                PrivateUpdatePhase::RestoringOld => matches!(layout,
+                    (true, false, false, false) | (true, false, true, false) | (true, false, false, true)
+                    | (false, true, true, false) | (true, true, false, false) | (false, true, false, true)),
+                PrivateUpdatePhase::CommittedCleaning => false,
+            };
+            if !reachable || (backup.is_none() && view.current.files.as_ref() != Some(expected)) { return Err(AppDataError::Io); }
+        } else if backup.is_some() || discard || (files && staging)
+            || (phase == PrivateUpdatePhase::SwappedUnconfirmed && staging) { return Err(AppDataError::Io); }
+        Ok(())
+    }
+    pub(super) fn validate_coordinated_rollback(root: &Root, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase) -> Result<()> {
+        validate_rollback(&coordinated_view(root, context)?, context, phase)
+    }
+    pub(super) fn rollback_coordinated(root: &Root, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        let view = coordinated_view(root, context)?;
+        validate_rollback(&view, context, phase)?;
+        let names = context.names();
+        if let Some(package) = view.package {
+            if view.temporary[0].is_some() {
+                if view.files.is_some() { coordinated_rename(&package, "files", &names[2], checkpoint)?; }
+                coordinated_rename(&package, &names[0], "files", checkpoint)?;
+            } else if context.baseline.files.is_none() { coordinated_remove(&package, "files", checkpoint)?; }
+            coordinated_remove(&package, &names[1], checkpoint)?;
+            coordinated_remove(&package, &names[2], checkpoint)?;
+            coordinated_sync(&package, checkpoint)?;
+        }
+        coordinated_remove_new_namespace(root, context, checkpoint)?;
+        if observe_update_checked(root, &context.baseline.package_id, || {})? != context.baseline { return Err(AppDataError::Io); }
+        Ok(())
+    }
+    pub(super) fn finish_coordinated(root: &Root, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase, confirmed: &PrivateUpdateBaseline, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
+        if phase != PrivateUpdatePhase::CommittedCleaning || (context.baseline.files.is_some() && confirmed.files.is_none()) { return Err(AppDataError::Io); }
+        let view = coordinated_view(root, context)?;
+        if &view.current != confirmed || view.temporary[1].is_some() || view.temporary[2].is_some() { return Err(AppDataError::Io); }
+        if let Some(package) = view.package {
+            for name in context.names() { coordinated_remove(&package, &name, checkpoint)?; }
+            coordinated_sync(&package, checkpoint)?;
+        }
+        if observe_update_checked(root, &context.baseline.package_id, || {})? != *confirmed { return Err(AppDataError::Io); }
+        Ok(())
     }
     pub fn snapshot_private_read_only(path: &Path, package_id: &str) -> Result<PrivateContentSnapshot> {
         snapshot_private_read_only_checked(path, package_id, || {})
@@ -2509,6 +2878,366 @@ mod snapshot_tests {
     use super::*;
     use std::{fs, os::unix::fs::{symlink, PermissionsExt}, path::PathBuf};
     const ID: &str = "dev.ming.install-demo";
+    fn coordinated_context(root: &Path) -> CoordinatedPrivateUpdate {
+        CoordinatedPrivateUpdate { transaction_id: "task2-1".into(), baseline: observe_private_update_read_only(root, ID).unwrap(), backup_name: ".ming-update-backup-task2-1".into() }
+    }
+    #[test]
+    fn coordinated_absent_files_trial_write_rollback_restores_absence() {
+        let (_temp, root, files) = fixture();
+        fs::remove_dir_all(&files).unwrap();
+        let package = files.parent().unwrap();
+        file(&package.join("slot-1"), b"original metadata");
+        let context = coordinated_context(&root);
+        let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap()));
+        authority.prepare_coordinated_update(&context, None).unwrap();
+        assert!(!files.exists());
+        let session = authority.default_private_session(ID, [2; 32]).unwrap();
+        session.write_file("trial", b"new nonempty content").unwrap(); drop(session);
+        authority.rollback_coordinated_update(&context, PrivateUpdatePhase::SwappedUnconfirmed).unwrap();
+        authority.rollback_coordinated_update(&context, PrivateUpdatePhase::RestoringOld).unwrap();
+        assert!(!files.exists());
+        assert_eq!(fs::read(package.join("slot-1")).unwrap(), b"original metadata");
+        assert_eq!(authority.observe_update(ID).unwrap(), context.baseline);
+    }
+    #[test]
+    fn coordinated_absent_namespace_trial_write_rollback_removes_only_created_namespace() {
+        let (_temp, root, files) = fixture();
+        fs::remove_dir_all(files.parent().unwrap()).unwrap();
+        let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap()));
+        let sibling = authority.default_private_session("dev.ming.sibling", [1; 32]).unwrap();
+        sibling.write_file("sentinel", b"sibling").unwrap();
+        authority.authorize_public(ID).unwrap();
+        let public = authority.public_session(ID).unwrap(); public.write_file("sentinel", b"public").unwrap();
+        let context = coordinated_context(&root);
+        authority.prepare_coordinated_update(&context, None).unwrap();
+        assert!(!files.parent().unwrap().exists());
+        let session = authority.default_private_session(ID, [2; 32]).unwrap();
+        session.write_file("trial", b"new content").unwrap(); drop(session);
+        authority.rollback_coordinated_update(&context, PrivateUpdatePhase::SwappedUnconfirmed).unwrap();
+        assert!(!files.parent().unwrap().exists());
+        assert_eq!(authority.observe_update(ID).unwrap(), context.baseline);
+        assert_eq!(sibling.read_file("sentinel").unwrap(), b"sibling");
+        assert_eq!(public.read_file("sentinel").unwrap(), b"public");
+    }
+    #[test]
+    fn coordinated_requires_released_sessions_before_any_mutation() {
+        let (_temp, root, _files) = fixture();
+        let context = coordinated_context(&root);
+        let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap()));
+        let session = authority.default_private_session(ID, [2; 32]).unwrap();
+        let before = tree(&root);
+        assert_eq!(authority.prepare_coordinated_update(&context, None), Err(AppDataError::Denied));
+        assert_eq!(tree(&root), before); drop(session);
+    }
+    #[test]
+    fn coordinated_existing_files_are_backed_up_even_without_migration() {
+        for empty in [false, true] {
+            let (_temp, root, files) = fixture();
+            if empty { fs::remove_file(files.join("note.txt")).unwrap(); }
+            let context = coordinated_context(&root);
+            let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap()));
+            authority.prepare_coordinated_update(&context, None).unwrap();
+            assert!(files.parent().unwrap().join(&context.backup_name).is_dir());
+            let trial = authority.default_private_session(ID, [2; 32]).unwrap();
+            trial.write_file("trial", b"new").unwrap(); drop(trial);
+            assert!(authority.observe_update(ID).is_err() || authority.observe_update(ID).unwrap() != context.baseline);
+            assert_eq!(authority.observe_coordinated_update(&context).unwrap().non_files_sha256, context.baseline.non_files_sha256);
+            authority.rollback_coordinated_update(&context, PrivateUpdatePhase::SwappedUnconfirmed).unwrap();
+            authority.rollback_coordinated_update(&context, PrivateUpdatePhase::RestoringOld).unwrap();
+            assert_eq!(authority.observe_update(ID).unwrap(), context.baseline);
+            assert!(!files.join("trial").exists());
+        }
+    }
+    #[test]
+    fn coordinated_missing_backup_is_accepted_only_in_bound_old_states() {
+        for phase in [PrivateUpdatePhase::BeforeSwap, PrivateUpdatePhase::SwappedUnconfirmed, PrivateUpdatePhase::RestoringOld, PrivateUpdatePhase::CommittedCleaning] {
+            let (_temp, root, files) = fixture();
+            let context = coordinated_context(&root);
+            let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+            let before = tree(&root);
+            let result = authority.rollback_coordinated_update(&context, phase);
+            assert_eq!(result.is_ok(), matches!(phase, PrivateUpdatePhase::BeforeSwap | PrivateUpdatePhase::RestoringOld));
+            if result.is_err() { assert_eq!(tree(&root), before); }
+            file(&files.join("note.txt"), b"newer");
+            let before = tree(&root);
+            assert!(authority.rollback_coordinated_update(&context, phase).is_err());
+            assert_eq!(tree(&root), before);
+        }
+    }
+    #[test]
+    fn coordinated_absent_migration_uses_empty_staging_and_failed_sources_restore_absence() {
+        for absent_namespace in [false, true] {
+            for step in [MigrationStep::EnsureDir { path: "new/empty".into() }, MigrationStep::CopyFile { from: "missing".into(), to: "copy".into() }, MigrationStep::RenameFile { from: "missing".into(), to: "renamed".into() }] {
+                let (_temp, root, files) = fixture();
+                fs::remove_dir_all(if absent_namespace { files.parent().unwrap() } else { &files }).unwrap();
+                let context = coordinated_context(&root);
+                let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+                let succeeds = matches!(step, MigrationStep::EnsureDir { .. });
+                let result = authority.prepare_coordinated_update(&context, Some(&DataMigration { from_version: "1.0.0".into(), steps: vec![step] }));
+                assert_eq!(result.is_ok(), succeeds);
+                if succeeds { assert!(files.join("new/empty").is_dir()); }
+                else { assert_eq!(authority.observe_update(ID).unwrap(), context.baseline); }
+                authority.rollback_coordinated_update(&context, PrivateUpdatePhase::RestoringOld).unwrap();
+                assert_eq!(authority.observe_update(ID).unwrap(), context.baseline);
+            }
+        }
+    }
+    #[test]
+    fn coordinated_commit_requires_confirmation_and_resumes_partial_backup_cleanup() {
+        let (_temp, root, files) = fixture();
+        let context = coordinated_context(&root);
+        let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+        authority.prepare_coordinated_update(&context, None).unwrap();
+        file(&files.join("note.txt"), b"trial");
+        let confirmed = authority.observe_coordinated_update(&context).unwrap();
+        let before = tree(&root);
+        assert!(authority.finish_coordinated_update(&context, PrivateUpdatePhase::SwappedUnconfirmed, &confirmed).is_err());
+        assert!(authority.finish_coordinated_update(&context, PrivateUpdatePhase::CommittedCleaning, &context.baseline).is_err());
+        assert_eq!(tree(&root), before);
+        fs::remove_file(files.parent().unwrap().join(&context.backup_name).join("note.txt")).unwrap();
+        authority.finish_coordinated_update(&context, PrivateUpdatePhase::CommittedCleaning, &confirmed).unwrap();
+        authority.finish_coordinated_update(&context, PrivateUpdatePhase::CommittedCleaning, &confirmed).unwrap();
+        assert_eq!(authority.observe_update(ID).unwrap(), confirmed);
+        assert_eq!(fs::read(files.join("note.txt")).unwrap(), b"trial");
+    }
+    #[test]
+    fn coordinated_rejects_bad_context_collisions_and_non_files_drift_before_writing() {
+        for case in 0..8 {
+            let (_temp, root, files) = fixture();
+            let mut context = coordinated_context(&root);
+            match case {
+                0 => context.transaction_id = "../escape".into(),
+                1 => context.backup_name = ".ming-update-backup-other".into(),
+                2 => context.transaction_id = "x".repeat(97),
+                3..=5 => directory(&files.parent().unwrap().join(&context.names()[case - 3])),
+                6 => file(&files.parent().unwrap().join("slot-1"), b"unexpected"),
+                _ => directory(&files.parent().unwrap().join(".ming-update-unknown")),
+            }
+            let before = tree(&root);
+            let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+            assert!(authority.prepare_coordinated_update(&context, None).is_err(), "case {case}");
+            assert_eq!(tree(&root), before);
+        }
+    }
+    #[test]
+    fn coordinated_rollback_rechecks_after_read_only_preflight() {
+        let (_temp, root, files) = fixture();
+        let context = coordinated_context(&root);
+        let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap()));
+        authority.prepare_coordinated_update(&context, None).unwrap();
+        // Production keeps the same registry operation mutex and launch gate from
+        // this read-only check through RollingBack and the mutation call.
+        let before = tree(&root);
+        authority.validate_coordinated_rollback(&context, PrivateUpdatePhase::SwappedUnconfirmed).unwrap();
+        assert_eq!(tree(&root), before);
+        let session = authority.default_private_session(ID, [2; 32]).unwrap();
+        assert_eq!(authority.rollback_coordinated_update(&context, PrivateUpdatePhase::RestoringOld), Err(AppDataError::Denied));
+        assert_eq!(tree(&root), before); drop(session);
+        file(&files.parent().unwrap().join(&context.backup_name).join("note.txt"), b"corrupt");
+        let before = tree(&root);
+        assert!(authority.rollback_coordinated_update(&context, PrivateUpdatePhase::RestoringOld).is_err());
+        assert_eq!(tree(&root), before);
+    }
+    #[test]
+    fn coordinated_prepare_every_mutation_checkpoint_recovers_old_state() {
+        for original in 0..3 {
+            let mut total = 0;
+            for stop in 0..256 {
+                if stop > total && stop > 0 { break; }
+                let (_temp, root, files) = fixture();
+                if original == 1 { fs::remove_dir_all(&files).unwrap(); }
+                if original == 2 { fs::remove_dir_all(files.parent().unwrap()).unwrap(); }
+                let context = coordinated_context(&root);
+                let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+                let migration = DataMigration { from_version: "1.0.0".into(), steps: vec![MigrationStep::EnsureDir { path: "new/empty".into() }] };
+                let mut index = 0;
+                let result = authority.with_coordinated_target(&context, |root| platform::prepare_coordinated(root, &context, Some(&migration), &mut |_| {
+                    index += 1; if stop > 0 && index == stop { Err(AppDataError::Io) } else { Ok(()) }
+                }));
+                if stop == 0 { result.unwrap(); total = index; assert!(total > 0); }
+                else { assert!(result.is_err(), "original {original}, stop {stop}"); }
+                authority.validate_coordinated_rollback(&context, PrivateUpdatePhase::BeforeSwap).unwrap();
+                drop(authority);
+                let reopened = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+                reopened.rollback_coordinated_update(&context, PrivateUpdatePhase::RestoringOld).unwrap();
+                assert_eq!(reopened.observe_update(ID).unwrap(), context.baseline, "original {original}, stop {stop}");
+            }
+        }
+    }
+    #[test]
+    fn coordinated_rollback_and_commit_resume_after_every_mutation_checkpoint() {
+        for commit in [false, true] {
+            for original in 0..3 {
+                let mut total = 0;
+                for stop in 0..256 {
+                    if stop > total && stop > 0 { break; }
+                    let (_temp, root, files) = fixture();
+                    if original == 1 { fs::remove_dir_all(&files).unwrap(); }
+                    if original == 2 { fs::remove_dir_all(files.parent().unwrap()).unwrap(); }
+                    let context = coordinated_context(&root);
+                    let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap()));
+                    authority.prepare_coordinated_update(&context, None).unwrap();
+                    let session = authority.default_private_session(ID, [2; 32]).unwrap();
+                    session.create_directory("nested").unwrap(); session.write_file("nested/trial", b"new content").unwrap(); drop(session);
+                    let confirmed = authority.observe_coordinated_update(&context).unwrap();
+                    let mut index = 0;
+                    let result = authority.with_coordinated_target(&context, |root| {
+                        let mut checkpoint = |_| { index += 1; if stop > 0 && index == stop { Err(AppDataError::Io) } else { Ok(()) } };
+                        if commit { platform::finish_coordinated(root, &context, PrivateUpdatePhase::CommittedCleaning, &confirmed, &mut checkpoint) }
+                        else { platform::rollback_coordinated(root, &context, PrivateUpdatePhase::SwappedUnconfirmed, &mut checkpoint) }
+                    });
+                    if stop == 0 { result.unwrap(); total = index; assert!(total > 0); }
+                    else { assert!(result.is_err(), "commit {commit}, original {original}, stop {stop}"); }
+                    drop(authority);
+                    let reopened = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+                    if commit {
+                        reopened.finish_coordinated_update(&context, PrivateUpdatePhase::CommittedCleaning, &confirmed).unwrap();
+                        assert_eq!(reopened.observe_update(ID).unwrap(), confirmed);
+                    } else {
+                        reopened.rollback_coordinated_update(&context, PrivateUpdatePhase::RestoringOld).unwrap();
+                        assert_eq!(reopened.observe_update(ID).unwrap(), context.baseline);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn coordinated_individual_tree_quota_allows_backup_and_rejects_copy_overflow() {
+        let (_temp, root, files) = fixture();
+        file(&files.join("note.txt"), &vec![1; MAX_PRIVATE_TOTAL_BYTES]);
+        let context = coordinated_context(&root);
+        let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+        let copy = DataMigration { from_version: "1.0.0".into(), steps: vec![MigrationStep::CopyFile { from: "note.txt".into(), to: "copy".into() }] };
+        assert!(authority.prepare_coordinated_update(&context, Some(&copy)).is_err());
+        assert_eq!(authority.observe_update(ID).unwrap(), context.baseline);
+        authority.prepare_coordinated_update(&context, None).unwrap();
+        assert_eq!(authority.observe_coordinated_update(&context).unwrap().files.unwrap().bytes, MAX_PRIVATE_TOTAL_BYTES as u64);
+        authority.rollback_coordinated_update(&context, PrivateUpdatePhase::SwappedUnconfirmed).unwrap();
+        assert_eq!(authority.observe_update(ID).unwrap(), context.baseline);
+    }
+    #[test]
+    fn coordinated_cleanup_rejects_symlinks_and_real_unlink_failure_then_retries() {
+        for unsafe_link in [false, true] {
+            let (_temp, root, files) = fixture();
+            let context = coordinated_context(&root);
+            let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+            authority.prepare_coordinated_update(&context, None).unwrap();
+            let confirmed = authority.observe_coordinated_update(&context).unwrap();
+            let backup = files.parent().unwrap().join(&context.backup_name);
+            if unsafe_link { symlink(files.join("note.txt"), backup.join("link")).unwrap(); }
+            else { fs::set_permissions(&backup, fs::Permissions::from_mode(0o500)).unwrap(); }
+            let before = tree(&root);
+            assert!(authority.finish_coordinated_update(&context, PrivateUpdatePhase::CommittedCleaning, &confirmed).is_err());
+            assert_eq!(tree(&root), before);
+            if unsafe_link { fs::remove_file(backup.join("link")).unwrap(); }
+            else { fs::set_permissions(&backup, fs::Permissions::from_mode(0o700)).unwrap(); }
+            authority.finish_coordinated_update(&context, PrivateUpdatePhase::CommittedCleaning, &confirmed).unwrap();
+            assert_eq!(authority.observe_update(ID).unwrap(), confirmed);
+        }
+    }
+    #[test]
+    fn coordinated_removed_namespace_retries_root_sync_after_interruption() {
+        let (_temp, root, files) = fixture();
+        fs::remove_dir_all(files.parent().unwrap()).unwrap();
+        let context = coordinated_context(&root);
+        let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap()));
+        let session = authority.default_private_session(ID, [2; 32]).unwrap();
+        session.write_file("trial", b"new").unwrap(); drop(session);
+        let mut removed = 0;
+        let result = authority.with_coordinated_target(&context, |root| platform::rollback_coordinated(root, &context, PrivateUpdatePhase::SwappedUnconfirmed, &mut |event| {
+            if event == "rmdir" { removed += 1; }
+            if event == "rmdir" && removed == 2 { Err(AppDataError::Io) } else { Ok(()) }
+        }));
+        assert!(result.is_err()); assert_eq!(removed, 2);
+        assert!(!files.parent().unwrap().exists()); drop(authority);
+        let reopened = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+        let mut root_sync_attempted = false;
+        let result = reopened.with_coordinated_target(&context, |root| platform::rollback_coordinated(root, &context, PrivateUpdatePhase::RestoringOld, &mut |event| {
+            if event == "before-sync" { root_sync_attempted = true; Err(AppDataError::Io) } else { Ok(()) }
+        }));
+        assert!(root_sync_attempted, "missing namespace skipped the interrupted root sync");
+        assert!(result.is_err(), "root sync failure must not report recovered");
+        reopened.rollback_coordinated_update(&context, PrivateUpdatePhase::RestoringOld).unwrap();
+        assert_eq!(reopened.observe_update(ID).unwrap(), context.baseline);
+    }
+    #[test]
+    fn coordinated_rollback_rejects_unreachable_exact_temporary_layouts_without_writes() {
+        for absent in [false, true] {
+            for phase in [PrivateUpdatePhase::BeforeSwap, PrivateUpdatePhase::SwappedUnconfirmed, PrivateUpdatePhase::RestoringOld] {
+                for discard in [false, true] {
+                    let (_temp, root, files) = fixture();
+                    if absent { fs::remove_dir_all(&files).unwrap(); }
+                    let context = coordinated_context(&root);
+                    let authority = Arc::new(PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap()));
+                    authority.prepare_coordinated_update(&context, None).unwrap();
+                    let package = files.parent().unwrap();
+                    if discard && !absent { fs::rename(&files, package.join(&context.names()[2])).unwrap(); }
+                    if absent {
+                        let session = authority.default_private_session(ID, [2; 32]).unwrap();
+                        session.write_file("trial", b"new").unwrap(); drop(session);
+                        if discard { fs::rename(&files, package.join(&context.names()[2])).unwrap(); }
+                    }
+                    directory(&package.join(&context.names()[1]));
+                    let before = tree(&root);
+                    assert!(authority.validate_coordinated_rollback(&context, phase).is_err(), "absent {absent}, phase {phase:?}, discard {discard}");
+                    assert!(authority.rollback_coordinated_update(&context, phase).is_err());
+                    assert_eq!(tree(&root), before);
+                }
+            }
+        }
+    }
+    #[test]
+    fn coordinated_finish_rejects_staging_and_discard_without_deleting_them() {
+        for temporary in [1, 2] {
+            let (_temp, root, files) = fixture();
+            let context = coordinated_context(&root);
+            let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+            authority.prepare_coordinated_update(&context, None).unwrap();
+            let confirmed = authority.observe_coordinated_update(&context).unwrap();
+            directory(&files.parent().unwrap().join(&context.names()[temporary]));
+            let before = tree(&root);
+            assert!(authority.finish_coordinated_update(&context, PrivateUpdatePhase::CommittedCleaning, &confirmed).is_err());
+            assert_eq!(tree(&root), before);
+        }
+    }
+    #[test]
+    fn coordinated_finish_rejects_disappeared_existing_files_even_with_matching_confirmation() {
+        let (_temp, root, files) = fixture();
+        let context = coordinated_context(&root);
+        let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+        authority.prepare_coordinated_update(&context, None).unwrap();
+        fs::remove_dir_all(&files).unwrap();
+        let mut impossible = context.baseline.clone(); impossible.files = None;
+        let before = tree(&root);
+        assert!(authority.finish_coordinated_update(&context, PrivateUpdatePhase::CommittedCleaning, &impossible).is_err());
+        assert_eq!(tree(&root), before);
+    }
+    #[test]
+    fn coordinated_full_non_files_budget_is_independent_of_transaction_copies() {
+        let (_temp, root, files) = fixture();
+        for index in 0..MAX_PRIVATE_ENTRIES { file(&files.parent().unwrap().join(format!("slot-{index}")), b"metadata"); }
+        let context = coordinated_context(&root);
+        let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+        authority.prepare_coordinated_update(&context, None).unwrap();
+        assert_eq!(authority.observe_coordinated_update(&context).unwrap().non_files_sha256, context.baseline.non_files_sha256);
+        authority.rollback_coordinated_update(&context, PrivateUpdatePhase::SwappedUnconfirmed).unwrap();
+        assert_eq!(authority.observe_update(ID).unwrap(), context.baseline);
+    }
+    #[test]
+    fn coordinated_absent_trial_without_writes_commits_without_creating_files() {
+        for absent_namespace in [false, true] {
+            let (_temp, root, files) = fixture();
+            fs::remove_dir_all(if absent_namespace { files.parent().unwrap() } else { &files }).unwrap();
+            let context = coordinated_context(&root);
+            let authority = PackageStorageAuthority::new(AppDataRoot::open(&root).unwrap());
+            authority.prepare_coordinated_update(&context, None).unwrap();
+            let confirmed = authority.observe_coordinated_update(&context).unwrap();
+            assert_eq!(confirmed, context.baseline);
+            authority.finish_coordinated_update(&context, PrivateUpdatePhase::CommittedCleaning, &confirmed).unwrap();
+            assert_eq!(authority.observe_update(ID).unwrap(), context.baseline);
+            assert!(!files.exists());
+        }
+    }
     fn directory(path: &Path) { fs::create_dir(path).unwrap(); fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap(); }
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
