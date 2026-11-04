@@ -253,6 +253,9 @@ pub(crate) struct CoordinatedPrivateUpdate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrivateUpdatePhase { BeforeSwap, SwappedUnconfirmed, RestoringOld, CommittedCleaning }
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CoordinatedCleanupPhase { BeforeConfirmation, Cleaning, JournalCleared }
+#[cfg(target_os = "linux")]
 impl CoordinatedPrivateUpdate {
     fn validate(&self) -> Result<()> {
         let valid_hash = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
@@ -473,6 +476,13 @@ impl PackageStorageAuthority {
     #[cfg(target_os = "linux")]
     pub(crate) fn finish_coordinated_update(&self, context: &CoordinatedPrivateUpdate, phase: PrivateUpdatePhase, confirmed: &PrivateUpdateBaseline) -> Result<()> {
         self.with_coordinated_target(context, |root| platform::finish_coordinated(root, context, phase, confirmed, &mut |_| Ok(())))
+    }
+    /// Read-only layout check; callers must retain the registry operation mutex
+    /// and launch gate until the matching mutation completes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_coordinated_cleanup(&self, context: &CoordinatedPrivateUpdate, expected: &PrivateUpdateBaseline,
+        phase: CoordinatedCleanupPhase, require_files: bool) -> Result<()> {
+        self.with_coordinated_target(context, |root| platform::validate_coordinated_cleanup(root, context, expected, phase, require_files))
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn open_default_private(root: AppDataRoot) -> Result<Self> {
@@ -1516,7 +1526,7 @@ fn key_directory_name(key: &str) -> String {
 }
 // Lowercase base32 is injective and portable on case-insensitive filesystems. The separate
 // prefix prevents collisions with legacy key directories, even for attacker-chosen identities.
-fn package_directory_name(id: &str) -> String {
+pub(crate) fn package_directory_name(id: &str) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut name = String::with_capacity(4 + (id.len() * 8).div_ceil(5));
     name.push_str("app-");
@@ -1868,6 +1878,22 @@ mod platform {
         let view = coordinated_view(root, context)?;
         if view.temporary[0].as_ref().is_some_and(|tree| Some(&tree.digest) != context.baseline.files.as_ref()) { return Err(AppDataError::Io); }
         Ok(view.current)
+    }
+    pub(super) fn validate_coordinated_cleanup(root: &Root, context: &CoordinatedPrivateUpdate, expected: &PrivateUpdateBaseline,
+        phase: CoordinatedCleanupPhase, require_files: bool) -> Result<()> {
+        let view = coordinated_view(root, context)?;
+        if view.current != *expected || (require_files && view.files.is_none())
+            || view.temporary[1..].iter().any(Option::is_some) { return Err(AppDataError::Io); }
+        match phase {
+            CoordinatedCleanupPhase::BeforeConfirmation => {
+                if view.temporary[0].as_ref().map(|tree| &tree.digest) != context.baseline.files.as_ref() { return Err(AppDataError::Io); }
+            }
+            CoordinatedCleanupPhase::Cleaning => {},
+            CoordinatedCleanupPhase::JournalCleared => {
+                if view.temporary[0].is_some() { return Err(AppDataError::Io); }
+            }
+        }
+        Ok(())
     }
     fn coordinated_sync(directory: &Directory, checkpoint: &mut impl FnMut(&'static str) -> Result<()>) -> Result<()> {
         checkpoint("before-sync")?;
