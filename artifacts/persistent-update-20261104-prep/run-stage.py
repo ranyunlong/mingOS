@@ -800,21 +800,30 @@ def inside_build(root, repo, freeze):
         MING_UPDATE_NEW_WASM=str(repo / 'artifacts/persistent-update-demo/new/main.wasm'),
         MING_UPDATE_ABSENT_WASM=str(repo / 'artifacts/persistent-update-demo/absent-write/main.wasm'),
         MING_UPDATE_FIXTURE_HELPER=str(cache / 'target/release/examples/prepare_persistent_update_fixture'))
-    tests = [
-        ('ming_desktop::persistent_update_runtime::migrated_and_absent_write_commit_only_after_real_ready_close_reap', True),
-        ('ming_desktop::persistent_update_runtime::absent_nonempty_runtime_failure_rolls_back_original_missing_namespace', True),
-        ('ming_desktop::persistent_update_runtime::killed_host_recovers_in_independent_process', True),
-        ('persistent_update::recovery_tests::real_sigkill_recovery_and_independent_strict_reopen_matrix', False),
-        ('persistent_update::recovery_tests::recovery_process_itself_is_killed_during_missing_tree_and_partial_backup_cleanup', False)]
-    for index, (test, ignored) in enumerate(tests, 1):
+    tests = []
+    for index, test in enumerate((
+        'ming_desktop::persistent_update_runtime::migrated_and_absent_write_commit_only_after_real_ready_close_reap',
+        'ming_desktop::persistent_update_runtime::absent_nonempty_runtime_failure_rolls_back_original_missing_namespace',
+        'ming_desktop::persistent_update_runtime::killed_host_recovers_in_independent_process'), 1):
+        tests.append((str(index), ['--lib', test, '-j1', '--', '--exact', '--nocapture', '--ignored'], (1, 0, 0, 0)))
+    tests += [
+        ('public', ['--test', 'persistent_update_runtime',
+            'separate_process_roles_and_real_stable_host_refuse_active_update_without_writes',
+            '-j1', '--', '--exact', '--nocapture', '--ignored', '--test-threads=1'], (1, 0, 0, 0)),
+        # All 18 recovery parents run once; the child is invoked only by its
+        # bounded SIGKILL parents and remains ignored by this outer runner.
+        ('recovery', ['--lib', 'persistent_update::recovery_tests::', '-j1', '--', '--nocapture', '--test-threads=1'], (18, 0, 1, 0))]
+    for name, arguments, expected in tests:
         command = ['cargo', '+1.99.1', 'test', '--offline', '--locked', '--release', '-p', 'ming-app-host',
-                   '--lib', test, '-j1', '--', '--exact', '--nocapture']
-        if ignored: command.append('--ignored')
-        directory = root / 'build' / ('explicit-update-%d' % index)
+                   *arguments]
+        directory = root / 'build' / ('explicit-update-' + name)
         result = execute(directory, command, 900, cwd=repo)
         if result['exitCode']: raise RuntimeError('explicit real update/recovery test failed')
-        if '1 passed; 0 failed; 0 ignored' not in (directory / 'stdout.log').read_text():
-            raise ValueError('explicit update test did not match exactly one test')
+        summaries = [line for line in (directory / 'stdout.log').read_text().splitlines() if line.startswith('test result:')]
+        summary = re.fullmatch(r'test result: ok\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored; ([0-9]+) measured; '
+                               r'[0-9]+ filtered out; finished in [0-9.]+s', summaries[0]) if len(summaries) == 1 else None
+        if summary is None or tuple(map(int, summary.groups())) != expected:
+            raise ValueError('explicit update test counts changed: ' + name)
     payload = root / 'inputs/payload'
     for name, source in [('ming-app-host', cache / 'target/release/ming-app-host'),
                          ('prepare-persistent-update-fixture', cache / 'target/release/examples/prepare_persistent_update_fixture')]:

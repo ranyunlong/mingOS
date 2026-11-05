@@ -115,6 +115,114 @@ class DriverTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'host test fixture'):
                     stage.inside_build(root,root,{'hostTestFixtures':{},'environment':{'qualificationId':'test'}})
 
+    def run_build_explicit_tests(self, work, outcomes=None):
+        stage=driver();repo=Path(work).resolve();root=repo/'prep';(root/'build').mkdir(parents=True)
+        (root/'inputs/payload').mkdir(parents=True);self.host_test_packages(stage,repo)
+        paths={'bootstrap':root/'external-inputs/bootstrap/main.wasm',
+               'old':repo/'artifacts/persistent-update-demo/old/main.wasm',
+               'new':repo/'artifacts/persistent-update-demo/new/main.wasm'}
+        for path in paths.values():path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'fixture')
+        freeze={'hostTestFixtures':stage.host_test_inputs(repo),'environment':{'qualificationId':str(repo/'qualification')},
+                'fixture':{name:{'packagedSha256':stage.sha(path)} for name,path in paths.items()}}
+        calls=[]
+        def cache_copy(source,cache,record):
+            for name in ('ming-app-host','examples/prepare_persistent_update_fixture'):
+                path=cache/'target/release'/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'executable')
+        def execute(directory,command,timeout,*,cwd=None):
+            calls.append((command,dict(os.environ),directory,timeout,cwd));directory.mkdir()
+            recovery='persistent_update::recovery_tests::' in command
+            stdout='test result: ok. 18 passed; 0 failed; 1 ignored; 0 measured; 200 filtered out; finished in 0.01s\n' if recovery else \
+                   'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.01s\n'
+            stdout,exit_code=(outcomes or {}).get(directory.name,(stdout,0))
+            (directory/'stdout.log').write_text(stdout)
+            return {'exitCode':exit_code}
+        class PayloadReady(Exception):pass
+        with mock.patch.dict(os.environ),mock.patch.object(stage,'copy_build_cache',side_effect=cache_copy), \
+             mock.patch.object(stage,'execute',side_effect=execute), \
+             mock.patch.object(stage,'review_from_payload',side_effect=PayloadReady):
+            try:stage.inside_build(root,repo,freeze)
+            except (PayloadReady,RuntimeError,ValueError) as error:return calls,root,error,PayloadReady
+        self.fail('build must stop at the controlled payload boundary')
+
+    def test_build_runs_exact_ignored_public_integration_with_ready_worker_and_fixtures(self):
+        with tempfile.TemporaryDirectory() as work:
+            calls,root,error,ready=self.run_build_explicit_tests(work)
+            public=[call for call in calls if '--test' in call[0]]
+            self.assertEqual(len(public),1,'ignored public integration must run explicitly')
+            command,environment,directory,timeout,cwd=public[0]
+            self.assertEqual(command,['cargo','+1.99.1','test','--offline','--locked','--release','-p','ming-app-host',
+                '--test','persistent_update_runtime','separate_process_roles_and_real_stable_host_refuse_active_update_without_writes',
+                '-j1','--','--exact','--nocapture','--ignored','--test-threads=1'])
+            self.assertEqual(calls.index(public[0]),8,'all five Cargo prerequisites and three real controller checks run first')
+            self.assertEqual(cwd,Path(work).resolve());self.assertEqual(timeout,900)
+            for name in ('MING_TEST_PRIVATE_WORKER','MING_UPDATE_FIXTURE_HELPER','MING_UPDATE_BOOTSTRAP_WASM',
+                         'MING_UPDATE_OLD_WASM','MING_UPDATE_NEW_WASM'):
+                self.assertTrue(Path(environment[name]).is_file(),name)
+            self.assertIsInstance(error,ready)
+            self.assertTrue((root/'inputs/payload/ming-app-host').is_file())
+
+    def test_build_stops_before_payload_for_failed_or_unexecuted_public_integration(self):
+        passed='test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
+        cases=[('nonzero',passed,101,RuntimeError),
+               ('zero matches',passed.replace('1 passed','0 passed'),0,ValueError),
+               ('ignored',passed.replace('1 passed','0 passed').replace('0 ignored','1 ignored'),0,ValueError),
+               ('failed',passed.replace('ok. 1 passed; 0 failed','FAILED. 0 passed; 1 failed'),0,ValueError),
+               ('eleven passed',passed.replace('1 passed','11 passed'),0,ValueError),
+               ('duplicate summaries',passed+passed,0,ValueError),('missing summary','running 0 tests\n',0,ValueError)]
+        for name,stdout,exit_code,expected in cases:
+            with self.subTest(name=name),tempfile.TemporaryDirectory() as work:
+                calls,root,error,_=self.run_build_explicit_tests(work,{'explicit-update-public':(stdout,exit_code)})
+                self.assertIsInstance(error,expected)
+                self.assertEqual(len(calls),9)
+                self.assertEqual(list((root/'inputs/payload').iterdir()),[])
+
+    def test_build_runs_complete_recovery_parent_matrix_once_serially(self):
+        with tempfile.TemporaryDirectory() as work:
+            calls,root,error,ready=self.run_build_explicit_tests(work)
+            recovery=[call for call in calls if any('persistent_update::recovery_tests' in part for part in call[0])]
+            self.assertEqual(len(recovery),1,'complete matrix replaces duplicate exact recovery parents')
+            command,_,directory,timeout,cwd=recovery[0]
+            self.assertEqual(command,['cargo','+1.99.1','test','--offline','--locked','--release','-p','ming-app-host',
+                '--lib','persistent_update::recovery_tests::','-j1','--','--nocapture','--test-threads=1'])
+            self.assertEqual(calls.index(recovery[0]),9);self.assertEqual(len(calls),10)
+            self.assertEqual(cwd,Path(work).resolve());self.assertEqual(timeout,900)
+            controllers=[call for call in calls if any(part.startswith('ming_desktop::persistent_update_runtime::') for part in call[0])]
+            self.assertEqual([call[0][9] for call in controllers],[
+                'ming_desktop::persistent_update_runtime::migrated_and_absent_write_commit_only_after_real_ready_close_reap',
+                'ming_desktop::persistent_update_runtime::absent_nonempty_runtime_failure_rolls_back_original_missing_namespace',
+                'ming_desktop::persistent_update_runtime::killed_host_recovers_in_independent_process'])
+            for command,_,_,timeout,_ in controllers:
+                self.assertIn('--exact',command);self.assertIn('--ignored',command);self.assertEqual(timeout,900)
+            for command,_,_,timeout,_ in calls[:5]:
+                self.assertTrue({'--offline','--locked','--release','-j1'}<=set(command));self.assertEqual(timeout,1800)
+            self.assertIsInstance(error,ready)
+
+    def test_build_stops_for_incomplete_or_changed_recovery_matrix(self):
+        passed='test result: ok. 18 passed; 0 failed; 1 ignored; 0 measured; 200 filtered out; finished in 0.01s\n'
+        cases=[('nonzero',passed,101,RuntimeError),('missing summary','',0,ValueError),
+               ('zero matches',passed.replace('18 passed','0 passed').replace('1 ignored','0 ignored'),0,ValueError),
+               ('missing parent',passed.replace('18 passed','17 passed'),0,ValueError),
+               ('additional parent',passed.replace('18 passed','19 passed'),0,ValueError),
+               ('missing child',passed.replace('1 ignored','0 ignored'),0,ValueError),
+               ('extra ignored',passed.replace('1 ignored','2 ignored'),0,ValueError),
+               ('failed',passed.replace('ok. 18 passed; 0 failed','FAILED. 17 passed; 1 failed'),0,ValueError),
+               ('measured',passed.replace('0 measured','1 measured'),0,ValueError),
+               ('duplicate summaries',passed+passed,0,ValueError)]
+        for name,stdout,exit_code,expected in cases:
+            with self.subTest(name=name),tempfile.TemporaryDirectory() as work:
+                calls,root,error,_=self.run_build_explicit_tests(work,{'explicit-update-recovery':(stdout,exit_code)})
+                self.assertIsInstance(error,expected);self.assertEqual(len(calls),10)
+                self.assertEqual(list((root/'inputs/payload').iterdir()),[])
+
+    def test_build_rejects_misleading_controller_test_summaries(self):
+        passed='test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.01s\n'
+        for stdout in (passed.replace('1 passed','11 passed'),passed+passed,
+                       passed.replace('0 measured','1 measured')):
+            with self.subTest(stdout=stdout),tempfile.TemporaryDirectory() as work:
+                calls,root,error,_=self.run_build_explicit_tests(work,{'explicit-update-1':(stdout,0)})
+                self.assertIsInstance(error,ValueError);self.assertEqual(len(calls),6)
+                self.assertEqual(list((root/'inputs/payload').iterdir()),[])
+
     def test_host_test_export_preserves_exact_frozen_packages_and_build_provenance(self):
         with tempfile.TemporaryDirectory() as work:
             stage=driver();repo=Path(work).resolve();self.host_test_packages(stage,repo)
