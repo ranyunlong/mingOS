@@ -1,5 +1,7 @@
 """Driver contracts: no Docker, VM, disk or paid calls are executed by these tests."""
 import importlib.util
+import copy
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,6 +15,135 @@ def driver():
 
 
 class DriverTests(unittest.TestCase):
+    def host_test_packages(self, stage, repo):
+        task='artifacts/persistent-update-regression-fixtures-20261105'
+        sources=['settings.gradle.kts','build.gradle.kts','gradle.properties',
+                 'gradle/wrapper/gradle-wrapper.jar','gradle/wrapper/gradle-wrapper.properties',
+                 'scripts/wasm-sdk-adapter.mjs','probes/compose-wasi/port/wasm-imports.mjs',
+                 'ming-sdk/src/Test.kt','ming-compose/src/Test.kt','probes/compose-frame/coroutines-port/Test.kt']
+        for sample in ('image-viewer','read-file'):
+            sources += ['samples/'+sample+'/app.json','samples/'+sample+'/src/Main.kt']
+        for name in sources:
+            path=repo/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(name)
+        for sample,sdk in [('image-viewer',2),('read-file',1)]:
+            stage.write(repo/'samples'/sample/'app.json',{'schemaVersion':1,'id':'dev.ming.'+sample,
+                        'version':'0.1.0','sdkVersion':sdk,'entry':'main.wasm'},exclusive=False)
+        result={}
+        for sample,sdk in [('image-viewer',2),('read-file',1)]:
+            directory=repo/'artifacts'/sample;directory.mkdir(parents=True)
+            manifest={'schemaVersion':1,'id':'dev.ming.'+sample,'version':'0.1.0','sdkVersion':sdk,'entry':'main.wasm'}
+            stage.write(directory/'app.json',manifest)
+            (repo/'samples'/sample/'app.json').write_bytes((directory/'app.json').read_bytes())
+            for name in ('compiler.wasm','main.wasm'):(directory/name).write_bytes(b'\x00asm\x01\x00\x00\x00')
+            info={'kotlin':'2.3.20','adapterVersion':1,'rawSha256':stage.sha(directory/'compiler.wasm'),
+                  'packagedSha256':stage.sha(directory/'main.wasm'),'imports':[],'exports':[],
+                  'rewrites':[{'from':'wasi_snapshot_preview1.random_get','to':'ming_v2.random_fill'}] if sdk==2 else []}
+            stage.write(directory/'build-info.json',info)
+            evidence={}
+            for name in ('source-freeze.json','toolchain.json','network/profile.sb',sample+'/stdout.log',sample+'/stderr.log'):
+                path=repo/task/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(name)
+                if name=='source-freeze.json':stage.write(path,{'sourceCommit':'a'*40,'files':{source:stage.sha(repo/source) for source in sources}},exclusive=False)
+                evidence[str(path.relative_to(repo))]=stage.sha(path)
+            receipt={'schemaVersion':1,'status':'passed','sample':sample,'offline':True,'compilerExitCode':0,
+                     'sourceCommit':'a'*40,'rebuiltFromFrozenSource':True,'rebuiltThisQualification':False,
+                     'rawToPackageReplayVerified':True,'abiValidatedAgainstCurrentEngine':True,
+                     'sourceFreezePath':task+'/source-freeze.json','sourceFreezeSha256':evidence[task+'/source-freeze.json'],
+                     'stdoutPath':task+'/'+sample+'/stdout.log','stdoutSha256':evidence[task+'/'+sample+'/stdout.log'],
+                     'stderrPath':task+'/'+sample+'/stderr.log','stderrSha256':evidence[task+'/'+sample+'/stderr.log'],
+                     'inputSha256':{name:stage.sha(repo/name) for name in sources},'evidenceSha256':evidence,
+                     'manifestSha256':stage.sha(directory/'app.json'),'package':info,
+                     'command':['java','--offline','--rerun-tasks','--no-build-cache',':'+sample+':compileProductionExecutableKotlinWasmWasi'],
+                     'network':{'platform':'darwin','nonLoopbackDenied':True,'loopbackAllowed':True,
+                                'profileSha256':evidence[task+'/network/profile.sb'],'pythonProbeExitCode':0,'javaProbeExitCode':0},
+                     'toolchainEvidence':{'path':task+'/toolchain.json','sha256':evidence[task+'/toolchain.json']}}
+            stage.write(directory/'build-receipt.json',receipt);result[sample]=receipt
+        return result
+
+    def test_host_test_packages_are_required_at_both_production_test_paths(self):
+        with tempfile.TemporaryDirectory() as work:
+            stage=driver();repo=Path(work).resolve();self.host_test_packages(stage,repo)
+            self.assertTrue(hasattr(stage,'host_test_inputs'),'driver must preflight the real all-targets fixtures')
+            value=stage.host_test_inputs(repo)
+            self.assertEqual(set(value),{'image-viewer','read-file'})
+            (repo/'artifacts/read-file/main.wasm').unlink()
+            with self.assertRaisesRegex(ValueError,'host test fixture'):stage.host_test_inputs(repo)
+
+    def test_host_test_package_bytes_sources_receipts_and_links_are_bound(self):
+        with tempfile.TemporaryDirectory() as work:
+            stage=driver();repo=Path(work).resolve();receipts=self.host_test_packages(stage,repo)
+            self.assertTrue(hasattr(stage,'host_test_inputs'),'driver must validate all-targets fixture provenance')
+            stage.host_test_inputs(repo)
+            directory=repo/'artifacts/image-viewer'
+            for name in ('main.wasm','app.json','build-info.json'):
+                path=directory/name;original=path.read_bytes()
+                if name=='build-info.json':stage.write(path,dict(stage.read(path),adapterVersion=99),exclusive=False)
+                else:path.write_bytes(original+b' ')
+                with self.assertRaises(ValueError,msg=name):stage.host_test_inputs(repo)
+                path.write_bytes(original)
+            for key,value in [('offline',False),('compilerExitCode',False),('rebuiltFromFrozenSource',False),
+                              ('rawToPackageReplayVerified',False),('abiValidatedAgainstCurrentEngine',False),
+                              ('inputSha256',{}),('evidenceSha256',{}),('sourceFreezeSha256','b'*64)]:
+                receipt=copy.deepcopy(receipts['image-viewer']);receipt[key]=value
+                stage.write(directory/'build-receipt.json',receipt,exclusive=False)
+                with self.assertRaises(ValueError,msg=key):stage.host_test_inputs(repo)
+            stage.write(directory/'build-receipt.json',receipts['image-viewer'],exclusive=False)
+            source=repo/'ming-sdk/src/Test.kt';source.write_text('changed')
+            with self.assertRaises(ValueError):stage.host_test_inputs(repo)
+            source.write_text('ming-sdk/src/Test.kt')
+            extra=directory/'extra.wasm';extra.write_bytes(b'extra')
+            with self.assertRaises(ValueError):stage.host_test_inputs(repo)
+            extra.unlink();path=directory/'main.wasm';raw=path.read_bytes();path.unlink()
+            path.symlink_to(directory/'compiler.wasm')
+            with self.assertRaises(ValueError):stage.host_test_inputs(repo)
+            path.unlink();path.write_bytes(raw);os.link(path,directory/'linked')
+            with self.assertRaises(ValueError):stage.host_test_inputs(repo)
+
+    def test_source_freeze_includes_host_test_packages_and_external_build_evidence(self):
+        with tempfile.TemporaryDirectory() as work:
+            stage,repo,prep=self.preparation_repo(work);self.host_test_packages(stage,repo)
+            captured=stage.capture_source(repo,prep)
+            self.assertIn('artifacts/image-viewer/main.wasm',captured)
+            self.assertIn('artifacts/read-file/main.wasm',captured)
+            self.assertIn('artifacts/persistent-update-regression-fixtures-20261105/image-viewer/stdout.log',captured)
+            path=repo/'artifacts/read-file/main.wasm';path.write_bytes(path.read_bytes()+b'changed')
+            with self.assertRaisesRegex(ValueError,'source changed'):stage.verify_source_files({'files':captured},repo,prep)
+
+    def test_build_preflight_rejects_missing_host_test_fixture_before_cache_copy(self):
+        with tempfile.TemporaryDirectory() as work:
+            stage=driver();root=Path(work).resolve();(root/'build').mkdir();(root/'inputs/payload').mkdir(parents=True)
+            with mock.patch.object(stage,'copy_build_cache',side_effect=AssertionError('cache copy ran before fixture preflight')):
+                with self.assertRaisesRegex(ValueError,'host test fixture'):
+                    stage.inside_build(root,root,{'hostTestFixtures':{},'environment':{'qualificationId':'test'}})
+
+    def test_host_test_export_preserves_exact_frozen_packages_and_build_provenance(self):
+        with tempfile.TemporaryDirectory() as work:
+            stage=driver();repo=Path(work).resolve();self.host_test_packages(stage,repo)
+            self.assertTrue(hasattr(stage,'export_host_test_inputs'),'offline export must retain real Kotlin build evidence')
+            names={str(path.relative_to(repo)) for path in (repo/'artifacts').rglob('*') if path.is_file()}
+            freeze={'hostTestFixtures':stage.host_test_inputs(repo),'files':{name:stage.sha(repo/name) for name in names}}
+            output=repo/'export';output.mkdir();stage.export_host_test_inputs(repo,freeze,output,[])
+            copied=stage.file_hashes(output/'host-test-inputs')
+            self.assertEqual(set(copied),names|{'manifest.json'})
+            self.assertEqual(stage.read(output/'host-test-inputs/manifest.json')['files'],freeze['files'])
+            self.assertEqual((output/'host-test-inputs/artifacts/read-file/main.wasm').read_bytes(),b'\x00asm\x01\x00\x00\x00')
+            missing=repo/'missing';missing.mkdir();del freeze['files']['artifacts/read-file/main.wasm']
+            with self.assertRaisesRegex(ValueError,'frozen host test input'):stage.export_host_test_inputs(repo,freeze,missing,[])
+            self.assertFalse((missing/'host-test-inputs').exists())
+
+    def test_host_test_export_rejects_source_change_during_copy_before_writing_manifest(self):
+        with tempfile.TemporaryDirectory() as work:
+            stage=driver();repo=Path(work).resolve();self.host_test_packages(stage,repo)
+            names={str(path.relative_to(repo)) for path in (repo/'artifacts').rglob('*') if path.is_file()}
+            freeze={'hostTestFixtures':stage.host_test_inputs(repo),'files':{name:stage.sha(repo/name) for name in names}}
+            output=repo/'export';output.mkdir();copy_regular=stage.copy_regular
+            def replace_then_copy(source,target,excluded):
+                if source==repo/'artifacts/read-file/main.wasm':source.write_bytes(b'changed between validation and copy')
+                copy_regular(source,target,excluded)
+            with mock.patch.object(stage,'copy_regular',side_effect=replace_then_copy):
+                with self.assertRaisesRegex(ValueError,'host test input changed during export'):
+                    stage.export_host_test_inputs(repo,freeze,output,[])
+            self.assertFalse((output/'host-test-inputs/manifest.json').exists())
+
     def preparation_repo(self, work):
         stage=driver();repo=Path(work).resolve()/'repo';repo.mkdir()
         (repo/'.gitignore').write_text('artifacts/\n')
@@ -48,9 +179,9 @@ class DriverTests(unittest.TestCase):
                     'runtime':{},'budget':stage.execution_budget(*stage.input_contracts()),'inputs':inputs,
                     'checker':{'path':str((prep/'verify-persistent-update-evidence.py').relative_to(repo)),
                                'sha256':stage.sha(prep/'verify-persistent-update-evidence.py')},
-                    'fixture':{},'finalSystemAccepted':False}
+                    'fixture':{},'hostTestFixtures':{},'finalSystemAccepted':False}
             stage.write(prep/'freeze.json',freeze)
-            with mock.patch.object(stage,'fixture_inputs',return_value={}),mock.patch.object(stage,'validate_runtime_inputs'):
+            with mock.patch.object(stage,'fixture_inputs',return_value={}),mock.patch.object(stage,'host_test_inputs',return_value={}),mock.patch.object(stage,'validate_runtime_inputs'):
                 self.assertEqual(stage.verify_freeze(prep,repo),freeze)
                 mapped=Path(work).resolve()/'mapped-prep';mapped.symlink_to(prep,target_is_directory=True)
                 self.assertEqual(stage.verify_freeze(mapped,repo),freeze)
@@ -209,13 +340,17 @@ class DriverTests(unittest.TestCase):
             for name in stage.REPLAY_MODULES:
                 path=root/'scripts/boot'/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(name)
                 frozen['scripts/boot/'+name]=stage.sha(path)
+            self.host_test_packages(stage,root)
+            for path in (root/'artifacts').rglob('*'):
+                if path.is_file():frozen[str(path.relative_to(root))]=stage.sha(path)
             inputs={}
             for number in (1,2):
                 path=root/'inputs'/('input-boot%d.json'%number);path.write_text('{}')
                 inputs['boot%dSha256'%number]=stage.sha(path)
-            stage.inside_export(root,root,{'environment':{'workRoot':str(backing)},'files':frozen,'inputs':inputs})
+            stage.inside_export(root,root,{'environment':{'workRoot':str(backing)},'files':frozen,'inputs':inputs,
+                                         'hostTestFixtures':stage.host_test_inputs(root)})
             output=root/'export-stage/export'
-            for name in ('inputs','bundle','fixture','pair','build-evidence','external-inputs','admission','stage-evidence'):
+            for name in ('inputs','bundle','fixture','pair','build-evidence','external-inputs','admission','stage-evidence','host-test-inputs'):
                 self.assertTrue((output/name).is_dir(),name)
             self.assertEqual((output/'fixture/command.json').read_bytes(),original)
             self.assertEqual((output/'inputs/session-review.json').read_bytes(),(root/'review.json').read_bytes())

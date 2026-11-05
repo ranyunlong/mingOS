@@ -29,6 +29,11 @@ STAGES = ('prepare', 'build', 'bundle', 'admission', 'pair', 'export', 'verify')
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 REPLAY_MODULES = ('bootlib.py', 'infra.py', 'persistent_update_receipt.py', 'wayland_receipt.py',
                   'bundle.py', 'isolation_profiles.py', 'payload_profiles.py')
+HOST_TEST_SAMPLES = {'image-viewer': 2, 'read-file': 1}
+HOST_TEST_FILES = {'compiler.wasm', 'main.wasm', 'app.json', 'build-info.json', 'build-receipt.json'}
+HOST_TEST_EVIDENCE = 'artifacts/persistent-update-regression-fixtures-20261105/'
+HOST_TEST_FILE_LIMIT = 8 * 1024 * 1024
+HOST_TEST_TOTAL_LIMIT = 32 * 1024 * 1024
 
 
 def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -332,6 +337,14 @@ def source_names(repo, root):
     # Build receipts include ignored Kotlin runtime and adapter inputs too.
     for receipt in (repo / 'artifacts/persistent-update-demo').glob('*/build-receipt.json'):
         names.update(read(receipt).get('inputSha256', {}))
+    # These real Kotlin packages are hardcoded inputs of unignored Host tests.
+    # Keep them outside the guest payload, but inside the source byte freeze.
+    for sample in HOST_TEST_SAMPLES:
+        directory = repo / 'artifacts' / sample
+        if not directory.exists(): continue
+        names.update(str((directory / name).relative_to(repo)) for name in file_hashes(directory))
+        receipt = read(directory / 'build-receipt.json')
+        for field in ('inputSha256', 'evidenceSha256'): names.update(receipt.get(field, {}))
     for directory in ('.cargo', 'crates', 'scripts', 'samples', 'ming-sdk', 'ming-compose', 'third_party', 'gradle'):
         base = repo / directory
         if not base.exists(): continue
@@ -386,6 +399,122 @@ def validate_geometry(receipt, repo, stdout_path=None):
         lines = [matched.group(1) for line in raw.splitlines() if (matched := re.fullmatch(pattern,line))]
         if len(lines) != 1 or strict_json(lines[0]) != geometry or b'1 passed; 0 failed; 0 ignored' not in raw:
             raise ValueError('geometry raw test output mismatch')
+
+
+def host_test_source_names(repo, sample):
+    names = {'settings.gradle.kts', 'build.gradle.kts', 'gradle.properties',
+             'gradle/wrapper/gradle-wrapper.jar', 'gradle/wrapper/gradle-wrapper.properties',
+             'scripts/wasm-sdk-adapter.mjs', 'probes/compose-wasi/port/wasm-imports.mjs'}
+    excluded = {'build', 'builds', '.gradle', '.kotlin', '.git', '.cache', '__pycache__', 'node_modules'}
+    for name in ('samples/' + sample, 'ming-sdk', 'ming-compose', 'probes/compose-wasi/port',
+                 'probes/compose-frame/coroutines-port'):
+        directory = relative(repo, name)
+        if not directory.is_dir(): raise ValueError('host test fixture source directory missing: ' + name)
+        for parent, children, files in os.walk(directory, followlinks=False):
+            children[:] = [child for child in children if child not in excluded]
+            names.update(str((Path(parent) / child).relative_to(repo)) for child in files)
+    return names
+
+
+def host_test_inputs(repo):
+    """Verify the two real Kotlin packages before allocating/copying a build cache."""
+    result, retained = {}, {}
+    for sample, sdk in HOST_TEST_SAMPLES.items():
+        directory = relative(repo, 'artifacts/' + sample)
+        if not directory.is_dir(): raise ValueError('missing real host test fixture: ' + sample)
+        files = file_hashes(directory)
+        if set(files) != HOST_TEST_FILES: raise ValueError('host test fixture file set: ' + sample)
+        retained.update({str((directory / name).relative_to(repo)): (directory / name).stat().st_size for name in files})
+        if any(size > HOST_TEST_FILE_LIMIT for size in retained.values()): raise ValueError('host test fixture file budget')
+        receipt, info, manifest = (read(directory / name) for name in ('build-receipt.json', 'build-info.json', 'app.json'))
+        if any(not isinstance(value, dict) for value in (receipt, info, manifest)): raise ValueError('host test fixture JSON objects required')
+        if (type(receipt.get('schemaVersion')) is not int or receipt['schemaVersion'] != 1
+                or receipt.get('status') != 'passed' or receipt.get('sample') != sample
+                or receipt.get('offline') is not True or type(receipt.get('compilerExitCode')) is not int
+                or receipt['compilerExitCode'] != 0 or receipt.get('rebuiltFromFrozenSource') is not True
+                or receipt.get('rawToPackageReplayVerified') is not True or receipt.get('abiValidatedAgainstCurrentEngine') is not True
+                or receipt.get('rebuiltThisQualification') is not False):
+            raise ValueError('host test fixture real offline compiler receipt: ' + sample)
+        command = receipt.get('command')
+        if (not isinstance(command, list) or any(not isinstance(arg, str) for arg in command)
+                or not {'--offline', '--rerun-tasks', '--no-build-cache', ':' + sample + ':compileProductionExecutableKotlinWasmWasi'} <= set(command)):
+            raise ValueError('host test fixture compiler command: ' + sample)
+        inputs, evidence = receipt.get('inputSha256'), receipt.get('evidenceSha256')
+        if (not isinstance(inputs, dict) or not host_test_source_names(repo, sample) <= set(inputs)
+                or not isinstance(evidence, dict) or not evidence
+                or any(not name.startswith(HOST_TEST_EVIDENCE) for name in evidence) or set(inputs) & set(evidence)):
+            raise ValueError('host test fixture source/evidence set: ' + sample)
+        for name, expected in {**inputs, **evidence}.items():
+            if not isinstance(expected, str) or not HEX.fullmatch(expected): raise ValueError('host test fixture input hash')
+            path = relative(repo, name)
+            observed = path.lstat()
+            if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1 or sha(path) != expected:
+                raise ValueError('host test fixture input changed: ' + name)
+            if name in evidence: retained[name] = observed.st_size
+        if any(size > HOST_TEST_FILE_LIMIT for size in retained.values()) or sum(retained.values()) > HOST_TEST_TOTAL_LIMIT:
+            raise ValueError('host test fixture evidence budget')
+        for field in ('sourceFreeze', 'stdout', 'stderr'):
+            path, expected = receipt.get(field + 'Path'), receipt.get(field + 'Sha256')
+            if not isinstance(path, str) or evidence.get(path) != expected or not HEX.fullmatch(expected or ''):
+                raise ValueError('host test fixture compiler evidence binding: ' + field)
+        source_freeze = read(relative(repo, receipt['sourceFreezePath']))
+        if (not isinstance(source_freeze, dict) or not isinstance(source_freeze.get('files'), dict)
+                or not isinstance(receipt.get('sourceCommit'), str) or not re.fullmatch(r'[0-9a-f]{40}', receipt['sourceCommit'])
+                or receipt['sourceCommit'] != source_freeze.get('sourceCommit')
+                or any(source_freeze['files'].get(name) != expected for name, expected in inputs.items())):
+            raise ValueError('host test fixture frozen compiler source mismatch: ' + sample)
+        toolchain, network = receipt.get('toolchainEvidence', {}), receipt.get('network', {})
+        if (not isinstance(toolchain, dict) or set(toolchain) != {'path', 'sha256'}
+                or evidence.get(toolchain['path']) != toolchain['sha256'] or not isinstance(network, dict)
+                or network.get('platform') != 'darwin' or network.get('nonLoopbackDenied') is not True
+                or network.get('loopbackAllowed') is not True or network.get('profileSha256') not in evidence.values()
+                or any(type(network.get(key)) is not int or network[key] != 0 for key in ('pythonProbeExitCode', 'javaProbeExitCode'))):
+            raise ValueError('host test fixture toolchain/network evidence: ' + sample)
+        if (type(manifest.get('schemaVersion')) is not int or manifest['schemaVersion'] != 1 or manifest.get('id') != 'dev.ming.' + sample
+                or manifest.get('version') != '0.1.0' or type(manifest.get('sdkVersion')) is not int
+                or manifest['sdkVersion'] != sdk or manifest.get('entry') != 'main.wasm'
+                or files['app.json'] != receipt.get('manifestSha256')
+                or files['app.json'] != inputs.get('samples/' + sample + '/app.json')):
+            raise ValueError('host test fixture manifest identity/bytes: ' + sample)
+        package = receipt.get('package', {})
+        keys = ('rawSha256', 'packagedSha256', 'adapterVersion', 'rewrites', 'imports', 'exports')
+        if (not isinstance(package, dict) or any(key not in info or package.get(key) != info[key] for key in keys)
+                or info['rawSha256'] != files['compiler.wasm'] or info['packagedSha256'] != files['main.wasm']
+                or type(info['adapterVersion']) is not int or info['adapterVersion'] != 1
+                or info['rewrites'] != ([{'from':'wasi_snapshot_preview1.random_get', 'to':'ming_v2.random_fill'}] if sdk == 2 else [])
+                or not isinstance(info['imports'], list) or not isinstance(info['exports'], list)
+                or (sdk == 1 and files['compiler.wasm'] != files['main.wasm'])):
+            raise ValueError('host test fixture raw/package provenance: ' + sample)
+        if any(not isinstance(row, dict) or row.get('module') not in ('ming_v1', 'ming_v2') for row in info['imports']):
+            raise ValueError('host test fixture forbidden non-SDK import: ' + sample)
+        for name in ('compiler.wasm', 'main.wasm'):
+            if (directory / name).read_bytes()[:8] != b'\x00asm\x01\x00\x00\x00': raise ValueError('host test fixture Wasm bytes required')
+        result[sample] = {'path': 'artifacts/' + sample, 'files': files,
+                          'buildProvenance': 'current-worktree-offline-kotlin', 'rebuiltThisQualification': False}
+    return result
+
+
+def export_host_test_inputs(repo, freeze, output, excluded):
+    fixtures = host_test_inputs(repo)
+    if fixtures != freeze['hostTestFixtures']: raise ValueError('host test fixture bytes/provenance changed')
+    names = set()
+    for sample in HOST_TEST_SAMPLES:
+        directory = 'artifacts/' + sample
+        names.update(directory + '/' + filename for filename in HOST_TEST_FILES)
+        names.update(read(repo / directory / 'build-receipt.json')['evidenceSha256'])
+    files = {}
+    for name in sorted(names):
+        expected = freeze['files'].get(name)
+        if expected is None or sha(relative(repo, name)) != expected: raise ValueError('frozen host test input missing/changed: ' + name)
+        files[name] = expected
+    target = output / 'host-test-inputs'
+    target.mkdir()
+    for name in files:
+        destination = target / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        copy_regular(relative(repo, name), destination, excluded)
+        if sha(destination) != files[name]: raise ValueError('frozen host test input changed during export: ' + name)
+    write(target / 'manifest.json', {'schemaVersion': 1, 'fixtures': fixtures, 'files': files})
 
 
 def fixture_inputs(repo, root=None):
@@ -504,6 +633,7 @@ def prepare(root, repo):
         input_raw[number] = raw
     validate_inputs(first, second, root)
     fixtures = fixture_inputs(repo, root)
+    host_tests = host_test_inputs(repo)
     runtime = read(root / 'runtime-inputs.json'); validate_runtime_inputs(runtime, repo, root)
     write(root/'source-inventory.json',sorted(source_names(repo,root)),exclusive=False)
     identifier = 'persistent-update-20261104-qual1-' + uuid.uuid4().hex[:12]
@@ -525,19 +655,20 @@ def prepare(root, repo):
               'inputs': {'boot%dSha256' % n: hashlib.sha256(input_raw[n]).hexdigest() for n in (1, 2)},
               'checker': {'path': str((root / 'verify-persistent-update-evidence.py').relative_to(repo)),
                           'sha256': sha(root / 'verify-persistent-update-evidence.py')},
-              'fixture': fixtures, 'finalSystemAccepted': False}
+              'fixture': fixtures, 'hostTestFixtures': host_tests, 'finalSystemAccepted': False}
     write(root / 'freeze.json', freeze)
     verify_source_files(freeze, repo, root)
     seal_stage(root, 'prepare', ['freeze.json', 'source-inventory.json', 'inputs/input-boot1.json', 'inputs/input-boot2.json', 'execution-budget.json', 'environment-inspection.json'])
 
 def verify_freeze(root, repo):
     freeze = read(root / 'freeze.json')
-    fields = {'schemaVersion', 'profile', 'repo', 'preparedAt', 'sourceCommit', 'files', 'sourceInventorySha256', 'environment', 'runtime', 'budget', 'inputs', 'checker', 'fixture', 'finalSystemAccepted'}
+    fields = {'schemaVersion', 'profile', 'repo', 'preparedAt', 'sourceCommit', 'files', 'sourceInventorySha256', 'environment', 'runtime', 'budget', 'inputs', 'checker', 'fixture', 'hostTestFixtures', 'finalSystemAccepted'}
     if set(freeze) != fields or type(freeze['schemaVersion']) is not int or freeze['schemaVersion'] != 1 or freeze['profile'] != PROFILE or freeze['finalSystemAccepted'] is not False:
         raise ValueError('update freeze schema/profile')
     if sha(root/'source-inventory.json') != freeze['sourceInventorySha256']:raise ValueError('source inventory changed')
     verify_source_files(freeze, repo, root)
     if fixture_inputs(repo, root) != freeze['fixture']: raise ValueError('fixture bytes/provenance changed')
+    if host_test_inputs(repo) != freeze['hostTestFixtures']: raise ValueError('host test fixture bytes/provenance changed')
     validate_runtime_inputs(freeze['runtime'], repo, root)
     specs = []
     for number in (1, 2):
@@ -648,6 +779,7 @@ def copy_build_cache(source, cache, record_path):
 def inside_build(root, repo, freeze):
     if list((root / 'build').iterdir()) or list((root / 'inputs/payload').iterdir()):
         raise FileExistsError('fresh dedicated build outputs required')
+    if host_test_inputs(repo) != freeze['hostTestFixtures']: raise ValueError('host test fixture bytes/provenance changed')
     cache = Path('/var/tmp') / freeze['environment']['qualificationId'] / 'cache'
     copy_build_cache(Path('/cache-ro'), cache, root / 'build/cache-copy.json')
     environment = os.environ.copy()
@@ -891,6 +1023,7 @@ def inside_export(root, repo, freeze):
     for stage in STAGES[:STAGES.index('export')]:
         copy_regular(root/'stages'/stage,output/'stage-evidence'/stage,excluded)
     export_replay_dependencies(root, repo, freeze, output, excluded)
+    export_host_test_inputs(repo, freeze, output, excluded)
     write(output / 'excluded-runtime-sockets.json', {'excluded': excluded, 'reason': 'QMP sockets are not archive members'})
 
 
@@ -1302,7 +1435,7 @@ def preview(root, repo):
     result={'schemaVersion':1,'status':'draft-unsealed','profile':PROFILE,
         'reviewed':False,'formalRunAuthorized':False,'finalSystemAccepted':False,
         'sourceCommit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),
-        'files':sources,'sourceCount':len(sources),'inputs':specs,'fixture':fixture_inputs(repo,root),
+        'files':sources,'sourceCount':len(sources),'inputs':specs,'fixture':fixture_inputs(repo,root),'hostTestFixtures':host_test_inputs(repo),
         'geometry':{'path':'input-geometry.json','sha256':sha(root/'input-geometry.json'),
                     'stdoutSha256':sha(root/'geometry.stdout.log'),'test':geometry['test']},
         'runtime':runtime,'budget':execution_budget(first,second),
