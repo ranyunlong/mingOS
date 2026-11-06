@@ -7,6 +7,9 @@ New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
 $curl=(Get-Command curl.exe -ErrorAction Stop).Source
 function Get-OfficialText([string]$Url,[string]$Name) {
   $file=Join-Path $downloadDir $Name
+  if((Test-Path -LiteralPath $file) -and (Get-Item -LiteralPath $file).Length -gt 0) {
+    return [IO.File]::ReadAllText($file)
+  }
   & $curl --fail --location --connect-timeout 10 --max-time 45 --retry 1 --silent --show-error --output $file $Url
   if($LASTEXITCODE -ne 0){throw "Download failed: $Name"}
   return [IO.File]::ReadAllText($file)
@@ -14,8 +17,15 @@ function Get-OfficialText([string]$Url,[string]$Name) {
 function Save-VerifiedDownload([string]$Url,[string]$Expected,[string]$Destination) {
   if($Expected -notmatch '^[0-9a-f]{64}$'){throw 'Invalid official checksum'}
   if((Test-Path -LiteralPath $Destination) -and (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant() -eq $Expected){return}
-  $response=Invoke-WebRequest -Uri $Url -Method Head -TimeoutSec 20
-  $size=[long]($response.Headers['Content-Length'] | Select-Object -First 1)
+  # Windows PowerShell can return a null WebResponseObject for HEAD requests even
+  # when the same URL is reachable. Use curl, which is already required above,
+  # so the bootstrap behaves consistently in both PowerShell runtimes.
+  $headers=Join-Path $downloadDir ($Expected+'.headers')
+  & $curl --fail --location --connect-timeout 10 --max-time 45 --retry 1 --silent --show-error --head --output $headers $Url
+  if($LASTEXITCODE -ne 0){throw "Unable to read download headers: $Url"}
+  $lengthLine=Get-Content -LiteralPath $headers | Where-Object {$_ -match '(?i)^content-length:\s*(\d+)'} | Select-Object -Last 1
+  if(!$lengthLine -or $lengthLine -notmatch '(?i)^content-length:\s*(\d+)'){throw 'Missing download size'}
+  $size=[long]$Matches[1]
   if($size -lt 1){throw 'Missing download size'}
   $parts=Join-Path $downloadDir $Expected
   New-Item -ItemType Directory -Path $parts -Force | Out-Null
@@ -46,6 +56,12 @@ if(!(Test-Path -LiteralPath (Join-Path $env:CARGO_HOME 'bin\rustup.exe'))) {
   & $init -y --no-modify-path --default-toolchain none --profile minimal
   if($LASTEXITCODE -ne 0){throw 'Rustup bootstrap failed'}
 }
+$rustup=Join-Path $env:CARGO_HOME 'bin\rustup.exe'
+$installedToolchain=Join-Path $env:RUSTUP_HOME 'toolchains\1.99.1-x86_64-pc-windows-msvc\bin\rustc.exe'
+if(Test-Path -LiteralPath $installedToolchain) {
+  & (Join-Path $env:CARGO_HOME 'bin\cargo.exe') --version
+  exit $LASTEXITCODE
+}
 $channelUrl='https://static.rust-lang.org/dist/channel-rust-1.99.1.toml'
 $manifestHash=((Get-OfficialText ($channelUrl+'.sha256') 'channel.sha256').Trim() -split '\s+')[0]
 $manifestFile=Join-Path $downloadDir 'channel.toml'
@@ -62,6 +78,6 @@ foreach($component in @('rustc','cargo','rust-std','rustfmt-preview','clippy-pre
   $hash=[regex]::Match($block,'(?m)^xz_hash = "([^"]+)"').Groups[1].Value
   Save-VerifiedDownload $url $hash (Join-Path $env:RUSTUP_HOME ('downloads\'+$hash))
 }
-& (Join-Path $env:CARGO_HOME 'bin\rustup.exe') toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy --no-self-update
+& $rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy --no-self-update
 if($LASTEXITCODE -ne 0){throw 'Rust toolchain install failed'}
 & (Join-Path $env:CARGO_HOME 'bin\cargo.exe') --version
