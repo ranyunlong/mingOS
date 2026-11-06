@@ -8,6 +8,16 @@
 
 当前尚未验证新 guest cgroup/data 挂载、真实持久 marker/两次新bootId、live QMP 输入和 strict kernel/resource probe。等待 Docker 数据环境稳定后，使用 Dockerfile.recovery（固定 Debian digest + recovery-packages.lock，无Rust）恢复工具，再创建新的 workspace/disk generation 和 bundle。不能将新建盘冒充之前的盘；不修改旧review或自动批准最终持续host。
 
+## Qualification 资产恢复
+
+当原始 qualification 镜像归档和 build-cache volume 从备份取回后，先用仓库内脚本做只读校验。manifest 必须列出 rust、tools、openssl 三个镜像的归档 SHA-256 和固定 image ID；脚本默认不调用 Docker，也不会覆盖已有资源。
+
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/boot/restore-qualification-assets.ps1 -AssetRoot C:\path\to\qualification-assets -Manifest C:\path\to\qualification-assets\manifest.json -ValidateOnly
+~~~
+
+确认校验结果后，才显式使用 -LoadImages；有 volume 归档时再单独使用 -RestoreVolume。脚本拒绝路径穿越、重名镜像、摘要不匹配、已有同名 volume 和未在 manifest 中声明的资源，不提供删除或摘要替换选项。
+
 以下为此前真实 v4 诊断记录，镜像/volume的存在状态以新的环境证据为准。
 
 # MingOS boot：有界 kernel/DRM 诊断
