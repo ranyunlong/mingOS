@@ -39,7 +39,7 @@ def put_json(path, value):
 
 class SignedFixture:
     """Create signed synthetic controls without executing the fixture helper."""
-    def __init__(self, root):
+    def __init__(self, root, *, omit_absent_migration=False):
         self.root = root
         self.inputs, self.fixture = root / 'inputs', root / 'fixture'
         payload, data = self.inputs / 'payload', self.fixture / 'data'
@@ -68,6 +68,7 @@ class SignedFixture:
             manifest = {'schemaVersion': 1, 'id': package, 'version': version, 'sdkVersion': 6,
                 'entry': 'main.wasm', 'privateStorage': False, 'publicStorage': False, 'dataMigration': migration,
                 'publisherKeyId': 'mingos-dev-2026', 'publisherSignature': base64.b64encode(signature_path.read_bytes()).decode()}
+            if omit_absent_migration and migration is None: manifest.pop('dataMigration')
             fingerprint = (b'ming-private-storage-package-v1\0' + struct.pack('>I', 1) + text(package)
                 + text(version) + text('main.wasm') + struct.pack('>I', 6) + struct.pack('>Q', len(module)) + module)
             if migration is not None:
@@ -134,6 +135,66 @@ class FixtureSignatureTests(unittest.TestCase):
             self.assertIs(result[label]['signatureVerified'], True)
             self.assertIs(result[label]['tamperedMessageRejected'], True)
             self.assertEqual(len(result[label]['openssl']['sha256']), 64)
+
+    def check_manifest(self, label, manifest):
+        directory = Path(self.temp.name) / ('candidate-' + label); directory.mkdir(exist_ok=True)
+        put_json(directory / 'app.json', manifest)
+        package = self.fixture.packages[label]
+        (directory / 'main.wasm').write_bytes(package['wasm'])
+        return self.checker.signed_package(directory / 'app.json', package['manifest']['id'],
+            package['manifest']['version'], self.fixture.inputs / 'payload/packages' / label / 'main.wasm')
+
+    def test_signed_fixture_accepts_rust_omitted_and_explicit_null_absent_migration(self):
+        for omitted in (True, False):
+            with self.subTest(omitted=omitted), tempfile.TemporaryDirectory() as work:
+                fixture = SignedFixture(Path(work), omit_absent_migration=omitted)
+                result = self.checker.verify_fixture_directory(fixture.fixture, fixture.inputs, fixture.review)
+                self.assertEqual(result['initialContent'], fixture.content)
+                for label in ('bootstrap', 'old'):
+                    manifest = fixture.packages[label]['manifest']
+                    if omitted: self.assertNotIn('dataMigration', manifest)
+                    else: self.assertIsNone(manifest['dataMigration'])
+                    self.assertIs(result[label]['signatureVerified'], True)
+                    self.assertIs(result[label]['tamperedMessageRejected'], True)
+                    self.assertEqual(result[label]['migrationSha256'], hash_bytes(b'null'))
+                self.assertEqual(fixture.packages['new']['manifest']['dataMigration'], self.checker.MIGRATION)
+                self.assertIs(result['new']['signatureVerified'], True)
+
+    def test_signed_manifest_rejects_extra_fields_and_missing_required_signature_fields(self):
+        for label in ('bootstrap', 'old', 'new'):
+            for omitted in ((True, False) if label != 'new' else (False,)):
+                original = copy.deepcopy(self.fixture.packages[label]['manifest'])
+                if omitted: original.pop('dataMigration')
+                for field in ('publisherKeyId', 'publisherSignature', 'privateStorage'):
+                    with self.subTest(label=label, omitted=omitted, missing=field):
+                        manifest = copy.deepcopy(original); del manifest[field]
+                        with self.assertRaises(ValueError): self.check_manifest(label, manifest)
+                with self.subTest(label=label, omitted=omitted, extra=True):
+                    manifest = copy.deepcopy(original); manifest['unexpected'] = None
+                    with self.assertRaises(ValueError): self.check_manifest(label, manifest)
+
+    def test_signed_manifest_rejects_migration_on_bootstrap_and_old(self):
+        for label in ('bootstrap', 'old'):
+            for migration in ({}, False, [], 'null', self.checker.MIGRATION):
+                with self.subTest(label=label, migration=migration):
+                    manifest = copy.deepcopy(self.fixture.packages[label]['manifest']); manifest['dataMigration'] = migration
+                    with self.assertRaises(ValueError): self.check_manifest(label, manifest)
+
+    def test_signed_new_manifest_requires_exact_nonnull_migration(self):
+        valid = self.fixture.packages['new']['manifest']
+        missing = copy.deepcopy(valid); del missing['dataMigration']
+        cases = [missing]
+        for migration in (None, {}, False, [], {'fromVersion': '0.1.0', 'steps': []}):
+            manifest = copy.deepcopy(valid); manifest['dataMigration'] = migration; cases.append(manifest)
+        for change in ('extra-migration-field', 'extra-step-field', 'wrong-version', 'wrong-destination'):
+            manifest = copy.deepcopy(valid)
+            if change == 'extra-migration-field': manifest['dataMigration']['unexpected'] = None
+            elif change == 'extra-step-field': manifest['dataMigration']['steps'][0]['unexpected'] = None
+            elif change == 'wrong-version': manifest['dataMigration']['fromVersion'] = '0.0.0'
+            else: manifest['dataMigration']['steps'][1]['to'] = 'wrong/note.txt'
+            cases.append(manifest)
+        for index, manifest in enumerate(cases):
+            with self.subTest(case=index), self.assertRaises(ValueError): self.check_manifest('new', manifest)
 
     def test_original_container_command_survives_read_only_export_path_relocation(self):
         original = self.check()

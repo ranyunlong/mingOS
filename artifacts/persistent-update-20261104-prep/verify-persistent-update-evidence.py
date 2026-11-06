@@ -215,6 +215,7 @@ def openssl_verify(public, message, signature):
 
 def signed_package(manifest_path, expected_id, version, expected_wasm, public=PUBLIC_KEY):
     manifest_bytes = read(manifest_path, 16384); manifest = bounded_json(manifest_bytes)
+    if type(manifest) is dict: manifest.setdefault('dataMigration', None)
     exact(manifest, ('schemaVersion', 'id', 'version', 'sdkVersion', 'entry', 'privateStorage', 'publicStorage',
                      'dataMigration', 'publisherKeyId', 'publisherSignature'))
     migration = MIGRATION if expected_id == PACKAGE_ID and version == '0.2.0' else None
