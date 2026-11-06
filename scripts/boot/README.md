@@ -18,6 +18,22 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/boot/restore-qua
 
 确认校验结果后，才显式使用 -LoadImages；有 volume 归档时再单独使用 -RestoreVolume。脚本拒绝路径穿越、重名镜像、摘要不匹配、已有同名 volume 和未在 manifest 中声明的资源，不提供删除或摘要替换选项。
 
+### 从源机器导出
+
+如果固定资产仍在另一台 Docker 环境，必须在那里导出原始 image 和 build-cache volume。镜像使用 docker save，volume 使用只读 bind mount 打 tar；docker export 不能替代 volume 归档。
+
+~~~powershell
+$out = 'C:\qualification-assets'
+New-Item -ItemType Directory -Force $out, (Join-Path $out 'images'), (Join-Path $out 'volume') | Out-Null
+docker save sha256:868a411f3e53b95fcdfb0604031e0172e51cf7d1ae2bce8aa0ea1c0bb82f0130 -o (Join-Path $out 'images\rust.tar')
+docker save sha256:2440560d810a834637cfeeb1057f7f471c40caa8e532645e00e063cbc8ec639a -o (Join-Path $out 'images\tools.tar')
+docker save sha256:3646133f4b4d2e007dd3eee28d9db6336c29f6ccb31b9f8a49b88bc0a70051be -o (Join-Path $out 'images\openssl.tar')
+docker run --rm --network none --mount type=volume,source=<qualification-build-volume>,target=/src,readonly --mount type=bind,source=$out\volume,target=/dst debian:trixie-slim sh -c 'tar -cf /dst/build-cache.tar -C /src .'
+Get-FileHash $out\images\*.tar,$out\volume\build-cache.tar -Algorithm SHA256
+~~~
+
+将归档 SHA-256 写入 manifest 后，在目标机器先运行 -ValidateOnly，再分开运行 -LoadImages 和 -RestoreVolume。
+
 以下为此前真实 v4 诊断记录，镜像/volume的存在状态以新的环境证据为准。
 
 # MingOS boot：有界 kernel/DRM 诊断
