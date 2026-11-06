@@ -35,3 +35,10 @@ Cargo.lock text eol=lf
 *.otf   binary
 *.zip   binary
 *.jar   binary
+
+# Qualification evidence is hashed as raw bytes; never rewrite line endings
+# when a Windows checkout materializes these streams.
+artifacts/**/geometry.stdout.log binary
+artifacts/**/stdout.log binary
+artifacts/**/stderr.log binary
+artifacts/**/*.jsonl binary
