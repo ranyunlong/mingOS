@@ -142,8 +142,18 @@ if ($LoadImages) {
 
 if ($RestoreVolume) {
   if ($null -eq $record.volume) { Fail 'volume entry is required for RestoreVolume' }
-  $existing = & docker.exe volume inspect $record.volume.name 2>$null
-  if ($LASTEXITCODE -eq 0) { Fail ('refusing to overwrite existing volume: ' + $record.volume.name) }
+  $probeRoot = Join-Path ([IO.Path]::GetTempPath()) ('mingos-volume-probe-' + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
+  try {
+    $probe = Start-Process docker.exe -ArgumentList @('volume', 'inspect', $record.volume.name) -Wait -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $probeRoot 'stdout.txt') -RedirectStandardError (Join-Path $probeRoot 'stderr.txt')
+    if ($probe.ExitCode -eq 0) { Fail ('refusing to overwrite existing volume: ' + $record.volume.name) }
+    if ($probe.ExitCode -ne 1) {
+      $probeError = [IO.File]::ReadAllText((Join-Path $probeRoot 'stderr.txt')).Trim()
+      Fail ('unable to inspect target volume: ' + $probeError)
+    }
+  } finally {
+    Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
   Invoke-Docker @('image', 'inspect', $VolumeHelperImage) | Out-Null
   Invoke-Docker @('volume', 'create', $record.volume.name) | Out-Null
   $volumePath = Resolve-SafeAssetPath $root ([string]$record.volume.archive) 'volume archive'
