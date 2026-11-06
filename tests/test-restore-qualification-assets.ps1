@@ -68,4 +68,34 @@ $wrongImageId.images = @($valid.images | ForEach-Object { $_.Clone() })
 $wrongImageId.images[0].imageId = ('sha256:' + ('f' * 64))
 Invoke-Validation $wrongImageId 1
 
+$outsideRoot = Join-Path ([IO.Path]::GetTempPath()) ('mingos-restore-outside-' + [guid]::NewGuid().ToString('N'))
+$outsideManifest = Join-Path ([IO.Path]::GetTempPath()) ('mingos-restore-manifest-' + [guid]::NewGuid().ToString('N') + '.json')
+New-Item -ItemType Directory -Path (Join-Path $outsideRoot 'images') -Force | Out-Null
+try {
+  $outsideImages = @()
+  foreach ($entry in $valid.images) {
+    $path = Join-Path $outsideRoot $entry.archive
+    New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($path)) -Force | Out-Null
+    [IO.File]::WriteAllBytes($path, [Text.Encoding]::UTF8.GetBytes($entry.key))
+    $outsideImages += @{
+      key = $entry.key
+      archive = $entry.archive
+      imageId = $entry.imageId
+      archiveSha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+  }
+  $outsideManifestValue = @{ schemaVersion = 1; images = $outsideImages }
+  [IO.File]::WriteAllText($outsideManifest, ($outsideManifestValue | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+  $stdoutPath = Join-Path $outsideRoot 'stdout.txt'
+  $stderrPath = Join-Path $outsideRoot 'stderr.txt'
+  $process = Start-Process powershell.exe -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script,
+    '-AssetRoot', $outsideRoot, '-Manifest', $outsideManifest, '-ValidateOnly'
+  ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+  if ($process.ExitCode -ne 1) { throw 'Manifest outside AssetRoot was accepted' }
+} finally {
+  Remove-Item -LiteralPath $outsideRoot -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $outsideManifest -Force -ErrorAction SilentlyContinue
+}
+
 Write-Output 'restore qualification asset validation tests passed'

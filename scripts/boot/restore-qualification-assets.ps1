@@ -113,7 +113,12 @@ function Invoke-Docker([string[]]$Arguments) {
 $root = [IO.Path]::GetFullPath($AssetRoot)
 if (!(Test-Path -LiteralPath $root -PathType Container)) { Fail 'AssetRoot is missing' }
 if ([string]::IsNullOrWhiteSpace($Manifest)) { $Manifest = Join-Path $root 'manifest.json' }
-$record = Read-Manifest ([IO.Path]::GetFullPath($Manifest))
+$manifestFull = [IO.Path]::GetFullPath($Manifest)
+if (!$manifestFull.StartsWith($root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+  Fail 'manifest must be inside AssetRoot'
+}
+$manifest = Resolve-SafeAssetPath $root $manifestFull.Substring($root.TrimEnd('\').Length + 1) 'manifest'
+$record = Read-Manifest $manifest
 $archives = @{}
 foreach ($entry in $record.images) { $archives[$entry.key] = Assert-Archive $entry $root }
 
@@ -155,7 +160,7 @@ $result = [ordered]@{
   schemaVersion = 1
   status = 'validated'
   assetRoot = $root
-  manifest = [IO.Path]::GetFullPath($Manifest)
+  manifest = $manifest
   images = @($record.images | ForEach-Object { [ordered]@{ key = $_.key; imageId = $_.imageId; archive = $_.archive } })
   volume = if ($null -eq $record.volume) { $null } else { [ordered]@{ name = $record.volume.name; archive = $record.volume.archive } }
   loadImages = [bool]$LoadImages
