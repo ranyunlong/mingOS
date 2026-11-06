@@ -324,3 +324,5 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 2026-11-06 公开基础镜像边界诊断：固定 Rust 摘要 `sha256:868a411f...` 在 Docker Hub 不存在；公开 `rust:1.99.1` 拉取成功但实际摘要为 `sha256:bc2c4c21...`，固定 Debian 基础拉取成功且摘要与合同一致。两者只用于诊断/临时脚本环境，未改写 driver 的固定摘要、未创建 build volume/资格盘，也未启动 guest；tools、Rust qualification 和 OpenSSL source 镜像仍缺失，`finalSystemAccepted=false`。
 
 2026-11-06 qualification 证据字节稳定性修复：Windows checkout 在通用 `text=auto` 规则下将 `geometry.stdout.log` 等被 SHA-256 绑定的原始 stdout/stderr/jsonl 流改写为 CRLF，导致只读 preview 误报 `geometry raw output changed`。`.gitattributes` 现将 qualification 原始证据流标记为 `binary`，后续新冻结在 Windows 工作树中保持原始字节；旧 prep 不回写、不续用，`finalSystemAccepted=false`。
+
+2026-11-06 固定镜像恢复审计：Git 全历史、不可达对象、用户目录扫描和 Docker Desktop 数据盘均未发现 `mingos-linux-task3`、`mingos-boot-tools`、`mingos-boot-infra` 的镜像归档或 build cache volume；公开 registry 对三个固定名称返回 `access denied/unauthorized`，固定 Rust digest 也不存在。当前 Docker VHDX 只有本轮新拉取的公开基础镜像。后续只能从原机器/备份导出精确 image 与 build cache volume，或在持有私有 registry 凭证的环境恢复；不能重建后修改摘要绕过 driver，Task9 qualification 仍保持未完成，`finalSystemAccepted=false`。
