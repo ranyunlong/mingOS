@@ -12,6 +12,12 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$script:ExpectedImageIds = @{
+  rust = 'sha256:868a411f3e53b95fcdfb0604031e0172e51cf7d1ae2bce8aa0ea1c0bb82f0130'
+  tools = 'sha256:2440560d810a834637cfeeb1057f7f471c40caa8e532645e00e063cbc8ec639a'
+  openssl = 'sha256:3646133f4b4d2e007dd3eee28d9db6336c29f6ccb31b9f8a49b88bc0a70051be'
+}
+
 function Fail([string]$Message) {
   throw ('QUALIFICATION_ASSET_RESTORE_BLOCKED: ' + $Message)
 }
@@ -74,6 +80,7 @@ function Read-Manifest([string]$Path) {
     if ($entry.key -notin $required -or $seen.ContainsKey($entry.key)) { Fail 'image keys must be unique rust/tools/openssl' }
     $seen[$entry.key] = $true
     if ($entry.imageId -notmatch '^sha256:[0-9a-f]{64}$') { Fail ($entry.key + ' imageId is invalid') }
+    if ($entry.imageId -ne $script:ExpectedImageIds[$entry.key]) { Fail ($entry.key + ' imageId differs from the qualification contract') }
     Assert-Hash $entry.archiveSha256 ($entry.key + ' archiveSha256')
   }
   foreach ($key in $required) { if (!$seen.ContainsKey($key)) { Fail ('missing image: ' + $key) } }

@@ -327,3 +327,4 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 
 2026-11-06 固定镜像恢复审计：Git 全历史、不可达对象、用户目录扫描和 Docker Desktop 数据盘均未发现 `mingos-linux-task3`、`mingos-boot-tools`、`mingos-boot-infra` 的镜像归档或 build cache volume；公开 registry 对三个固定名称返回 `access denied/unauthorized`，固定 Rust digest 也不存在。当前 Docker VHDX 只有本轮新拉取的公开基础镜像。后续只能从原机器/备份导出精确 image 与 build cache volume，或在持有私有 registry 凭证的环境恢复；不能重建后修改摘要绕过 driver，Task9 qualification 仍保持未完成，`finalSystemAccepted=false`。
 2026-11-06 qualification 资产恢复入口：新增 scripts/boot/restore-qualification-assets.ps1 及真实 PowerShell 子进程测试。默认只读校验 manifest、归档 SHA-256、固定 rust/tools/openssl image ID、路径边界和 reparse point；-LoadImages 与 -RestoreVolume 是显式副作用入口，拒绝覆盖已有 volume，不提供删除或摘要替换。测试覆盖合法 manifest、路径穿越、重复 key、缺少固定镜像，结果通过；该工具不代表资产已恢复，finalSystemAccepted=false。
+2026-11-06 qualification 恢复门固定摘要修复：回归测试先证明任意格式正确但错误的 image ID 可绕过只读 manifest 校验；恢复脚本现强制 rust/tools/openssl 三个 ID 等于当前 Task9 合同，错误 ID 在任何 Docker 动作前拒绝。恢复测试、Node 检查和宿主测试继续通过，正式镜像仍未恢复，finalSystemAccepted=false。
