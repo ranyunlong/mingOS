@@ -15,13 +15,15 @@
 
 ## 继续交付的门槛
 
-最新阶段补充：卸载新代 `28aef8a17bbb44d2` 已使用完整输入通过同盘双启动和公共 export / verify / replay，manifest SHA256 `b7e35a77f3ebbd49f7b3b4442b2c57128940c3482d3b27ce9acb608c33543df6`。强 raw 重放确认正常关机、同盘重开及卸载后私有文件保留；便携归档正在生成。下面 f500a8a3 的缺失输入失败仍为历史失败，不续用或修改。恢复后的源码/Gradle 已实际重新编译 Text Entry 和 Motion，宿主 46 文件及编译/依赖/编排链独立回放通过；恢复源码/Cargo 的新 Rust 冷构建仍在运行。开发 bundle 已实际生成并独立核对全部必需内容，完整 pack 与 guest 尚待完成。
+最新阶段补充：卸载新代 `28aef8a17bbb44d2` 已使用完整输入通过同盘双启动和公共 export / verify / replay，manifest SHA256 `b7e35a77f3ebbd49f7b3b4442b2c57128940c3482d3b27ce9acb608c33543df6`。便携归档已完成，187107454 字节，SHA256 `c1b9e6aaaf433d234102b42ada5130b30ca9a490f323f955b1257f5fa57fbd1b`，3479 个文件及 887 个目录逐项匹配。下面 f500a8a3 的缺失输入失败仍为历史失败，不续用或修改。
 
-1. 独立 Linux 持久卸载资格：新四包来源重编/回放及七命令 cold 9436c4cf 全部通过（776通过、0失败、24忽略）。runtime f500a8a3 实际同盘双启动通过完整强 raw 检查，均正常关机；portable export 成功，但独立 verify 因运行输入漏带冷构建引用的 rust-image.json、node、toolchain-observation.json 失败。该代不续用、不改判，全部盘/卷/容器/日志保留。完整输入已准备，须用全新代再完成双启动及公共导出回放，当前不声明完整卸载资格通过。更早 5d98a41e 的 PID0 启动锚点失败与针对同次唯一 native launch 的修复记录仍保留。
+恢复后的源码/Gradle 已实际重新编译 Text Entry 和 Motion，宿主 46 文件及编译/依赖/编排链独立回放通过。恢复源码/Cargo 的新 Rust 冷构建 `f7e24f3a64814d49` 已完成七条命令：776 通过、0 失败、24 忽略；Host 和 helper 与原冷构建 9436 字节一致。主执行者另在只读容器中复核全部源码、工具、命令、产物和原容器最终配置。开发 bundle 已实际生成并独立核对全部必需内容，完整 pack 与 guest 验证继续。
+
+1. 独立 Linux 持久卸载：新四包来源重编/回放及七命令 cold 9436c4cf 全部通过（776通过、0失败、24忽略），完整输入新代 28aef8a1 已完成双启动及公共导出回放。历史 runtime f500a8a3 虽完成同盘双启动，独立 verify 因漏带 rust-image.json、node、toolchain-observation.json 失败；该代不续用、不改判，全部盘/卷/容器/日志保留。更早 5d98a41e 的 PID0 启动锚点失败与针对同次唯一 native launch 的修复记录仍保留。
 2. 用户确认优先交付可复建的x86_64 VM开发系统，含应用、持久数据、更新/卸载和恢复说明。公共只读developer pack验证器已通过主执行者独立Linux40项控制；源码/缓存迁移、实际干净重建与开发会话仍在实施，详见[交付范围与检查入口](vm-developer-system.md)。物理鼠标专项仍暂停；TCG、虚拟输入和软件呈现不能作为物理硬件资格。
 3. 历史APFS资格不能由新Linux证据替代；280个deb的观察记录也不构成完整签名离线APT重建闭包。
 
-新开发入口阶段：完整开发包只读验证器已独立Linux40/40；卸载checker、开发profile、固定镜像迁移和共享boot控制在真实Linux合计65/65、零跳过。三个开发工具链归档实际只读验证通过，但未实际加载到全新daemon。Kotlin公开包装器已从封印源码kd-ff1e822e完成全新卸载四包和开发双包实际离线编译；两代均通过独立只读容器回放，主执行者另重放宿主导出包及编排收据链，逐文件检查封印前后摘要。共六次编译实际执行，原Gradle缓存及1487个封印源文件保持不变。新Cargo home独立复制12495文件、245308651字节，原registry及目标文件/模式/owner/nlink完整清单匹配，旧派生缓存未复制；尚不等同归档恢复。新七命令cold 9436c4cf已使用该Cargo副本和新四包完成，全部7命令通过，主测试776/0/24。源码和Cargo/Gradle缓存已实际归档并恢复到新消费者卷，独立只读复核通过（1487源文件/392目录、12495 Cargo文件、2496 Gradle文件）；长/短宿主源码投影另逐文件核验。恢复输入的实际Kotlin构建及新Rust冷构建继续，开发VM真实启动和完整交接仍待执行。各项范围、公开命令与待完成门槛见[开发系统交付说明](vm-developer-system.md)。
+新开发入口阶段：完整开发包只读验证器已独立Linux40/40；卸载checker、开发profile、固定镜像迁移和共享boot控制在真实Linux合计65/65、零跳过。三个开发工具链归档实际只读验证通过，但未实际加载到全新daemon。Kotlin公开包装器已从封印源码kd-ff1e822e完成全新卸载四包和开发双包实际离线编译；两代均通过独立只读容器回放，主执行者另重放宿主导出包及编排收据链，逐文件检查封印前后摘要。原Gradle缓存及1487个封印源文件保持不变。源码和Cargo/Gradle缓存已实际归档并恢复到新消费者卷，独立只读复核通过（1487源文件/392目录、12495 Cargo文件、2496 Gradle文件）；长/短宿主源码投影另逐文件核验。恢复输入的实际Kotlin构建及Rust冷构建均已通过；开发VM真实启动和完整交接仍待执行。各项范围、公开命令与待完成门槛见[开发系统交付说明](vm-developer-system.md)。
 
 完整阶段记录见 [连续开发记录](continuous-development.md)、[当前环境记录](development-environment-20261107.md)、[Linux更新资格计划](superpowers/plans/2026-11-07-linux-host-qualification.md) 与 [Linux卸载资格计划](superpowers/plans/2026-11-07-linux-host-uninstall-qualification.md)。大产物按仓库约定保留本机，不提交Git。
 
