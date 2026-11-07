@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import stat
 import tomllib
 
@@ -20,6 +21,8 @@ PACKAGES = {'read-file': ('read-file', None), 'image-viewer': ('image-viewer', N
             'absent-write': ('persistent-update-demo', 'absent-write')}
 SUMMARY = re.compile(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; '
                      r'(\d+) measured; \d+ filtered out; finished in [0-9.]+s')
+ARTIFACT_PATHS = ('release/ming-app-host', 'release/examples/prepare_persistent_update_fixture')
+ARTIFACT_LIMIT = 512 * 1024 * 1024
 
 
 def relative_path(value):
@@ -202,9 +205,120 @@ def summarize(raw, expected):
     return dict(zip(('groups', 'passed', 'failed', 'ignored', 'measured'), (len(counts), *totals)))
 
 
+def _artifact_identity(info):
+    return dict(zip(('dev', 'ino', 'mode', 'links', 'uid', 'gid', 'bytes', 'mtimeNs', 'ctimeNs'), q.stamp(info)))
+
+
+def _artifact_fd_hash(fd, expected):
+    if q.stamp(os.fstat(fd)) != q.stamp(expected):
+        raise ValueError('artifact source identity changed')
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest, size, magic = hashlib.sha256(), 0, b''
+    while True:
+        raw = os.read(fd, 1024 * 1024)
+        if not raw:
+            break
+        if not magic:
+            magic = raw[:4]
+        size += len(raw)
+        if size > ARTIFACT_LIMIT:
+            raise ValueError('artifact size budget exceeded')
+        digest.update(raw)
+    if magic != b'\x7fELF' or size != expected.st_size or q.stamp(os.fstat(fd)) != q.stamp(expected):
+        raise ValueError('artifact ELF bytes or source identity changed during read')
+    return {'sha256': digest.hexdigest(), 'bytes': size}
+
+
+def seal_artifacts(target):
+    """Detach only Cargo's two fixed executable aliases; global hashing stays strict."""
+    target = q.checked_directory(Path(target))
+    receipts = {}
+    for name in ARTIFACT_PATHS:
+        path = target / name
+        parent = q.open_directory(path.parent)
+        source, temporary, owned_temporary, temporary_object = None, None, False, None
+        try:
+            before = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink < 1
+                    or (before.st_uid, before.st_gid) != (65534, 65534)
+                    or not stat.S_IMODE(before.st_mode) & 0o111 or before.st_mode & 0o7000
+                    or not 4 <= before.st_size <= ARTIFACT_LIMIT):
+                raise ValueError('bounded owned regular executable artifact required: ' + name)
+            source = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            first = _artifact_fd_hash(source, before)
+            detached = before.st_nlink > 1
+            if detached:
+                temporary = '.linux-host-seal-' + secrets.token_hex(16)
+                output = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                 0o600, dir_fd=parent)
+                owned_temporary = True
+                created = os.fstat(output)
+                temporary_object = (created.st_dev, created.st_ino)
+                try:
+                    os.lseek(source, 0, os.SEEK_SET)
+                    copied, copied_size = hashlib.sha256(), 0
+                    while True:
+                        raw = os.read(source, 1024 * 1024)
+                        if not raw:
+                            break
+                        copied_size += len(raw)
+                        if copied_size > ARTIFACT_LIMIT:
+                            raise ValueError('artifact copy size budget exceeded')
+                        copied.update(raw)
+                        pending = memoryview(raw)
+                        while pending:
+                            written = os.write(output, pending)
+                            if written <= 0:
+                                raise OSError('artifact copy made no progress')
+                            pending = pending[written:]
+                    os.fchmod(output, stat.S_IMODE(before.st_mode))
+                    os.fsync(output)
+                    temporary_identity = os.fstat(output)
+                    if ({'sha256': copied.hexdigest(), 'bytes': copied_size} != first
+                            or q.hash_at(parent, temporary, temporary_identity) != first):
+                        raise ValueError('artifact copy bytes differ from original')
+                finally:
+                    os.close(output)
+            second = _artifact_fd_hash(source, before)
+            if second != first or q.stamp(os.stat(path.name, dir_fd=parent, follow_symlinks=False)) != q.stamp(before):
+                raise ValueError('artifact source changed before atomic replacement')
+            current_parent = q.open_directory(path.parent)
+            try:
+                if (os.fstat(current_parent).st_dev, os.fstat(current_parent).st_ino) != (os.fstat(parent).st_dev, os.fstat(parent).st_ino):
+                    raise ValueError('artifact parent directory replaced')
+            finally:
+                os.close(current_parent)
+            if detached:
+                if q.stamp(os.stat(temporary, dir_fd=parent, follow_symlinks=False)) != q.stamp(temporary_identity):
+                    raise ValueError('owned artifact temporary replaced')
+                os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+                owned_temporary = False
+                os.fsync(parent)
+            artifact = q.stable_hash(path)
+            final = path.stat(follow_symlinks=False)
+            if artifact != first or final.st_nlink != 1 or final.st_uid != 65534 or final.st_gid != 65534:
+                raise ValueError('sealed artifact bytes or ownership changed')
+            receipts[name] = {'detached': detached, 'sourceIdentity': _artifact_identity(before),
+                'sourceBefore': first, 'sourceAfter': second, 'artifact': artifact,
+                'artifactIdentity': _artifact_identity(final)}
+        finally:
+            if source is not None:
+                os.close(source)
+            if owned_temporary:
+                try:
+                    remaining = os.stat(temporary, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    remaining = None
+                if remaining is not None and (remaining.st_dev, remaining.st_ino) == temporary_object:
+                    os.unlink(temporary, dir_fd=parent)
+                    os.fsync(parent)
+            os.close(parent)
+    return receipts
+
+
 def built_artifacts(target):
     result = {}
-    for name in ('release/ming-app-host', 'release/examples/prepare_persistent_update_fixture'):
+    for name in ARTIFACT_PATHS:
         path = target / name
         result[name] = q.stable_hash(path)
         with path.open('rb') as stream:
@@ -287,7 +401,9 @@ def run_build(root, repo, freeze, cargo_home, target, packages_root):
                         q.write_json(command_root / 'summary.json', summary)
                     results.append({'number': number, 'result': result})
                     if number == 5:
+                        q.write_json(directory / 'pre-explicit-artifact-seal.json', seal_artifacts(target))
                         q.write_json(directory / 'pre-explicit-artifacts.json', built_artifacts(target))
+                q.write_json(directory / 'final-artifact-seal.json', seal_artifacts(target))
                 q.write_json(directory / 'artifacts.json', built_artifacts(target))
                 return {'coldBuildCommands': len(results), 'target': str(target),
                         'formalQualification': False, 'finalSystemAccepted': False}

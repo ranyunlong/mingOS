@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -252,6 +253,29 @@ class ColdBuildControls(unittest.TestCase):
                 self.run_build()
         self.assertEqual(len(self.calls), 6)
 
+    def test_cargo_hardlinked_outputs_are_sealed_before_explicit_tests_and_after_relink(self):
+        self.calls, self.original_execute = [], q.execute
+        def cargo_links(directory, command, timeout, **kwargs):
+            result = self.simulated_execute(directory, command, timeout, **kwargs)
+            if len(self.calls) == 5:
+                for name in ('release/ming-app-host', 'release/examples/prepare_persistent_update_fixture'):
+                    artifact = self.target / name
+                    os.link(artifact, artifact.with_name(artifact.name + '-cargo-alias'))
+            if len(self.calls) == 6:
+                self.assertEqual((self.target / 'release/ming-app-host').stat().st_nlink, 1)
+                self.assertTrue((self.root / 'stages/build/pre-explicit-artifact-seal.json').exists())
+            if len(self.calls) == 9:
+                for name in ('release/ming-app-host', 'release/examples/prepare_persistent_update_fixture'):
+                    artifact = self.target / name
+                    artifact.unlink()
+                    os.link(artifact.with_name(artifact.name + '-cargo-alias'), artifact)
+            return result
+        with mock.patch.object(q, 'execute', side_effect=cargo_links):
+            self.run_build()
+        self.assertEqual(q.read_json(self.root / 'stages/build/result.json')['status'], 'passed')
+        self.assertTrue((self.root / 'stages/build/final-artifact-seal.json').exists())
+        self.assertEqual((self.target / 'release/ming-app-host').stat().st_nlink, 1)
+
     def test_failed_prepare_result_cannot_run_cargo(self):
         (self.root / 'prepare-result.json').unlink()
         q.write_json(self.root / 'prepare-result.json', {'status': 'failed', 'freezeSha256': self.freeze_sha})
@@ -333,6 +357,126 @@ class ColdBuildControls(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'read-only'):
                 b.run_build(self.root, self.repo, self.freeze, self.cargo, self.target, self.packages)
             execute.assert_not_called()
+
+
+class ArtifactSealControls(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.target = Path(self.temp.name)
+        self.names = ('release/ming-app-host', 'release/examples/prepare_persistent_update_fixture')
+        for name in self.names:
+            artifact = self.target / name
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile('/usr/bin/true', artifact)
+            artifact.chmod(0o755)
+            os.link(artifact, artifact.with_name(artifact.name + '-cargo-alias'))
+
+    def test_real_hardlinked_elf_detaches_only_fixed_outputs_with_identical_bytes(self):
+        before = {name: (self.target / name).stat() for name in self.names}
+        expected = hashlib.sha256(Path('/usr/bin/true').read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, 'single-link'):
+            q.stable_hash(self.target / self.names[0])
+        receipt = b.seal_artifacts(self.target)
+        self.assertEqual(set(receipt), set(self.names))
+        for name in self.names:
+            artifact = self.target / name
+            alias = artifact.with_name(artifact.name + '-cargo-alias')
+            self.assertEqual(alias.stat().st_ino, before[name].st_ino)
+            self.assertNotEqual(artifact.stat().st_ino, before[name].st_ino)
+            self.assertEqual(artifact.stat().st_nlink, 1)
+            self.assertEqual(q.stable_hash(artifact)['sha256'], expected)
+            self.assertEqual(hashlib.sha256(alias.read_bytes()).hexdigest(), expected)
+            self.assertEqual(receipt[name]['sourceBefore'], receipt[name]['sourceAfter'])
+            self.assertEqual(receipt[name]['artifact']['sha256'], expected)
+            self.assertTrue(receipt[name]['detached'])
+        # The generic hash contract stays strict for every other hardlinked file.
+        os.link(alias, alias.with_name('another-alias'))
+        with self.assertRaisesRegex(ValueError, 'single-link'):
+            q.stable_hash(alias)
+        second = b.seal_artifacts(self.target)
+        self.assertTrue(all(value['detached'] is False for value in second.values()))
+
+    def test_symlink_leaf_and_parent_are_rejected(self):
+        artifact = self.target / self.names[0]
+        artifact.unlink()
+        artifact.symlink_to(artifact.with_name(artifact.name + '-cargo-alias'))
+        with self.assertRaises((OSError, ValueError)):
+            b.seal_artifacts(self.target)
+        artifact.unlink()
+        (self.target / 'release').rename(self.target / 'actual-release')
+        (self.target / 'release').symlink_to(self.target / 'actual-release', target_is_directory=True)
+        with self.assertRaises(ValueError):
+            b.seal_artifacts(self.target)
+
+    def test_non_elf_non_executable_and_oversize_are_rejected(self):
+        artifact = self.target / self.names[0]
+        artifact.write_bytes(b'not an ELF')
+        with self.assertRaises(ValueError):
+            b.seal_artifacts(self.target)
+        shutil.copyfile('/usr/bin/true', artifact)
+        artifact.chmod(0o644)
+        with self.assertRaises(ValueError):
+            b.seal_artifacts(self.target)
+        artifact.chmod(0o755)
+        with artifact.open('r+b') as stream:
+            stream.truncate(512 * 1024 * 1024 + 1)
+        with self.assertRaises(ValueError):
+            b.seal_artifacts(self.target)
+
+    def test_source_mutation_during_hash_is_rejected(self):
+        artifact = self.target / self.names[0]
+        original_read = os.read
+        changed = False
+        def mutate(fd, count):
+            nonlocal changed
+            result = original_read(fd, count)
+            if not changed:
+                changed = True
+                with artifact.open('r+b') as stream:
+                    stream.seek(8); stream.write(b'changed')
+            return result
+        with mock.patch.object(os, 'read', side_effect=mutate):
+            with self.assertRaises(ValueError):
+                b.seal_artifacts(self.target)
+
+    def test_source_replaced_during_copy_is_rejected_and_owned_temp_removed(self):
+        artifact = self.target / self.names[0]
+        replacement = self.target / 'replacement'
+        shutil.copyfile('/usr/bin/true', replacement)
+        replacement.chmod(0o755)
+        replacement_inode = replacement.stat().st_ino
+        original_write = os.write
+        changed = False
+        def replace(fd, raw):
+            nonlocal changed
+            if not changed:
+                changed = True
+                os.replace(replacement, artifact)
+            return original_write(fd, raw)
+        with mock.patch.object(os, 'write', side_effect=replace):
+            with self.assertRaises(ValueError):
+                b.seal_artifacts(self.target)
+        self.assertEqual(artifact.stat().st_ino, replacement_inode)
+        self.assertFalse(list(artifact.parent.glob('.linux-host-seal-*')))
+
+    def test_replaced_temporary_is_not_deleted_as_owned_cleanup(self):
+        artifact = self.target / self.names[0]
+        replacement = self.target / 'foreign-temporary'
+        replacement.write_bytes(b'preserve unrelated replacement')
+        original_write = os.write
+        moved_to = []
+        def replace(fd, raw):
+            result = original_write(fd, raw)
+            if not moved_to:
+                temporary = next(artifact.parent.glob('.linux-host-seal-*'))
+                os.replace(replacement, temporary)
+                moved_to.append(temporary)
+            return result
+        with mock.patch.object(os, 'write', side_effect=replace):
+            with self.assertRaises(ValueError):
+                b.seal_artifacts(self.target)
+        self.assertEqual(moved_to[0].read_bytes(), b'preserve unrelated replacement')
 
 
 if __name__ == '__main__':
