@@ -2,6 +2,20 @@
 
 更新：2026-10-27。用户授权每个阶段完成后直接进入下一阶段，直到整体任务结束。阶段验收通过只表示该阶段结束，不表示整个操作系统已经完成。
 
+## 2026-11-07 归档恢复、应用复建与公开外层入口
+
+新增公开 `developer_cache.py` / `developer_cache_worker.py`、`source_archive.py`，以及 `developer-vm-outer.ps1` / `developer_vm_driver.py`。缓存工具执行外部摘要固定、严格归档验证、全新匿名恢复卷、消费者投影和两次独立只读复核；源码数据层使用别名归档，保留完整路径和模式映射。公开外层固定可信源码、Tools 镜像、挂载、命令和资源上限，单次 `new → pair` 保留全部尝试，不提供失败代续跑或重置。
+
+实际缓存归档恢复完成 Cargo 12495 / Gradle 2496 文件，42 次操作均成功；源码恢复完成 1487 文件 / 392 目录，另独立核对长、短 Windows 宿主副本。恢复后的短源码与新 Gradle 消费者已通过公共 Kotlin 入口实际重新编译 Text Entry、Motion；新代 `8b03063e70404607a6bcd631ee8cabf8` 的只读容器回放和主执行者宿主独立回放均通过。宿主导出 46 文件、7 目录、13745862 字节；封印 SHA256 `90e463b188474c460700c6f8a570d269bebb4c455c0d81f7206888660b9b24e9`。当前公共包验证器和编排收据链重新执行通过，原缓存及封印源码保持。
+
+公开缓存/源码集成控制在固定 Linux 镜像中 52 项：51 通过、1 项 Windows 专属跳过；独立复核与冻结原型逐字节一致。外层 PowerShell 控制 34/34、独立 Linux driver 控制 8/8，通过默认仓库路径及可选 Docker 字段边界。它们不启动 guest。来源归档独立审阅和两份宿主投影复核通过；三个工具链归档的新版只读 OCI 检查通过，旧验证器拒绝 OCI index 的原失败记录保留，未实际加载到新 daemon。
+
+新卸载代 `28aef8a17bbb44d2` 使用完整运行输入，已完成同盘双启动及公共 export / verify / replay。portable manifest SHA256 `b7e35a77f3ebbd49f7b3b4442b2c57128940c3482d3b27ce9acb608c33543df6`；原始证据回放报告正常重开及卸载后私有文件保留。原 f500a8a3 缺少三项工具输入的失败代保持不变。新恢复输入的 Rust 冷构建 `f7e24f3a64814d49` 仍在执行。
+
+开发 bundle `developer-public-bundle-e512a7d9` 已实际生成，并经另一只读脚本复验全部 newc 流：1368 项、131574714 字节，54 项必需内容及内核/配置匹配。完整开发包仍在组装，开发 guest 尚未执行。现有 Text Entry 只保存内存状态，不能用该预览证明文字内容保存；另行推进笔记应用和持久内容流程。`formalQualification=false`、`finalSystemAccepted=false` 保持。
+
+本阶段证据根仍为 `artifacts/environment-rebuild-20261107/`；独立报告包括 `root-restored-kotlin-review-kr-83b7a1e2.json`、`public-data-migration-review-6431ef277915420da30f32037afc3b8d/`、`source-archive-independent-review-64e9f831/`、`developer-public-bundle-review-6a98cf20/`。大产物不提交 Git。
+
 ## 2026-11-07 当前源码应用重建与独立缓存副本
 
 已完成阶段：公共Kotlin入口从独立封印源码`artifacts/kd-ff1e822e`实际编译两代应用。卸载代`1e136eb1a8b04d49b112ef9f4af5dfeb`包含read-file、image-viewer、text-entry-demo、uninstall；开发代`73428b51767246849f6122604aacea1c`包含text-entry-demo、animated-demo。强制离线编译实际执行5/5/19/19及19/19项任务，每代另起只读容器回放；主执行者独立重验导出文件及编排证据，并用当前公开runner重放包/来源/依赖收据链，结果与容器回放一致。原Gradle缓存不变，封印源码1487文件的摘要、大小、模式及目录模式前后匹配。
@@ -450,3 +464,9 @@ Kotlin新代740082ff5d3d406da70e08ca4c60156d于UTC09:07:29至09:16:21完成四�
 另新增独立开发镜像归档迁移入口，固定Rust/Tools/Kotlin三份OCI index归档；验证外部大小/hash、全部blob/descriptor、唯一linux/amd64、层顺序/diffID、tagless Docker manifest及绑定attestation，后者不认证发布者。修复每次load前重验各自FD与普通失败部分收据留存；结果先独占创建并fsync，不宣称断电原子journal。真实三归档只读验证通过，尚未实际load或在新daemon验证index保持；历史恢复合同未变。综合独立Linux控制为checker15、profile13、migration16、boot21，共65/65、零跳过，固定Tools镜像、禁网、UID65534、只读根/源及前后inspect/hash通过；证据developer-combined-controls-0105b576aee2，result SHA256 64c56521ee104b06a5c677edd43837f5e55b3c4d970981e71ed12c87e3fdacee。pack证据developer-pack-root-controls-a7d71c2e55bb，迁移integration证据development-image-migration-integration-4b0e5c057745。未改变原legacy frozen probe缺失事实，formalQualification=false、finalSystemAccepted=false。
 
 2026-11-07 Kotlin公开源码构建编排：新增固定镜像、独立源码/缓存/工作/输出四卷的公开kotlin_delivery入口，支持developer双包、uninstall四包和update六包；加入Motion的SDK5精确ABI及capability检查。编译要求offline、rerun、独立工作目录和实际目标任务，另起只读容器核对包身份、源码/收据hash与依赖前后链；每次create先重验已有卷，失败/超时保留inspect，仅停止所属运行CID，失败代不能原地续跑。集成时先保留缺失DTO fixture的14通过/2错误结果，再补入真实DTO回归输入（仅替换用户名）；主执行者和独立复核均16 Python与38 Node通过，pipeline语法通过。原型实际synthetic8d1a0b1fbe2e4ec2b5354d5cbdc0a8cc验证612源文件、2496缓存文件的复制、原cache保持及只读拒绝；exit7非零和超时Running=true后owned stop/reinspect均实际执行。新RO全量基线与旧基线不可变依赖一致，变化只在派生缓存；旧基线失配和三次DTO/prepare失败代保留。证据kotlin-synthetic-actual-e724e1cd及missing-volume-21eaab8f，compileExecuted=false；公开入口的新四包/双包实际编译另行记录，不能由synthetic替代。宿主docker-cp导出仍需外层独立封印。formalQualification=false、finalSystemAccepted=false。
+
+2026-11-07 VM复建输入实际归档与恢复阶段：新增公开developer_cache.py/worker及source_archive.py数据层，历史qualification USTAR/plan/worker合同不变。真实缓存导出290da81f含936744960字节归档（SHA77b59c4e3a4aa96485fabf2c009ba7e7e6e05aadfd37d8f68cb22c863c5d84c6），外部descriptor5ee32079347e5bc107bc3196ed22ac8bd33d224f55c465e316a225fa5790be9d。新restore70a5d3e1完成42操作，匿名payload独立只读复核后投影两个新消费者卷，12495 Cargo/2496 Gradle文件全量清单通过；原缓存保持。仅Cargo原7个0640文件在归档/新消费者中显式规范化0644，旧模式与每项转换均被descriptor绑定。结果SHAdcb16934a97d6717eb9a4f937cd47425f7d15218dfaae77834fef111da4aa6ac。
+
+源码strictUSTAR采用短别名与惰性JSON原路径映射，保留目录/空目录/模式及原owner记录，consumer owner规范化65534；原始source不变。实际exportedfb0b2d61f6从冷构建9436的RO源码导出1487文件/392目录，source.tar30914560字节，SHAcb2c58555bbbe5ac645c214ac9a29100ae6a329150e26d9f4c1b5e7bacf19144，外部descriptor8bb9ff1a0f3bfcd052997ff550cc8b1ed5cdc03bd6dc64d322c0bed400f79e43。restore9f97d47ab8f7全新Linux卷恢复及独立RO reopen核对全部内容/modes/owner；主执行者再核对宿主长路径与短路径artifacts/sr-9f97d47a全部文件字节、目录与原封印源码一致。长路径第一次stat遇MAX_PATH失败保留，随后用Win32长路径核对完整副本；为公开构建导出另一新短路径副本，未移动或覆盖原件。公共集成Linux控制52项51通过/1 Windows-only跳过；source集成控制需显式RO fixture，未提供时明确跳过。证据developer-archives-integrated-controls-cd9e72c4e923。
+
+同阶段新uninstall冷构建9436c4cf1c0e4ade全部7命令通过，776/0/24；完整sealed verify通过。runtime f500a8a300fd4f82于UTC11:46:28至11:51:46在同128MiB盘完成两次正常启动，strong raw验收通过，bundle24f7b87e2dcc9baedff77fe8e95f7e3c4996b2b6e93f27fd22d2433c863b7ec6、disk1adf18a6-081b-4d69-957e-c514e57cb695。export3467files成功，manifest4f4e4df9777fa8790d4a867c2293ee3c2b7eb476619e350b99aef8ad4e5b2635；public verify失败于tools/rust-image.json缺失。独立诊断确认runtimeInputs漏带cold.environment引用的三项工具收据，不改变exporter契约、不补写失败封印。完整3项收据已在新输入副本逐hash闭合，并保留8项缺失/篡改/未知引用控制；需新runtime代再验。旧失败代保持失败，不续用。formalQualification=false、finalSystemAccepted=false，整体交付未验收。

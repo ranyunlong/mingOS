@@ -49,6 +49,23 @@ python3 -I -B /source/scripts/boot/kotlin_delivery.py \
 
 ## 开发预览会话边界
 
+源码与 Cargo/Gradle 归档已有公开入口及实际新卷恢复证据，命令、输入布局和范围见 [VM 复建输入归档](vm-rebuild-inputs.md)。完整开发交付仍需后续实际构建、开发会话和交接验收。
+
+恢复后的源码与 Gradle 消费者已实际重新编译开发双包，独立容器和宿主回放通过。实际开发 bundle `developer-public-bundle-e512a7d9` 已生成并另起只读检查：完整 newc 流及 54 项必需文件、内核和配置均匹配。完整 pack 与真实开发 guest 仍待验收；以下预览不能保存 Text Entry 内容，因为当前该样例只有内存文本状态。
+
+公开 `scripts/boot/developer-vm-outer.ps1` 配置固定 Docker 外层、可信源码快照、全新工作/结果卷及完整 pack 只读挂载。它只接受新的证据目录和包外 SHA256，不接受包内 launcher 作为可信执行代码：
+
+```powershell
+./scripts/boot/developer-vm-outer.ps1 -Action new `
+  -Evidence C:/path/to/repo/artifacts/new-developer-session `
+  -PackVolume <已独立验证的完整包卷，包位于卷根> `
+  -PackManifestSha256 <包外精确小写SHA256>
+./scripts/boot/developer-vm-outer.ps1 -Action pair `
+  -Evidence C:/path/to/repo/artifacts/new-developer-session
+```
+
+`new` 固定 14 项 Linux 可信源码、宿主 helper、Tools image inspection 和卷身份；独立只读验证完整 pack。`pair` 在同一受控容器内初始化新盘并执行两次 start/inspect。每步仅可尝试一次，失败现场保留。PowerShell 34 项控制及独立 Linux driver 8 项控制通过；当前没有该公开外层真实 guest 成功记录。实际 pack 摘要和可运行代须从后续独立交接记录取得，示例占位符不代表已有发布包。
+
 独立 `developer-vm-v1` bundle profile 固定 Text Entry 与 Motion、15秒严格隔离会话及 `/data/mingos`，禁止输入脚本、测试事件、资格角色和安装/更新 fixture。所有 payload 文件、Host 来源收据、两包编译收据和 source-v2 probe 构建收据须精确绑定。该入口绑定已审来源，不在验证阶段重新运行编译器；真实冷构建、应用编译和独立回放仍须另外执行。当前 profile 控制已通过，真实开发 bundle 和 guest 工作流仍待执行。
 
 `scripts/boot/developer_vm.py` 提供 `verify`、`init`、`start`、`inspect` 生命周期入口。`init` 和 `start` 要求 Linux UID/GID65534、完整包只读挂载，以及固定私有目录 `/work/mingos-boot-infra-20261025`；包内 bundle 位于 `/pack/bundle`。协调器只执行独立安装的可信 `scripts/boot/vm.py`，不导入包内代码。新建数据盘固定128MiB，已有实例或部分初始化不能覆盖、重格式化或续建。
