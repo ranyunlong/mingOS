@@ -31,4 +31,4 @@ python3 -I -B /trusted/scripts/boot/linux_host_uninstall_export.py replay \
 
 已完成的显式恢复演练仅覆盖 Linux 受控进程中断、SIGKILL/reap 和显式恢复：615 个案例、770 次 kill/reap 身份、18 个父测试及 9 条实际 Host 观察。它不覆盖 guest 崩溃、断电、文件系统损坏或介质恢复。正常关机前同步成功也不证明这些耐久性。
 
-开发 VM 的正常跨容器重开、离线数据盘备份及在新卷恢复仍须由后续独立工作流实现和实测；当前 `developer-vm-outer.ps1` 仅提供同容器内的预览双启动。`formalQualification=false`、`finalSystemAccepted=false` 保持。
+Notes 开发工作流已实际完成正常跨容器重开、离线数据盘备份与新卷恢复：初次保存 A，第二次初载 A 并保存 B，恢复后第三次初载 B 且不再保存；三次正常 POWER、完整日志/SDK及停止后文件回放均通过。公开 `workflow_outer.py` 命令见 [Notes 开发会话](vm-workflow.md)。该备份依赖同 daemon 下保留的卷、prior 容器和 lineage，不是可携带的用户数据归档；旧 `developer-vm-outer.ps1` 保持预览范围。`formalQualification=false`、`finalSystemAccepted=false` 保持。

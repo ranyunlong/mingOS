@@ -2,6 +2,16 @@
 
 更新：2026-10-27。用户授权每个阶段完成后直接进入下一阶段，直到整体任务结束。阶段验收通过只表示该阶段结束，不表示整个操作系统已经完成。
 
+## 2026-11-07 Notes 三阶段持久化验收
+
+全新外层 `workflow-notes-actual-5de8a419`：首次保存13字节 `MingOS note A`，追加未保存编辑后正常 POWER；第二个容器初载精确 A，保存13字节 `MingOS note B` 并正常 POWER。停止后只读 fsck、文件导出、完整原始日志和SDK回放均通过。第二轮审查 SHA256 `8b71c9bbaa8347b53dc84c6f4edfc7b7089b920e3ad5f17dc455ffbff803f6bc`。
+
+离线备份收据 SHA256 `6e4b72f5595521cb0cde3dfc413e0783e87b46a054d20ae223ccfc2166731c7b`，backup manifest `542ad8ca4ad1f38d72d4525479fc413e4535b91e3afc272a00f6fae6934dbe7f`。恢复到新外层 `workflow-notes-restored-6bf321a8`、新工作/结果卷及新实例身份；第三次启动初载精确 B，未调用 save，正常 POWER。最终原始回放 `workflow-notes-sdk-restored3-73c9ed21/review-original.json` SHA256 `04e7156313fa64ad7b0b0a81668076311ea06b5ef191add522c7a3b0547b6698`，三次marker/session、应用严格资源回收、同步/卸载/kernel powerdown、精确容器exit0及磁盘字节均绑定，`threeStagePersistenceVerified=true`。原盘与备份保留。该备份仍依赖原daemon卷与lineage，不声称可迁携用户数据归档或断电恢复。
+
+停止后诊断导出原型曾因 `/helpers` 与实际 `/repo` 命令上下文不同拒绝；原失败保留，新原型仅绑定精确实际命令上下文。旧SDK runner在容器退出后尝试读取已消失tmpfs而失败，虽容器内回放成功仍不算宿主导出通过；新runner在同容器退出前严格传出原始review字节，再核对base64/SHA/stage，15控制通过，三轮实际均通过。没有放宽guest、POWER或磁盘门槛。
+
+新增完整交付操作文档；当前源码归档和八组件独立交接工具已公开，固定Tools的46项Linux控制零跳过。装配最后的组件根模式循环另实际执行4项Linux控制，全部通过。最终源码、运行包、缓存、三个镜像、更新/卸载证据、许可与收据的装配/外部导入单独记录实际收据。远程推送仍因先前自动审批拒绝未执行，不重复尝试；本地阶段提交继续。`formalQualification=false`、`finalSystemAccepted=false` 保持。
+
 ## 2026-11-07 归档恢复、应用复建与公开外层入口
 
 新增公开 `developer_cache.py` / `developer_cache_worker.py`、`source_archive.py`，以及 `developer-vm-outer.ps1` / `developer_vm_driver.py`。缓存工具执行外部摘要固定、严格归档验证、全新匿名恢复卷、消费者投影和两次独立只读复核；源码数据层使用别名归档，保留完整路径和模式映射。公开外层固定可信源码、Tools 镜像、挂载、命令和资源上限，单次 `new → pair` 保留全部尝试，不提供失败代续跑或重置。

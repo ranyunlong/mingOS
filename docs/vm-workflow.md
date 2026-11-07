@@ -16,7 +16,7 @@ Notes 的私有目录由可信宿主按已选择的包身份提供，无需共�
 
 公开 `scripts/boot/workflow_outer.py` 提供 `new/start/status/capture/click/key/type/power/reopen/offlinebackup/restore/inspect`。内部生命周期的 `backup` 对应外层 `offlinebackup`；外层没有 `verify` 子命令。下面的 PowerShell 命令使用此公开外层配置和监督 Docker 隔离。
 
-截至 2026-11-07，真实 `developer-workflow-v1` 新代 `8c4e19b7` 已启动，当前 `status` 为 `starting`，尚未 ready、发送输入或保存便签，实际运行验收进行中。以下是按实际 CLI 核对的操作说明，不是已经通过的保存、跨容器重开或恢复验收。最终可信源码清单、运行 pack 与收据 pins 尚待绑定独立交接记录。所有 `<...>` 均为待替换占位符，不代表已有可交付发布包。
+截至 2026-11-07，真实 `developer-workflow-v1` 已完成三阶段持久化验收：首次保存 `MingOS note A` 后追加未保存编辑并正常关机；第二个容器读出精确 A，保存 `MingOS note B` 并正常关机；离线备份恢复到新工作/结果卷后，第三个容器初始读出精确 B，未再次保存并正常关机。完整原始日志、SDK 操作、离线文件及历史链回放通过。运行 pack manifest 为 `273b38ceb8665d92743d8c4820939fb2c2a858deee4bb330e4af886b3fb7d1e6`；最终源码与整包摘要由包外交接收据固定。以下 `<...>` 是使用者路径或名称参数，不能直接照抄执行。
 
 ### 输入与信任
 
@@ -130,6 +130,8 @@ $ReceiptPin = '<独立固定的该backup.json的64位小写SHA256>'
 
 Notes/Motion 的实际离线强制重编、包适配和独立回放已通过；Notes 另通过 14 个真实 Kotlin/Wasm 存储合同和 4 个 Compose 输入/保存保护场景，存储能力使用替身。新控制接口及共享 boot/profile/input/pointer 控制在 Linux 中 143/143 通过，包含真实 Unix socket 和实际 main 参数入场，QMP 为明确替身。
 
-旧 `developer-vm-v1` 仍是固定 15 秒 Text Entry/Motion 预览，拒绝输入脚本和资格角色。其公开外层已实际完成同盘双启动、正常同步关机及原始结果回放（历史记录 `6d8f2b79`）。这不能替代 Notes 保存内容、正常跨容器重开、离线备份及新卷恢复；这些交付门槛仍在实施。
+真实 Notes 三阶段记录位于本机证据根的 `workflow-notes-actual-5de8a419` 与 `workflow-notes-restored-6bf321a8`。最后原始回放为 `workflow-notes-sdk-restored3-73c9ed21/review-original.json`，SHA256 `04e7156313fa64ad7b0b0a81668076311ea06b5ef191add522c7a3b0547b6698`，`normalBoots=3`、`threeStagePersistenceVerified=true`。A/B 均为13字节；导出逐字节核对，fsck 只读检查通过。三次均确认应用退出、资源回收、数据同步、卸载文件系统、kernel powerdown 与精确容器退出码0。单键 no-op 和 POWER 完成时序的原失败代完整保留；修正后的公共生命周期控制为 Linux 113/113、零跳过。
+
+旧 `developer-vm-v1` 仍是固定15秒 Text Entry/Motion 预览；历史 `6d8f2b79` 只保留其原始范围。Notes 上述验收覆盖正常保存、正常关机、跨容器重开及同 daemon 下新卷恢复，不证明异常断电、损坏介质、跨主机用户数据备份或物理输入。
 
 参见 [开发系统交付范围](vm-developer-system.md)、[复建输入](vm-rebuild-inputs.md) 与 [更新、卸载和恢复](vm-update-uninstall-recovery.md)。当前 `formalQualification=false`、`finalSystemAccepted=false`。

@@ -51,15 +51,15 @@ python3 -I -B /source/scripts/boot/kotlin_delivery.py \
 
 `developer-workflow-v1` 使用 Notes（SDK6）和 Motion（SDK5），900 秒正常交互会话及独立持久盘。公开 `scripts/boot/workflow_outer.py` 提供 `new/start/status/capture/click/key/type/power/reopen/offlinebackup/restore/inspect`；实际命令、可信输入、截图导出和恢复操作见 [Notes 开发会话](vm-workflow.md)。包使用独立的 `workflow-manifest.json`，与旧预览 `developer-vm-v1` 格式互相拒绝。
 
-外层 `new` 需要全新的 evidence、包外独立固定的 pack manifest SHA256，以及完整独立安装的可信 `--source` 树；源码和 evidence 不得重叠，不能执行 pack 内 launcher。最终受信源码清单和 pack pins 尚待绑定独立交接记录，文档占位符不代表已有发布包。`start` 只确认容器启动，输入前须由 `status` 确认 ready 且 inactive；后续正常启动及恢复后的首次启动用 `reopen`。只在正常 UI POWER 完成、精确容器实际退出码为 0 后执行 `inspect` 或 `offlinebackup`。
+外层 `new` 需要全新的 evidence、包外独立固定的 pack manifest SHA256，以及完整独立安装的可信 `--source` 树；源码和 evidence 不得重叠，不能执行 pack 内 launcher。当前 pack manifest 为 `273b38ceb8665d92743d8c4820939fb2c2a858deee4bb330e4af886b3fb7d1e6`，完整源码及八组件交接入口见 [复建输入](vm-rebuild-inputs.md)。`start` 只确认容器启动，输入前须由 `status` 确认 ready 且 inactive；后续正常启动及恢复后的首次启动用 `reopen`。只在正常 UI POWER 完成、精确容器实际退出码为0后执行 `inspect` 或 `offlinebackup`。
 
 备份使用全新 Docker 卷；`restore` 以宿主 `backup.json` 的独立 SHA256 入场，恢复到新的 work/results 卷和 generation，保留原备份与历史。收据 SHA256 与备份 manifest SHA256 不同。恢复还依赖保留的原备份卷、来源卷及精确 prior 容器；单独复制宿主收据不构成可迁移的完整备份。失败代保留容器、卷和日志，不清除锁存或原地重试。
 
-截至 2026-11-07，真实 workflow 新代 `8c4e19b7` 已启动，当前 `status` 为 `starting`，尚未 ready、发送输入或保存便签，实际运行验收进行中。独立 Linux 控制 103/103 通过（公共生命周期/pack/交互组合 73 项，加外层 30 项），guest、formatter、pack 入场或 Docker 生命周期使用明确替身（double），不构成真实 guest 验证。Notes/Motion 已完成实际离线编译、包适配及独立回放；Notes 的存储合同和 Compose 测试使用能力/输入替身。便签实际保存、正常跨容器重开、离线备份及新卷恢复仍待真实 guest 验收。演示启用便签明文字节诊断，只使用非敏感测试内容；`formalQualification=false`、`finalSystemAccepted=false`。
+截至 2026-11-07，Notes/Motion 已完成实际离线强制重编、包适配及独立回放。真实工作流完成保存 A、未保存编辑不落盘、跨容器读 A/保存 B、离线备份恢复到新卷后初载 B 的三次正常启动；最后完整日志/SDK/磁盘回放 SHA256 为 `04e7156313fa64ad7b0b0a81668076311ea06b5ef191add522c7a3b0547b6698`。实际三阶段记录与精确范围见 [Notes 开发会话](vm-workflow.md)。公共生命周期替身控制 Linux 113/113通过，不能与真实guest记录混同。演示启用便签明文字节诊断，只使用非敏感测试内容；`formalQualification=false`、`finalSystemAccepted=false`。
 
 ## 旧开发预览会话边界
 
-源码与 Cargo/Gradle 归档已有公开入口及实际新卷恢复证据，命令、输入布局和范围见 [VM 复建输入归档](vm-rebuild-inputs.md)。完整开发交付仍需后续实际构建、开发会话和交接验收。
+源码与 Cargo/Gradle 归档已有公开入口及实际新卷恢复证据，恢复输入的真实冷构建及应用重编已通过。命令、输入布局和范围见 [VM 复建输入归档](vm-rebuild-inputs.md)。最终整包使用独立交接收据记录装配、外部导入和只读复核结果。
 
 恢复后的源码与 Gradle 消费者已实际重新编译开发双包，独立容器和宿主回放通过。实际开发 bundle `developer-public-bundle-e512a7d9` 已生成并另起只读检查：完整 newc 流及 54 项必需文件、内核和配置均匹配。旧预览的完整 pack 和公共外层同盘双启动、正常同步关机已通过，原始结果回放见历史记录 `6d8f2b79`。该记录仅覆盖旧预览；以下预览不能保存 Text Entry 内容，因为该样例只有内存文本状态。
 
@@ -76,7 +76,7 @@ python3 -I -B /source/scripts/boot/kotlin_delivery.py \
 
 `new` 固定 14 项 Linux 可信源码、宿主 helper、Tools image inspection 和卷身份；独立只读验证完整 pack。`pair` 在同一受控容器内初始化新盘并执行两次 start/inspect。每步仅可尝试一次，失败现场保留。PowerShell 34 项控制及独立 Linux driver 8 项控制通过；该旧预览公开外层已实际完成同盘双启动和正常同步关机，原始结果回放对应历史记录 `6d8f2b79`。实际 pack 摘要和可运行代须从相应独立交接记录取得，示例占位符不代表已有发布包；该历史结果不证明 Notes 工作流已验收。
 
-独立 `developer-vm-v1` bundle profile 固定 Text Entry 与 Motion、15秒严格隔离会话及 `/data/mingos`，禁止输入脚本、测试事件、资格角色和安装/更新 fixture。所有 payload 文件、Host 来源收据、两包编译收据和 source-v2 probe 构建收据须精确绑定。该入口绑定已审来源，不在验证阶段重新运行编译器；真实冷构建、应用编译和独立回放仍须另外执行。该旧 profile 控制及上述预览双启动已通过；Notes 的实际交互、保存和恢复验收仍在进行。
+独立 `developer-vm-v1` bundle profile 固定 Text Entry 与 Motion、15秒严格隔离会话及 `/data/mingos`，禁止输入脚本、测试事件、资格角色和安装/更新 fixture。所有 payload 文件、Host 来源收据、两包编译收据和 source-v2 probe 构建收据须精确绑定。该入口绑定已审来源，不在验证阶段重新运行编译器；该旧 profile 控制及上述预览双启动保持原范围。Notes 使用上文独立工作流及其三阶段验收。
 
 `scripts/boot/developer_vm.py` 提供 `verify`、`init`、`start`、`inspect` 生命周期入口。`init` 和 `start` 要求 Linux UID/GID65534、完整包只读挂载，以及固定私有目录 `/work/mingos-boot-infra-20261025`；包内 bundle 位于 `/pack/bundle`。协调器只执行独立安装的可信 `scripts/boot/vm.py`，不导入包内代码。新建数据盘固定128MiB，已有实例或部分初始化不能覆盖、重格式化或续建。
 
@@ -105,4 +105,4 @@ python3 -I -B /trusted/scripts/boot/developer_vm.py inspect \
 3. 与交付来源一致的运行包、完整清单、命令和恢复说明；在移离原 checkout 后执行交接流程。
 4. 如实列出工具链依赖、许可材料、受支持宿主、开发密钥与恢复演练范围。正常关机和受控进程恢复不代表断电或介质损坏恢复。
 
-15秒预览、截图或盘 marker 连续性是中间验证，不能替代所选开发系统的交付。当前尚无完成上述全部门槛的发布包。实际阶段状态见 [系统状态](current-system-status.md) 和 [连续开发记录](continuous-development.md)。
+15秒预览、截图或盘 marker 连续性是中间验证。可交接开发系统的完整输入、公开命令及限制见 [交付操作](vm-delivery.md)；实际整包装配和移离原 checkout 的结果须以独立交接收据为准。实际阶段状态见 [系统状态](current-system-status.md) 和 [连续开发记录](continuous-development.md)。
