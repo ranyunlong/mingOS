@@ -224,6 +224,46 @@ class PersistentUpdateReceiptTests(unittest.TestCase):
         self.assertEqual(parser.committed_content, content(False))
         self.assertEqual(parser.private_content, private(False))
 
+    def test_terminal_clock_accepts_accumulated_empty_polls(self):
+        values = chain()
+        terminal = next(v['receipt'] for v in values if v['kind'] == 'startup-confirmed')
+        clock = terminal['anchor']['history'][0]['frameClock']
+        clock.update(pending=7, waits=10)
+        self.replay(values)
+        clock.update(pending=2**64 - 4, waits=2**64 - 1, reads=2**64 - 1)
+        self.replay(values)
+
+    def test_terminal_clock_counters_are_u64_and_waits_account_for_every_poll(self):
+        fields = ('closes', 'cancels', 'frames', 'inputs', 'pending', 'reads', 'timers', 'waits')
+        mutations = [(key, bad) for key in fields for bad in (True, -1, 2**64, 1.5)]
+        mutations += [('source', 'other'), ('waits', 4), ('pending', 1), ('closes', 0), ('cancels', 1)]
+        for key, bad in mutations:
+            values = chain()
+            terminal = next(v['receipt'] for v in values if v['kind'] == 'startup-confirmed')
+            terminal['anchor']['history'][0]['frameClock'][key] = bad
+            with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                self.replay(values)
+        # Balanced totals must not bypass the required terminal Close/no Cancel.
+        for change in ({'closes': 0, 'waits': 2}, {'cancels': 1, 'waits': 4}):
+            values = chain()
+            terminal = next(v['receipt'] for v in values if v['kind'] == 'startup-confirmed')
+            terminal['anchor']['history'][0]['frameClock'].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.replay(values)
+
+    def test_terminal_clock_rejects_missing_and_extra_statistics(self):
+        for key in ('source', 'pending', 'waits'):
+            values = chain()
+            terminal = next(v['receipt'] for v in values if v['kind'] == 'startup-confirmed')
+            del terminal['anchor']['history'][0]['frameClock'][key]
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.replay(values)
+        values = chain()
+        terminal = next(v['receipt'] for v in values if v['kind'] == 'startup-confirmed')
+        terminal['anchor']['history'][0]['frameClock']['outstanding'] = 0
+        with self.assertRaises(ValueError):
+            self.replay(values)
+
     def test_commit_can_arrive_before_complete_close_release(self):
         self.replay(chain(early_commit=True))
 

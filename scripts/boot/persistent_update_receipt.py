@@ -356,7 +356,11 @@ class PersistentUpdateReceipts:
         if 'frameClock' in row:
             frame = row['frameClock']
             exact(frame, ('source', 'closes', 'cancels', 'frames', 'inputs', 'pending', 'reads', 'timers', 'waits'))
-            if frame['source'] != 'host-monotonic-opportunity' or any(not integer(v) for k, v in frame.items() if k != 'source'):
+            # FrameClockStats.pending counts completed waits returning no event;
+            # it is cumulative, not a count of outstanding worker requests.
+            if (frame['source'] != 'host-monotonic-opportunity'
+                    or any(not integer(v, 0, 2**64 - 1) for k, v in frame.items() if k != 'source')
+                    or frame['waits'] != sum(frame[key] for key in ('frames', 'timers', 'inputs', 'closes', 'cancels', 'pending'))):
                 raise ValueError('persistent update frame clock')
         worker_telemetry(row)
         return row
@@ -472,7 +476,7 @@ class PersistentUpdateReceipts:
                 or not integer(row['firstReadyMs']) or not integer(row['firstFrameMs'])
                 or row['firstFrameMs'] > row['firstReadyMs'] or not integer(row['framesSubmitted'], 1)
                 or not integer(row['presentedSourceSequence'], 1) or row.get('frameClock', {}).get('closes') != 1
-                or row.get('frameClock', {}).get('cancels') != 0 or row.get('frameClock', {}).get('pending') != 0
+                or row.get('frameClock', {}).get('cancels') != 0
                 or ('isolation' in row and any(row['isolation'][key] is not True for key in ('prepared', 'applied', 'cleaned')))):
             raise ValueError('persistent update incomplete terminal worker lifecycle')
         if proof:

@@ -2333,6 +2333,9 @@ impl Session {
         for (index, result) in completed.into_iter().rev() {
             let mut a = self.instances.remove(index);
             let join = a.worker.take().map(|w| w.join());
+            // Kernel cleanup may finish after this poll's initial snapshot.
+            // Joining makes the shared isolation receipt final, including failure.
+            self.records[a.record].isolation = a.isolation.as_ref().map(|s| s.snapshot());
             #[cfg(target_os = "linux")]
             let update_startup = a.update_startup.take();
             #[cfg(target_os = "linux")]
@@ -5046,6 +5049,65 @@ mod close_grace_tests {
         let kinds: Vec<_> = session.trace.iter().map(|event| event.kind).collect();
         assert_eq!(kinds, ["terminal-reply-written", "result-accepted", "worker-reaped", "worker-result", "failed"]);
         assert!(session.records[0].completed);
+    }
+    #[test]
+    fn terminal_isolation_snapshot_refreshes_after_worker_join() {
+        let (mut session, _bridge, _keepalive) = closing_session(crate::desktop_catalog::IsolationMode::Strict);
+        session.instances[0].closing = None;
+        let isolation = supervisor::StrictLaunch::new(1, 1, 20001).unwrap();
+        {
+            let mut status = isolation.status.lock().unwrap();
+            status.prepared = true;
+            status.applied = true;
+        }
+        session.instances[0].isolation = Some(isolation.clone());
+        let (tx, rx) = mpsc::sync_channel(0);
+        session.instances[0].result = rx;
+        let cleanup = isolation.clone();
+        session.instances[0].worker = Some(thread::spawn(move || {
+            // Rendezvous cannot finish until poll has taken its initial isolation
+            // snapshot. Joining must observe this later shared cleanup receipt.
+            tx.send(Err(anyhow!("TEST_TERMINAL_EXECUTION_FAILURE"))).unwrap();
+            cleanup.status.lock().unwrap().cleaned = true;
+        }));
+        let limit = Instant::now() + Duration::from_secs(2);
+        while !session.instances.is_empty() {
+            assert!(Instant::now() < limit);
+            session.poll().unwrap();
+            thread::yield_now();
+        }
+        assert!(isolation.snapshot().cleaned, "worker joined after publishing its cleanup receipt");
+        let record = &session.records[0];
+        assert!(record.completed);
+        assert_eq!(record.status, "failed");
+        assert!(record.error.as_deref().unwrap().contains("TEST_TERMINAL_EXECUTION_FAILURE"));
+        assert!(record.isolation.as_ref().unwrap().cleaned,
+            "terminal history must refresh the early poll snapshot after worker join");
+    }
+    #[test]
+    fn terminal_isolation_snapshot_does_not_invent_failed_cleanup() {
+        let (mut session, _bridge, _keepalive) = closing_session(crate::desktop_catalog::IsolationMode::Strict);
+        session.instances[0].closing = None;
+        let isolation = supervisor::StrictLaunch::new(1, 1, 20001).unwrap();
+        session.instances[0].isolation = Some(isolation.clone());
+        let (tx, rx) = mpsc::sync_channel(0);
+        session.instances[0].result = rx;
+        session.instances[0].worker = Some(thread::spawn(move || {
+            tx.send(Err(anyhow!("TEST_ISOLATION_CLEANUP_FAILURE"))).unwrap();
+        }));
+        let limit = Instant::now() + Duration::from_secs(2);
+        while !session.instances.is_empty() {
+            assert!(Instant::now() < limit);
+            session.poll().unwrap();
+            thread::yield_now();
+        }
+        assert!(!isolation.snapshot().cleaned);
+        let record = &session.records[0];
+        assert!(record.completed);
+        assert_eq!(record.status, "failed");
+        assert!(record.error.as_deref().unwrap().contains("TEST_ISOLATION_CLEANUP_FAILURE"));
+        assert!(!record.isolation.as_ref().unwrap().cleaned,
+            "native worker completion must not fabricate successful kernel cleanup");
     }
     #[test]
     fn lifecycle_deadline_keeps_checking_but_logs_once() {
