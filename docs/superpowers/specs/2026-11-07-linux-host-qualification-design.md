@@ -38,6 +38,12 @@ Kotlin 固定当前 Gradle wrapper 8.14.5 及其 SHA、Kotlin/Compose plugin 2.3
 
 任何首次失败即停止后续步骤，第一轮失败不跑第二轮；保留命令、日志、磁盘、卷与失败记录，不自动重试、格式化或扩大预算。修复后以新的完整冻结代执行。最终独立导出 checker 只证明其明确覆盖的正常重启资格，不将其升级为整个系统交付。
 
-## 尚未交付的恢复功能
+## Qualification 资产恢复工具与证据边界
 
-用户已批准的 qualification 资产恢复工具仍有未完成项：可信 manifest 归档的实际镜像内容绑定、导入后的固定 ID 验证、现有资源保护，以及适用缓存恢复的所有权和完整性校验。当前写入入口临时拒绝；本设计的依赖重新下载、fixture 重建、更新失败回滚和 checker 均不等于该工具已完成。它是开发资产工具，不额外引入产品级备份系统。`finalSystemAccepted=false` 保持到原交付要求有完整证据关闭；不得只完成测试或文档便宣称 MingOS 已交付。
+用户批准的开发资产恢复入口已实现。默认/`-ValidateOnly` 仍只报告 `archive-hashes-matched`；独立 `-LoadImages` 在导入前绑定唯一 config、固定历史 image ID、layer diffID 与 OCI 引用，以私有无标签副本顺序加载并核对精确 ID。`-ValidateOnly`、`-LoadImages`、`-RestoreVolume` 互斥，不改变历史 driver 或固定摘要。
+
+`-RestoreVolume` 在任何 Docker 调用前核对外层 manifest、镜像归档文件哈希及严格 USTAR 缓存归档，并冻结私有副本。它不加载镜像，也不把镜像归档的文件哈希核对写成镜像内容证明。固定本地 helper 为 `sha256:88624fbbfcb6b7ac6f1207491053cbe6fd435262f0ce547443fb36760c7e9d80`，create 使用 `--pull never`。creator 通过省略 source 的 `volume-nocopy` mount 原子取得新匿名卷；`volume.name` 仅为 provenance，不能选择或复用现有卷。根和 `control/` 为 UID/GID65534、0700；缓存单独放入 `payload/`，成功收据明确 `subpath="payload"`。root initializer 仅有 CHOWN，实际 worker 为 UID/GID65534、cap-drop ALL、禁网、只读 root。
+
+归档嵌入完整清单，只允许明确父目录及 regular 单链接文件，绑定 UID/GID65534、受限 mode、size 和 SHA-256；拒绝 PAX/GNU、link/device、路径穿越、重复成员及额外 payload。Linux worker 先独立验证私有字节，再用 NOFOLLOW/EXCL、目录描述符、独占 lease 和 fsync 写入，随后核验完整 inventory。writer 确认正常退出后，独立容器以真实 RO mount 重开，核验 ST_RDONLY、外部收据与完整 owner/mode/nlink/身份/内容。成功仅为 `volume-restored-readonly-verified`。任一失败或超时停止后续阶段，私有副本、顺序收据、日志、部分 payload、容器与卷原样保留，不删除、覆盖或自动续跑。
+
+真实控制代 `artifacts/environment-rebuild-20261107/restore-volume-root-controls/restore-live-b144eca66993/` 的两个并发公共入口各恢复到不同匿名卷，并独立只读核验；来源名所指的已有 sentinel 卷前后身份、权限、链接数和字节不变，Linux 综合控制110项、108通过、2个非Linux边界跳过。这是 synthetic 控制输入，`historicalAssetsRestored=false`，不证明历史资产已取得或恢复。工具成功、依赖重新下载、fixture 重建、更新失败回滚和 checker 各自只证明其明确范围；所有恢复收据保持 `formalQualification=false`、`finalSystemAccepted=false`，不能据此声明整个 MingOS 已交付。

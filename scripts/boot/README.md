@@ -10,13 +10,13 @@
 
 ## Qualification 资产恢复
 
-当前入口仅校验归档文件与 manifest 的 SHA-256 是否一致，以及 manifest 声明的 rust、tools、openssl image ID 是否等于历史合同。成功状态为 `archive-hashes-matched`；这不证明 tar 内容有效、归档包含声明的镜像或资产来源可信。默认模式和 `-ValidateOnly` 均不调用 Docker。
+默认模式和 `-ValidateOnly` 仅校验归档文件与 manifest 的 SHA-256 是否一致，以及 manifest 声明的 rust、tools、openssl image ID 是否等于历史合同。成功状态为 `archive-hashes-matched`；这不证明 tar 内容有效、归档包含声明的镜像或资产来源可信。这两个模式均不调用 Docker。
 
 ~~~powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/boot/restore-qualification-assets.ps1 -AssetRoot C:\path\to\qualification-assets -Manifest C:\path\to\qualification-assets\manifest.json -ValidateOnly
 ~~~
 
-`-LoadImages` 是显式镜像加载入口，不能与 `-ValidateOnly` 同用。它通过 Python 3 helper 先验证全部三个 Docker save 归档：每档唯一镜像、config 原始字节 SHA-256 等于历史固定 image ID、config 的每个 `rootfs.diff_ids` 等于对应 layer 解压后的 SHA-256。支持 legacy `layer.tar`、blob 路径和 gzip layer；含 OCI index 的归档只接受能绑定相同 config/layers 的单一引用链。多镜像、多平台、外部引用、重复成员/JSON key、路径穿越、link/device 和额外 payload 均拒绝。OCI-only 导出不在支持范围。
+`-ValidateOnly`、`-LoadImages`、`-RestoreVolume` 三个显式模式互斥。`-LoadImages` 通过 Python 3 helper 先验证全部三个 Docker save 归档：每档唯一镜像、config 原始字节 SHA-256 等于历史固定 image ID、config 的每个 `rootfs.diff_ids` 等于对应 layer 解压后的 SHA-256。支持 legacy `layer.tar`、blob 路径和 gzip layer；含 OCI index 的归档只接受能绑定相同 config/layers 的单一引用链。多镜像、多平台、外部引用、重复成员/JSON key、路径穿越、link/device 和额外 payload 均拒绝。OCI-only 导出不在支持范围。
 
 全部归档通过后，helper 在私有临时文件中生成只含已验证 config/layers 和空 `RepoTags` 的 tar，通过 stdin 顺序执行 `docker image load --quiet`，每次随后 `docker image inspect` 核对固定 ID。源标签及其他引用不会传给 Docker；工具不提供删除、覆盖 volume 或替换固定摘要的功能。失败立即停止并输出已发生操作和首个失败，保留已加载镜像。成功状态为 `image-load-verified`，`formalQualification=false`、`finalSystemAccepted=false`。
 
@@ -24,7 +24,31 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/boot/restore-qua
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/boot/restore-qualification-assets.ps1 -AssetRoot C:\path\to\qualification-assets -LoadImages -PythonExecutable C:\path\to\python.exe
 ~~~
 
-可省略 `-PythonExecutable`，入口优先使用 Codex bundled Python，再查找 PATH 中的 Python 3。`-RestoreVolume` 继续在读取资产和调用 Docker 前明确拒绝，`-VolumeHelperImage` 仅为保留的兼容参数。镜像加载不能补足历史宿主缓存或构成正式资格验收。
+可省略 `-PythonExecutable`，入口优先使用 Codex bundled Python，再查找 PATH 中的 Python 3。镜像加载不能补足历史宿主缓存或构成正式资格验收。
+
+### RestoreVolume 合同与入口
+
+`-RestoreVolume` 已实现，要求外层 schemaVersion 1 manifest 中仍有三个固定历史 image ID、对应归档及 SHA-256，并具有 `volume` 对象（`name`、`archive`、`archiveSha256`）。此模式核对三个镜像归档的文件哈希，但不加载镜像，也不以此证明其镜像内容有效；镜像内容绑定由独立 `-LoadImages` 模式处理。`volume.name` 仅记录来源，绝不作为目标卷名。
+
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/boot/restore-qualification-assets.ps1 -AssetRoot C:\path\to\qualification-assets -RestoreVolume -ReceiptRoot C:\existing-evidence\new-restore-run -PythonExecutable C:\path\to\python.exe
+~~~
+
+`-ReceiptRoot` 必须是父目录已存在的全新目录；省略时使用仓库 `artifacts/qualification-restore/` 下的唯一目录。helper 固定为本地 Linux amd64 image `sha256:88624fbbfcb6b7ac6f1207491053cbe6fd435262f0ce547443fb36760c7e9d80`，所有 create 使用 `--pull never`。`-VolumeHelperImage` 默认即此 ID，任何不同值均拒绝，不下载或替换缺失 helper。
+
+卷归档只接受未压缩的严格 USTAR，必须恰好包含一个根级 `restore-manifest.json` 和清单中的全部 payload。清单示例：
+
+~~~json
+{"schemaVersion":1,"uid":65534,"gid":65534,"entries":[{"path":"cache","type":"directory","uid":65534,"gid":65534,"mode":493},{"path":"cache/data","type":"file","uid":65534,"gid":65534,"mode":420,"size":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","nlink":1}]}
+~~~
+
+JSON mode 为十进制整数（493=`0755`，420=`0644`）；tar header 的 owner/mode/size 和文件内容必须与清单一致。每层父目录须显式列出；文件仅支持 `0600/0644/0700/0755`，目录仅支持 `0700/0755`，实际文件要求 regular、单链接和 UID/GID65534。拒绝 PAX/GNU、gzip、link/device/FIFO、路径穿越、重复成员/JSON key、隐式父目录、非零 padding 和额外 payload；普通 Docker tar 导出不保证符合此格式。上限为归档64GiB、单文件32GiB、嵌入清单16MiB、payload 100000项。
+
+完整归档在任何 Docker 调用前经过私有副本验证，Linux worker 在写 payload 前再次独立验证。creator 用省略 source 的 `volume-nocopy` mount 原子分配全新 Docker 匿名卷，随后核对精确 CID、nonce、镜像及 requested/effective mounts。根与 `control/` 为 UID/GID65534、`0700`；root initializer 仅保留 CHOWN，实际恢复和验证 worker 为 UID/GID65534、cap-drop ALL、禁网、只读 root。缓存位于 `payload/`，收据明确 `subpath="payload"`；`control/` 内的私有归档、lease 和完成收据不属于缓存。
+
+写入使用相对目录描述符、NOFOLLOW/EXCL、协作独占 lease、完整字节哈希和 file/directory fsync；不接纳已有目标，也不覆盖或续跑失败卷。确认 writer 正常停止后，另一个容器以真实 read-only volume mount 重开，通过 `ST_RDONLY`、外部完成收据绑定及完整 inventory/owner/mode/nlink/内容哈希核验。成功状态为 `volume-restored-readonly-verified`。每个命令前后保留顺序收据及完整 stdout/stderr；失败或超时立即停止后续阶段，私有副本、部分输出、所有容器和卷均保留，不执行 rm/prune/删除或回滚。Windows 主机目录 fsync 不可用时收据明确 `hostDirectoryFsync=false`。
+
+2026-11-07 已通过两路并发的真实公共入口恢复，各获得不同匿名卷并经独立容器只读重开；外层来源名故意指向已有 sentinel 卷，其 inode、owner/mode、nlink 和内容 SHA 在操作前后不变。真实固定镜像 Linux 综合控制110项、108通过、2个非Linux边界跳过。证据在 `artifacts/environment-rebuild-20261107/restore-volume-root-controls/restore-live-b144eca66993/` 的 `result.json`、`public-{1,2}.stdout.log` 与 `linux-controls-run.stderr.log`。这些输入是 synthetic 控制数据，`historicalAssetsRestored=false`，没有恢复历史缓存或加载历史镜像。工具及控制成功始终保持 `formalQualification=false`、`finalSystemAccepted=false`。
 
 ### 历史 Task9 的实际依赖
 

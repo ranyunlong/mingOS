@@ -6,7 +6,8 @@ param(
   [switch]$ValidateOnly,
   [switch]$LoadImages,
   [switch]$RestoreVolume,
-  [string]$VolumeHelperImage = 'debian:trixie-slim',
+  [string]$VolumeHelperImage = 'sha256:88624fbbfcb6b7ac6f1207491053cbe6fd435262f0ce547443fb36760c7e9d80',
+  [string]$ReceiptRoot = '',
   [string]$PythonExecutable = ''
 )
 
@@ -23,11 +24,11 @@ function Fail([string]$Message) {
   throw ('QUALIFICATION_ASSET_RESTORE_BLOCKED: ' + $Message)
 }
 
-if ($RestoreVolume) {
-  Fail 'mutating restore is disabled for volumes pending safe ownership verification'
+if (($ValidateOnly -and ($LoadImages -or $RestoreVolume)) -or ($LoadImages -and $RestoreVolume)) {
+  Fail 'ValidateOnly, LoadImages and RestoreVolume are mutually exclusive'
 }
-if ($ValidateOnly -and $LoadImages) {
-  Fail 'cannot combine ValidateOnly and LoadImages'
+if ($RestoreVolume -and $VolumeHelperImage -cne 'sha256:88624fbbfcb6b7ac6f1207491053cbe6fd435262f0ce547443fb36760c7e9d80') {
+  Fail 'RestoreVolume requires the exact fixed helper image ID'
 }
 
 function Assert-Hash([string]$Value, [string]$Name) {
@@ -130,9 +131,10 @@ if ($null -ne $record.volume) {
   if ($actual -ne $record.volume.archiveSha256) { Fail 'volume archive SHA-256 mismatch' }
 }
 
-if ($LoadImages) {
-  $helper = Join-Path $PSScriptRoot 'qualification_image_archive.py'
-  if (!(Test-Path -LiteralPath $helper -PathType Leaf)) { Fail 'image archive verification helper is missing' }
+if ($LoadImages -or $RestoreVolume) {
+  $helperName = if ($RestoreVolume) { 'qualification_volume_restore.py' } else { 'qualification_image_archive.py' }
+  $helper = Join-Path $PSScriptRoot $helperName
+  if (!(Test-Path -LiteralPath $helper -PathType Leaf)) { Fail 'qualification restoration helper is missing' }
   if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
     $bundledPython = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
     if (Test-Path -LiteralPath $bundledPython -PathType Leaf) {
@@ -146,8 +148,15 @@ if ($LoadImages) {
   if (![IO.Path]::IsPathRooted($PythonExecutable) -or !(Test-Path -LiteralPath $PythonExecutable -PathType Leaf)) {
     Fail 'PythonExecutable must name an existing absolute Python 3 executable'
   }
-  & $PythonExecutable -B $helper --asset-root $root --manifest $manifest
-  if ($LASTEXITCODE -ne 0) { Fail ('verified image load failed; preserved prior operations; exit ' + $LASTEXITCODE) }
+  $pythonArguments = @('-B', $helper, '--asset-root', $root, '--manifest', $manifest)
+  if ($RestoreVolume -and ![string]::IsNullOrWhiteSpace($ReceiptRoot)) {
+    $pythonArguments += @('--receipt-root', [IO.Path]::GetFullPath($ReceiptRoot))
+  }
+  & $PythonExecutable @pythonArguments
+  if ($LASTEXITCODE -ne 0) {
+    $operationName = if ($RestoreVolume) { 'volume restore' } else { 'image load' }
+    Fail ('verified ' + $operationName + ' failed; preserved all resources and prior operations; exit ' + $LASTEXITCODE)
+  }
   return
 }
 
