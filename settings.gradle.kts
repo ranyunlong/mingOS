@@ -39,6 +39,9 @@ project(":animated-demo").projectDir = file("samples/animated-demo")
 include(":text-entry-demo")
 project(":text-entry-demo").projectDir = file("samples/text-entry-demo")
 
+include(":notes-demo")
+project(":notes-demo").projectDir = file("samples/notes-demo")
+
 include(":persistent-uninstall-demo")
 project(":persistent-uninstall-demo").projectDir = file("samples/persistent-uninstall-demo")
 

@@ -4,7 +4,7 @@ import argparse,hashlib,json,os,re,shutil,subprocess,uuid
 from pathlib import Path
 IMAGE='sha256:5fba561826e826a26e5179d8b58425d0b5125d679e7dc64459d38bad0c6e417f'
 REQUIRED_SOURCE=('scripts/boot/build-linux-host-kotlin.mjs','scripts/boot/linux-host-kotlin.init.gradle','gradle/wrapper/gradle-wrapper.jar','gradle/wrapper/gradle-wrapper.properties','settings.gradle.kts','build.gradle.kts')
-PROFILES={'developer':['text-entry-demo','animated-demo'],'uninstall':['read-file','image-viewer','text-entry-demo','uninstall'],'update':['read-file','image-viewer','text-entry-demo','old','new','absent-write']}
+PROFILES={'developer':['text-entry-demo','animated-demo'],'developer-workflow':['notes-demo','animated-demo'],'uninstall':['read-file','image-viewer','text-entry-demo','uninstall'],'update':['read-file','image-viewer','text-entry-demo','old','new','absent-write']}
 TMPFS='rw,nosuid,nodev,size=1g,mode=1777'
 
 def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -21,7 +21,7 @@ def path_check(path,exists=True):
 
 def validate(options):
     o=dict(options)
-    if o.get('profile') not in PROFILES:raise ValueError('explicit developer, update or uninstall profile required')
+    if o.get('profile') not in PROFILES:raise ValueError('explicit supported Kotlin delivery profile required')
     for name in ('repo','baseline'):o[name]=path_check(o[name])
     o['output']=path_check(o['output'],False)
     if not o['repo'].is_dir() or not o['baseline'].is_file():raise ValueError('source directory and baseline file required')

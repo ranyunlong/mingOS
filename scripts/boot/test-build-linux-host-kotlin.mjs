@@ -39,6 +39,16 @@ test('developer Motion selects its own forced offline SDK5 source task',()=>{
   assert.ok(!args.some(arg=>arg.startsWith('-PpersistentUpdateFixture=')));
   for(const fixture of ['old','new','absent-write'])assert.throws(()=>parseOptions(['animated-demo',fixture]));
 });
+
+test('notes selects its own offline source task and refuses update fixture arguments',()=>{
+  const options=parseOptions(['notes-demo']);
+  assert.equal(options.sample,'notes-demo');assert.equal(options.fixture,null);
+  const args=gradleArguments({...paths,...options});
+  assert.ok(args.includes(':notes-demo:compileProductionExecutableKotlinWasmWasi'));
+  for(const flag of ['--offline','--rerun-tasks','--no-build-cache','--no-configuration-cache'])assert.ok(args.includes(flag));
+  assert.ok(!args.some(arg=>arg.startsWith('-PpersistentUpdateFixture=')));
+  for(const fixture of ['old','new','absent-write'])assert.throws(()=>parseOptions(['notes-demo',fixture]));
+});
 test('compiler failure and signals cannot reach packaging',()=>{
   requireCompilerSuccess({exitCode:0,signal:null});
   for(const result of [{exitCode:1,signal:null},{exitCode:null,signal:'SIGKILL'},{exitCode:0,signal:'SIGTERM'}])assert.throws(()=>requireCompilerSuccess(result));
@@ -121,6 +131,15 @@ test('uninstall validates its actual install-demo identity and SDK6 adapter cont
 });
 test('uninstall cannot package a text-only module without private file capability',()=>{
   assert.throws(()=>validatePackage(wasm(uninstallImports.slice(0,-1)),'persistent-uninstall-demo',null,uninstallManifest),/Missing SDK capability ming_private_files_v2.call/);
+});
+
+test('notes requires its own SDK6 identity and private file capability',()=>{
+  const manifest={schemaVersion:1,id:'dev.ming.notes-demo',version:'0.1.0',sdkVersion:6,entry:'main.wasm'};
+  const result=validatePackage(wasm(uninstallImports),'notes-demo',null,manifest);
+  assert.ok(result.imports.some(row=>row.module==='ming_private_files_v2'&&row.name==='call'));
+  assert.throws(()=>validatePackage(wasm(uninstallImports.slice(0,-1)),'notes-demo',null,manifest),/Missing SDK capability ming_private_files_v2.call/);
+  for(const change of [{id:'dev.ming.text-entry-demo'},{version:'0.2.0'},{sdkVersion:5}])assert.throws(()=>validatePackage(wasm(uninstallImports),'notes-demo',null,{...manifest,...change}));
+  assert.throws(()=>validatePackage(wasm(uninstallImports),'notes-demo','old',manifest));
 });
 test('uninstall replay binds its own manifest, compiler bytes and frozen source hashes',async()=>{
   // Synthetic replay receipt exercises integrity gates, not actual Kotlin execution.

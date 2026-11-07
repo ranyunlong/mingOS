@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 const sha=x=>createHash('sha256').update(x).digest('hex');
-export const profiles={developer:['text-entry-demo','animated-demo'],uninstall:['read-file','image-viewer','text-entry-demo','uninstall'],update:['read-file','image-viewer','text-entry-demo','old','new','absent-write']};
+export const profiles={developer:['text-entry-demo','animated-demo'],'developer-workflow':['notes-demo','animated-demo'],uninstall:['read-file','image-viewer','text-entry-demo','uninstall'],update:['read-file','image-viewer','text-entry-demo','old','new','absent-write']};
 export function identity(label){return ['old','new','absent-write'].includes(label)?{sample:'persistent-update-demo',fixture:label}:{sample:label==='uninstall'?'persistent-uninstall-demo':label,fixture:null}}
 export function commandFor(label,node){const {sample,fixture}=identity(label);return[node,'/repo/scripts/boot/build-linux-host-kotlin.mjs',sample,...(fixture?[fixture]:[]),'--repo','/repo','--work-root','/work/'+label,'--output-root','/out/packages/'+label,'--gradle-home','/deps/gradle','--dependency-manifest','/out/chain/'+label+'.dependency-manifest.json']}
 export async function verifyReplayContracts({meta,readFile,verifyPackage,node}){

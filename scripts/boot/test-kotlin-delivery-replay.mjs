@@ -4,7 +4,7 @@ import {createHash} from 'node:crypto';
 import {verifyReplayContracts} from './kotlin_delivery_replay.mjs';
 const sha=x=>createHash('sha256').update(x).digest('hex');
 function fixture(profile='uninstall'){
- const labels=profile==='developer'?['text-entry-demo','animated-demo']:profile==='uninstall'?['read-file','image-viewer','text-entry-demo','uninstall']:['read-file','image-viewer','text-entry-demo','old','new','absent-write'];
+ const labels=profile==='developer-workflow'?['notes-demo','animated-demo']:profile==='developer'?['text-entry-demo','animated-demo']:profile==='uninstall'?['read-file','image-viewer','text-entry-demo','uninstall']:['read-file','image-viewer','text-entry-demo','old','new','absent-write'];
  const meta={generation:'fresh-generation',profile,labels,runnerSha256:'r'.repeat(64),initSha256:'i'.repeat(64),baselineManifestSha256:'b'.repeat(64)};
  const tree={files:{'cache.jar':'a'.repeat(64)},directories:['']};const files=new Map();
  const put=(p,v)=>files.set(p,Buffer.from(JSON.stringify(v)));
@@ -38,3 +38,5 @@ test('valid update six-package identity chain',async()=>{const f=fixture('update
 test('old update package cannot satisfy new update fixture',async()=>{const f=fixture('update');f.put('/out/packages/new/build-receipt.json',{sample:'persistent-update-demo',fixture:'old',status:'passed'});await assert.rejects(f.run())});
 
 test('valid developer two-package identity chain',async()=>{const f=fixture('developer');assert.equal((await f.run()).length,2)});
+
+test('workflow replays notes and Motion without using an update fixture',async()=>{const f=fixture('developer-workflow');const results=await f.run();assert.equal(results.length,2);assert.equal(results[0].sample,'notes-demo');assert.equal(results[0].fixture,null)});

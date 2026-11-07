@@ -72,7 +72,7 @@ class Controls(unittest.TestCase):
     def options(self,profile='uninstall'):
         return {'repo':self.repo,'output':self.root/'new-output','baseline':self.baseline,'original_cache':'original-cache','profile':profile,'docker':'docker'}
     def test_profiles_and_boundaries(self):
-        for profile,count in [('uninstall',4),('update',6),('developer',2)]:
+        for profile,count in [('uninstall',4),('update',6),('developer',2),('developer-workflow',2)]:
             o=self.options(profile);o['output']=self.root/profile;fake=FakeDocker();result=m.run(o,fake)
             self.assertEqual(result['status'],'pipeline-completed');self.assertEqual(len(result['labels']),count)
             creates=[a for a,_ in fake.calls if a[0]=='create'];self.assertEqual(len(creates),count+3)
