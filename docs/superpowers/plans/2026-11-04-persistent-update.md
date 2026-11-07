@@ -350,3 +350,7 @@ cargo build --offline --locked --release -p ming-app-host --bin ming-app-host --
 - 不修改candidate2、独立新正式资格、无恢复普通boot2、真实进程恢复与双启动分别验收：全局约束及Task5/8/9。
 
 此计划完成表示后续工作可逐项执行和审阅；不表示这些接口、测试、构建或资格已经完成。任何执行中发现的新窗口必须在其所属Task补充行为反例与状态分类，保持设计支持范围，不能删除无旧目录或中断恢复路径以换取通过。
+
+### 2026-11-07 当前宿主 Task9 补充
+
+原macOS/APFS不可访问，历史driver与旧失败冻结不改。独立Linux新来源代fd90bae03bd34a57已完整执行上述十步release合同并独立核验：all-targets773/0/24，三个controller和public integration各1/0/0/0，恢复父矩阵18/0/1/0。新runtime5f056322a31e4974以确切源码、六包、几何ELF、source-v2探针、6042文件tools清单完成freeze/fixture/root review/bundle与无guest admission；原checker24、driver31及VM边界拦截均通过。正常同盘双启动和portable export仍待执行，不将新Linux合同记成原APFS driver通过，`finalSystemAccepted=false`。具体证据与首失败保留见continuous-development及2026-11-07环境记录。

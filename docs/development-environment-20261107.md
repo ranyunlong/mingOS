@@ -52,3 +52,5 @@ Windows 来源准备已真实编译 read-file 和 image-viewer，`npm run test:k
 按照[新宿主资格设计](superpowers/specs/2026-11-07-linux-host-qualification-design.md)与[实施计划](superpowers/plans/2026-11-07-linux-host-qualification.md)，准备独立 Cargo cache、真实 Kotlin 与 bootstrap 来源、boot tools 和 POSIX 存储准入，再冻结新执行器与完整输入。来源准备允许联网，正式构建与运行禁网。任何仍在执行的下载、构建或仅有启动日志的任务均不计作通过。
 
 旧 macOS/APFS 环境和完整备份目前不可访问；不修改历史 driver 的摘要/宿主合同，不续跑旧失败代。获批的镜像恢复入口现已实现：显式 `-LoadImages` 在任何 Docker 调用前核对全部三个归档的外层 tar、唯一 manifest/config、固定历史 image ID、每层 diffID 和 OCI 引用，再以私有无标签副本经 stdin 加载并检查精确 ID。只读模式仍只报告 `archive-hashes-matched`；卷恢复继续拒绝。归档控制23/23、Windows真实子进程测试通过；当前没有旧归档，未实际调用 daemon 加载镜像，因此不声称资产已恢复。
+
+实际完整冷构建后，新runtime5f056322a31e4974已通过独立存储、fixture、root review、bundle和无guest admission。tools manifest3覆盖6042文件，补入实际Rust ELF依赖的libgcc_s.so.1；原manifest2的6041文件及首runtime63c6失败均保留。原checker24/24、driver31/31及真实VM拦截通过。当前只证明无guest运行时准入，guest UID namespace、正常双启动及实际导出尚未完成。
