@@ -75,6 +75,22 @@ class RuntimeControls(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'production'):
                 runtime.source_extension(before, after)
 
+    def test_source_extension_binds_public_coordinator_updates_and_rejects_unlisted_scripts(self):
+        names = ('scripts/boot/new-linux-host-build.ps1', 'scripts/boot/snapshot_linux_host_source.py',
+                 'scripts/boot/test_snapshot_linux_host_source.py', 'scripts/boot/test-new-linux-host-build.ps1')
+        current = {name: {'sha256': 'd'} for name in names}
+        self.assertEqual(set(runtime.source_extension({}, current)), set(names))
+        with self.assertRaisesRegex(ValueError, 'production'):
+            runtime.source_extension({}, {'scripts/boot/unlisted-coordinator.ps1': {'sha256': 'd'}})
+
+    def test_only_exact_reviewed_init_and_attribute_normalization_is_allowed(self):
+        for name, (before, after) in runtime.SOURCE_NORMALIZATIONS.items():
+            self.assertEqual(runtime.source_extension({name: before}, {name: after}),
+                             {name: {'before': before, 'after': after}})
+            for old, new in ((before, dict(after, sha256='f' * 64)), (None, after), (before, None)):
+                with self.subTest(name=name, old=old, new=new), self.assertRaisesRegex(ValueError, 'normalization'):
+                    runtime.source_extension({name: old}, {name: new})
+
     def test_native_inputs_bind_exact_historical_bytes_and_step_geometry(self):
         repo = Path(__file__).resolve().parents[2]
         checker = repo / 'artifacts/persistent-update-20261104-prep'

@@ -22,11 +22,21 @@ CHECKER_FILES = ('verify-persistent-update-evidence.py', 'raw_boot_audit.py', 'r
                  'input-geometry.json', 'geometry.stdout.log', 'geometry-execution.json',
                  'test_persistent_update_evidence.py', 'test_run_stage.py')
 SOURCE_EXTENSIONS = {'probes/linux-isolation-source-v2/profile.json', 'scripts/boot/README.md',
+    'scripts/boot/new-linux-host-build.ps1', 'scripts/boot/snapshot_linux_host_source.py',
+    'scripts/boot/test_snapshot_linux_host_source.py', 'scripts/boot/test-new-linux-host-build.ps1',
     'scripts/boot/qualification_image_archive.py', 'scripts/boot/test_qualification_image_archive.py',
     'scripts/boot/restore-qualification-assets.ps1', 'scripts/test-restore-qualification-assets.ps1',
     'scripts/boot/test-restore-qualification-assets.ps1'}
 REQUIRED_TOOLS = ('/usr/bin/python3', '/usr/bin/openssl', '/usr/bin/qemu-system-x86_64',
                   '/usr/bin/weston', '/usr/bin/cpio', '/usr/bin/ldd')
+SOURCE_NORMALIZATIONS = {
+    'scripts/boot/init': (
+        {'sha256': '9380e1854e585031577639fe76e34d9a7fcdb75d42a632f697a7e047c3f31e2a', 'bytes': 751},
+        {'sha256': '4fb1c7ff87a1d1b99cd3fbf175d347f67b2d8e86c643ef8d02430cb7ee5e0c05', 'bytes': 734}),
+    '.gitattributes': (
+        {'sha256': 'c4bdbfe6a1ec1421ed59531e5026a53570a54427f65bd73fbad3f6932de4fac3', 'bytes': 1023},
+        {'sha256': '1484e582bc789fa0ac31a59e275907b745269cf20e7ea47e2809c9ece379b5a2', 'bytes': 1053}),
+}
 
 
 def source_extension(original, current):
@@ -34,6 +44,11 @@ def source_extension(original, current):
     changes = {}
     for name in sorted(set(original) | set(current)):
         if original.get(name) != current.get(name):
+            if name in SOURCE_NORMALIZATIONS:
+                if (original.get(name), current.get(name)) != SOURCE_NORMALIZATIONS[name]:
+                    raise ValueError('unreviewed source normalization: ' + name)
+                changes[name] = {'before': original.get(name), 'after': current.get(name)}
+                continue
             if not (name.startswith('docs/') or name.startswith('scripts/boot/linux_host_')
                     or name.startswith('scripts/boot/test_linux_host_')
                     or name in SOURCE_EXTENSIONS):

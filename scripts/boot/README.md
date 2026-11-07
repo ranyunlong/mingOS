@@ -125,3 +125,30 @@ python -B -m unittest discover -s scripts/boot -p test_boot.py -v
 ~~~sh
 python3 -B -m unittest discover -s scripts/boot -p 'test_*.py'
 ~~~
+
+## Windows 宿主的新 Linux 冷构建入口
+
+`new-linux-host-build.ps1` 创建唯一的新 source/prep/target 卷，检查固定 Rust 镜像、
+Node 字节和容器实际隔离条件，再执行存储 probe、独立容器 reopen 与六包重放冻结。
+它要求先准备经过校验的 Linux Kotlin 包卷、Cargo 离线卷和 runtime inputs；具体当前
+来源见 `docs/development-environment-20261107.md`。它不会下载或修补缺失的输入。
+
+~~~powershell
+pwsh -NoProfile -File scripts/boot/new-linux-host-build.ps1 `
+  -RuntimeInputs C:\absolute\verified-runtime-inputs `
+  -PackagesVolume verified-linux-kotlin-packages `
+  -CargoVolume verified-linux-cargo-cache `
+  -BackingVhd C:\absolute\docker_data.vhdx `
+  -StartBuild
+~~~
+
+`-EvidenceRoot` 可指定 `repo/artifacts` 下全新的证据目录。`-StartBuild` 异步启动，
+返回只表示已启动；须按 `build-started.json` 中的精确 CID 查看容器退出状态和
+`/prep/stages/build/result.json`。失败代不续跑、不复用 target，所有输出和卷保留。
+
+独立 runtime CLI 为 `linux_host_runtime.py --stage prepare|fixture|bundle|admission`，
+prepare 要求显式的成功冷构建、源码、六包、checker、几何执行、原生输入、tools 和
+source-v2 probe 路径；后续阶段使用 `--root /prep --repo /repo`。
+`linux_host_pair.py --root /prep --repo /repo` 仅接受已经完成 admission 的同一冻结。
+外层协调器仍须实施1950秒容器限制及既定 mount/UID/资源检查。这些入口与控制测试
+不能替代实际双启动与独立导出验收。
