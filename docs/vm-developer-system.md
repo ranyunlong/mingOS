@@ -43,17 +43,27 @@ python3 -I -B /source/scripts/boot/kotlin_delivery.py \
   --original-cache mingos-original-gradle --profile developer
 ```
 
-`developer` 真实编译 Text Entry（SDK6）和 Motion（SDK5）；`uninstall` 编译四个卸载资格包，`update` 编译六个更新资格包。使用 `--synthetic-controls` 只执行输入复制、只读拒绝和失败收尾控制，不编译。可用 `--docker` 指定 Docker 可执行文件。
+`developer` 真实编译 Text Entry（SDK6）和 Motion（SDK5）；`developer-workflow` 真实编译 Notes（SDK6）和 Motion（SDK5），用于下面的新开发会话；`uninstall` 编译四个卸载资格包，`update` 编译六个更新资格包。使用 `--synthetic-controls` 只执行输入复制、只读拒绝和失败收尾控制，不编译。可用 `--docker` 指定 Docker 可执行文件。
 
 每代创建独立源码、缓存、工作和输出卷；原始源码和缓存只读挂载，复制后比对完整清单。编译固定禁网、非 root、只读根、2 CPU/4GiB，强制离线重执行编译任务并使用新工作目录。每次创建容器前重验卷身份，编译后另起容器只读回放每个包的源码、编译收据和依赖链。失败代不能原地续跑；卷、容器及日志全部保留。宿主 `packages-and-evidence` 导出仍须由外层逐文件封印和重验，容器内回放不单独证明宿主副本完整。
 
-## 开发预览会话边界
+## Notes 开发会话入口
+
+`developer-workflow-v1` 使用 Notes（SDK6）和 Motion（SDK5），900 秒正常交互会话及独立持久盘。公开 `scripts/boot/workflow_outer.py` 提供 `new/start/status/capture/click/key/type/power/reopen/offlinebackup/restore/inspect`；实际命令、可信输入、截图导出和恢复操作见 [Notes 开发会话](vm-workflow.md)。包使用独立的 `workflow-manifest.json`，与旧预览 `developer-vm-v1` 格式互相拒绝。
+
+外层 `new` 需要全新的 evidence、包外独立固定的 pack manifest SHA256，以及完整独立安装的可信 `--source` 树；源码和 evidence 不得重叠，不能执行 pack 内 launcher。最终受信源码清单和 pack pins 尚待绑定独立交接记录，文档占位符不代表已有发布包。`start` 只确认容器启动，输入前须由 `status` 确认 ready 且 inactive；后续正常启动及恢复后的首次启动用 `reopen`。只在正常 UI POWER 完成、精确容器实际退出码为 0 后执行 `inspect` 或 `offlinebackup`。
+
+备份使用全新 Docker 卷；`restore` 以宿主 `backup.json` 的独立 SHA256 入场，恢复到新的 work/results 卷和 generation，保留原备份与历史。收据 SHA256 与备份 manifest SHA256 不同。恢复还依赖保留的原备份卷、来源卷及精确 prior 容器；单独复制宿主收据不构成可迁移的完整备份。失败代保留容器、卷和日志，不清除锁存或原地重试。
+
+截至 2026-11-07，真实 workflow 新代 `8c4e19b7` 已启动，当前 `status` 为 `starting`，尚未 ready、发送输入或保存便签，实际运行验收进行中。独立 Linux 控制 103/103 通过（公共生命周期/pack/交互组合 73 项，加外层 30 项），guest、formatter、pack 入场或 Docker 生命周期使用明确替身（double），不构成真实 guest 验证。Notes/Motion 已完成实际离线编译、包适配及独立回放；Notes 的存储合同和 Compose 测试使用能力/输入替身。便签实际保存、正常跨容器重开、离线备份及新卷恢复仍待真实 guest 验收。演示启用便签明文字节诊断，只使用非敏感测试内容；`formalQualification=false`、`finalSystemAccepted=false`。
+
+## 旧开发预览会话边界
 
 源码与 Cargo/Gradle 归档已有公开入口及实际新卷恢复证据，命令、输入布局和范围见 [VM 复建输入归档](vm-rebuild-inputs.md)。完整开发交付仍需后续实际构建、开发会话和交接验收。
 
-恢复后的源码与 Gradle 消费者已实际重新编译开发双包，独立容器和宿主回放通过。实际开发 bundle `developer-public-bundle-e512a7d9` 已生成并另起只读检查：完整 newc 流及 54 项必需文件、内核和配置均匹配。完整 pack 与真实开发 guest 仍待验收；以下预览不能保存 Text Entry 内容，因为当前该样例只有内存文本状态。
+恢复后的源码与 Gradle 消费者已实际重新编译开发双包，独立容器和宿主回放通过。实际开发 bundle `developer-public-bundle-e512a7d9` 已生成并另起只读检查：完整 newc 流及 54 项必需文件、内核和配置均匹配。旧预览的完整 pack 和公共外层同盘双启动、正常同步关机已通过，原始结果回放见历史记录 `6d8f2b79`。该记录仅覆盖旧预览；以下预览不能保存 Text Entry 内容，因为该样例只有内存文本状态。
 
-公开 `scripts/boot/developer-vm-outer.ps1` 配置固定 Docker 外层、可信源码快照、全新工作/结果卷及完整 pack 只读挂载。它只接受新的证据目录和包外 SHA256，不接受包内 launcher 作为可信执行代码：
+以下命令属于旧 `developer-vm-v1` 预览，不是 Notes 工作流入口。公开 `scripts/boot/developer-vm-outer.ps1` 配置固定 Docker 外层、可信源码快照、全新工作/结果卷及完整 pack 只读挂载。它只接受新的证据目录和包外 SHA256，不接受包内 launcher 作为可信执行代码：
 
 ```powershell
 ./scripts/boot/developer-vm-outer.ps1 -Action new `
@@ -64,13 +74,13 @@ python3 -I -B /source/scripts/boot/kotlin_delivery.py \
   -Evidence C:/path/to/repo/artifacts/new-developer-session
 ```
 
-`new` 固定 14 项 Linux 可信源码、宿主 helper、Tools image inspection 和卷身份；独立只读验证完整 pack。`pair` 在同一受控容器内初始化新盘并执行两次 start/inspect。每步仅可尝试一次，失败现场保留。PowerShell 34 项控制及独立 Linux driver 8 项控制通过；当前没有该公开外层真实 guest 成功记录。实际 pack 摘要和可运行代须从后续独立交接记录取得，示例占位符不代表已有发布包。
+`new` 固定 14 项 Linux 可信源码、宿主 helper、Tools image inspection 和卷身份；独立只读验证完整 pack。`pair` 在同一受控容器内初始化新盘并执行两次 start/inspect。每步仅可尝试一次，失败现场保留。PowerShell 34 项控制及独立 Linux driver 8 项控制通过；该旧预览公开外层已实际完成同盘双启动和正常同步关机，原始结果回放对应历史记录 `6d8f2b79`。实际 pack 摘要和可运行代须从相应独立交接记录取得，示例占位符不代表已有发布包；该历史结果不证明 Notes 工作流已验收。
 
-独立 `developer-vm-v1` bundle profile 固定 Text Entry 与 Motion、15秒严格隔离会话及 `/data/mingos`，禁止输入脚本、测试事件、资格角色和安装/更新 fixture。所有 payload 文件、Host 来源收据、两包编译收据和 source-v2 probe 构建收据须精确绑定。该入口绑定已审来源，不在验证阶段重新运行编译器；真实冷构建、应用编译和独立回放仍须另外执行。当前 profile 控制已通过，真实开发 bundle 和 guest 工作流仍待执行。
+独立 `developer-vm-v1` bundle profile 固定 Text Entry 与 Motion、15秒严格隔离会话及 `/data/mingos`，禁止输入脚本、测试事件、资格角色和安装/更新 fixture。所有 payload 文件、Host 来源收据、两包编译收据和 source-v2 probe 构建收据须精确绑定。该入口绑定已审来源，不在验证阶段重新运行编译器；真实冷构建、应用编译和独立回放仍须另外执行。该旧 profile 控制及上述预览双启动已通过；Notes 的实际交互、保存和恢复验收仍在进行。
 
 `scripts/boot/developer_vm.py` 提供 `verify`、`init`、`start`、`inspect` 生命周期入口。`init` 和 `start` 要求 Linux UID/GID65534、完整包只读挂载，以及固定私有目录 `/work/mingos-boot-infra-20261025`；包内 bundle 位于 `/pack/bundle`。协调器只执行独立安装的可信 `scripts/boot/vm.py`，不导入包内代码。新建数据盘固定128MiB，已有实例或部分初始化不能覆盖、重格式化或续建。
 
-在已配置的同一受控 Tools 容器内，命令形状如下；`<pin>` 必须从包外独立取得。外层容器封装、真实包及guest验收尚待完成，这些命令不单独配置Docker隔离或证明应用数据已保存：
+在已配置的同一受控 Tools 容器内，命令形状如下；`<pin>` 必须从包外独立取得。旧预览的实际外层与双启动记录见上文；这些内层命令不单独配置 Docker 隔离或证明应用数据已保存：
 
 ```sh
 python3 -I -B /trusted/scripts/boot/developer_vm.py init \
@@ -86,7 +96,7 @@ python3 -I -B /trusted/scripts/boot/developer_vm.py inspect \
 
 第二次 `start` 仅将输出改为全新 `/results/boot-0002`，继续使用同一个实例、数据盘和包摘要。每次尝试独占实例锁，写入不可覆盖的尝试/结果/监督日志，并检查正常关机、kernel powerdown、disk UUID、marker递增及从未复用的boot/session身份。失败或中断锁存该代；不清除锁存，不原地重试。监督器超时或等待异常只清理其创建的进程组，保留中断原因及清理错误。
 
-`inspect` 只读打开已有实例锁及同盘runtime lease，检查磁盘superblock和全部历史，不创建锁、不修复状态、不运行子进程。第一次 `start` 建立lease前，或切换到全新runtime tmpfs后，`inspect` 会拒绝缺失lease。初始验证应在同一容器/runtime内按 `init → start → inspect → start → inspect` 执行。两个正常marker只证明正常同盘重开，不证明应用内容持久化、异常断电恢复或最终交付。集成生命周期在独立Linux控制中40/40通过；真实guest仍待执行。
+`inspect` 只读打开已有实例锁及同盘runtime lease，检查磁盘superblock和全部历史，不创建锁、不修复状态、不运行子进程。第一次 `start` 建立lease前，或切换到全新runtime tmpfs后，`inspect` 会拒绝缺失lease。初始验证应在同一容器/runtime内按 `init → start → inspect → start → inspect` 执行。两个正常marker只证明正常同盘重开，不证明应用内容持久化、异常断电恢复或最终交付。集成生命周期在独立 Linux 控制中 40/40 通过；旧预览真实 guest 的同盘双启动及原始回放已通过（`6d8f2b79`），范围不包括 Notes 内容保存或恢复。
 
 ## 交付前必须完成
 
