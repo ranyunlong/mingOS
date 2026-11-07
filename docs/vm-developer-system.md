@@ -51,6 +51,26 @@ python3 -I -B /source/scripts/boot/kotlin_delivery.py \
 
 独立 `developer-vm-v1` bundle profile 固定 Text Entry 与 Motion、15秒严格隔离会话及 `/data/mingos`，禁止输入脚本、测试事件、资格角色和安装/更新 fixture。所有 payload 文件、Host 来源收据、两包编译收据和 source-v2 probe 构建收据须精确绑定。该入口绑定已审来源，不在验证阶段重新运行编译器；真实冷构建、应用编译和独立回放仍须另外执行。当前 profile 控制已通过，真实开发 bundle 和 guest 工作流仍待执行。
 
+`scripts/boot/developer_vm.py` 提供 `verify`、`init`、`start`、`inspect` 生命周期入口。`init` 和 `start` 要求 Linux UID/GID65534、完整包只读挂载，以及固定私有目录 `/work/mingos-boot-infra-20261025`；包内 bundle 位于 `/pack/bundle`。协调器只执行独立安装的可信 `scripts/boot/vm.py`，不导入包内代码。新建数据盘固定128MiB，已有实例或部分初始化不能覆盖、重格式化或续建。
+
+在已配置的同一受控 Tools 容器内，命令形状如下；`<pin>` 必须从包外独立取得。外层容器封装、真实包及guest验收尚待完成，这些命令不单独配置Docker隔离或证明应用数据已保存：
+
+```sh
+python3 -I -B /trusted/scripts/boot/developer_vm.py init \
+  --pack /pack --manifest-sha256 <pin> \
+  --work-root /work/mingos-boot-infra-20261025
+python3 -I -B /trusted/scripts/boot/developer_vm.py start \
+  --pack /pack --manifest-sha256 <pin> \
+  --instance /work/mingos-boot-infra-20261025/developer-instance.json \
+  --output /results/boot-0001 --runtime-root /run/mingos-runtime
+python3 -I -B /trusted/scripts/boot/developer_vm.py inspect \
+  --instance /work/mingos-boot-infra-20261025/developer-instance.json
+```
+
+第二次 `start` 仅将输出改为全新 `/results/boot-0002`，继续使用同一个实例、数据盘和包摘要。每次尝试独占实例锁，写入不可覆盖的尝试/结果/监督日志，并检查正常关机、kernel powerdown、disk UUID、marker递增及从未复用的boot/session身份。失败或中断锁存该代；不清除锁存，不原地重试。监督器超时或等待异常只清理其创建的进程组，保留中断原因及清理错误。
+
+`inspect` 只读打开已有实例锁及同盘runtime lease，检查磁盘superblock和全部历史，不创建锁、不修复状态、不运行子进程。第一次 `start` 建立lease前，或切换到全新runtime tmpfs后，`inspect` 会拒绝缺失lease。初始验证应在同一容器/runtime内按 `init → start → inspect → start → inspect` 执行。两个正常marker只证明正常同盘重开，不证明应用内容持久化、异常断电恢复或最终交付。集成生命周期在独立Linux控制中40/40通过；真实guest仍待执行。
+
 ## 交付前必须完成
 
 1. 公开的源码、Cargo/Gradle缓存和固定镜像迁移接口，使用全新目标实际完成 MingOS、应用及 VM 的重建，并独立核验导出副本。

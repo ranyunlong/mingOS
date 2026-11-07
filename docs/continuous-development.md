@@ -2,6 +2,26 @@
 
 更新：2026-10-27。用户授权每个阶段完成后直接进入下一阶段，直到整体任务结束。阶段验收通过只表示该阶段结束，不表示整个操作系统已经完成。
 
+## 2026-11-07 当前源码应用重建与独立缓存副本
+
+已完成阶段：公共Kotlin入口从独立封印源码`artifacts/kd-ff1e822e`实际编译两代应用。卸载代`1e136eb1a8b04d49b112ef9f4af5dfeb`包含read-file、image-viewer、text-entry-demo、uninstall；开发代`73428b51767246849f6122604aacea1c`包含text-entry-demo、animated-demo。强制离线编译实际执行5/5/19/19及19/19项任务，每代另起只读容器回放；主执行者独立重验导出文件及编排证据，并用当前公开runner重放包/来源/依赖收据链，结果与容器回放一致。原Gradle缓存不变，封印源码1487文件的摘要、大小、模式及目录模式前后匹配。
+
+证据根为`artifacts/environment-rebuild-20261107/`。两代宿主封印`kotlin-delivery-uninstall-export-seal-ff1e822e.json`和`kotlin-delivery-developer-export-seal-ff1e822e.json`的SHA256分别为`a803dde2aecd7123adb6fa795db79bb10e16328bd0064998b465b501f291a0e4`、`fa121ee306726a5a4ec838930fb29979dffd7b7af54d607567d70e1e23d443d9`；根侧独立结果分别为`root-kotlin-uninstall-review-ff1e822e.json`、`root-kotlin-developer-review-ff1e822e.json`。完整汇总`kotlin-fresh-build-summary-ff1e822e.json` SHA256为`610021b9b14e9ef7e1403a5c52e9bee2ef863f3f997cc1e2ba175a1470a8e4c2`。
+
+已完成独立Cargo home副本`cargo-independent-clone-8e4dd0ca04a5-cache`：仅从原只读registry复制12495个文件、245308651字节，核对全部文件摘要、目录、模式、UID/GID及nlink；7个0640文件原样保留，未复制原派生锁和全局缓存。原registry前后匹配，result SHA256为`540e39de0d76284b73590cccdc35ec2926040e189fafcbfc41dd4d2c6c81aeeb`。这次是独立副本验证，依赖归档导出/恢复仍在实现。
+
+下一阶段已开始：cold`persistent-uninstall-20261107-linux-9436c4cf1c0e4ade`使用相同封印源码、新四包、新Cargo home及空target执行七命令构建。本文记录时仍在执行；未将其算作成功cold，也未复用原失败卸载代。两代应用编译及缓存副本都不证明开发guest或最终系统已交付；`formalQualification=false`、`finalSystemAccepted=false`保持。
+
+## 2026-11-07 开发VM生命周期入口
+
+新增`developer_vm.py`及两组控制，提供完整包准入、固定128MiB新盘、私有不可变实例、双锁、只读inspect、连续尝试记录、正常关机marker/session链及失败代锁存。启动仅调用独立可信安装的既有vm.py；固定15秒developer profile，不开放资格角色、输入脚本、任意磁盘和超时选项。实现与现有vm/data_disk结果格式独立核对；实际同盘guest、应用保存及外层封装仍未完成。
+
+原型Linux37/37通过，根侧保留旧umask的实际子进程RED（0644而非0600）及修复GREEN。整合复核另发现wait被KeyboardInterrupt/普通异常打断时未清理自有进程组，先保留3项/5失败RED，再补仅自有PGID的SIGKILL、5秒reap和中断收据；清理失败不声明进程组已空。集成后Windows40项中31通过、9项Linux专属跳过；主执行者在固定Tools、UID65534、禁网、只读root/源码的独立容器中验证40/40、零跳过，源码摘要前后不变。
+
+证据：`developer-vm-root-controls-29e7803ee863`、`developer-vm-interruption-integration-20261107-b8762a10`及`developer-vm-integrated-controls-bbf865bbdfee`，均在本机证据根内。集成Linux CID为`85598ce064d39a1c6995e870cbceb106bc0095b7d131f9563296029944f16af3`；生命周期源码SHA256为`0dfe144b3f6cacfa7025a8091eb90296b3a812e7d6c922b14301e57da65cd378`。上述控制不运行真实guest，不赋予最终系统验收含义。
+
+独立子agent已只读复核规格、可信VM接合、磁盘lease、marker/session链、连续历史及中断清理，未发现明确P1/P2问题。外层隔离与真实guest仍作为下一阶段门槛；该审阅不取代实际运行。
+
 ## 当前工程基线
 
 Linux底座；普通应用使用Kotlin/Wasm，通过Ming SDK获取外部能力；父进程持有授权和系统资源，独立worker执行Wasm。保留真实Kotlin样例和旧SDK回归。当前先验证x86_64；Windows用于开发与硬件GPU验证，Linux容器/Wayland用于原生执行验证，两者都不替代可启动系统或真实Linux硬件验收。

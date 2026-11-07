@@ -19,7 +19,7 @@
 2. 用户确认优先交付可复建的x86_64 VM开发系统，含应用、持久数据、更新/卸载和恢复说明。公共只读developer pack验证器已通过主执行者独立Linux40项控制；源码/缓存迁移、实际干净重建与开发会话仍在实施，详见[交付范围与检查入口](vm-developer-system.md)。物理鼠标专项仍暂停；TCG、虚拟输入和软件呈现不能作为物理硬件资格。
 3. 历史APFS资格不能由新Linux证据替代；280个deb的观察记录也不构成完整签名离线APT重建闭包。
 
-新开发入口阶段：完整开发包只读验证器已独立Linux40/40；卸载checker、开发profile、固定镜像迁移和共享boot控制在真实Linux合计65/65、零跳过。三个开发工具链归档实际只读验证通过，但未实际加载到全新daemon。Kotlin公开包装器的16项编排控制、18项链路控制和20项runner控制通过；其原型另完成真实Docker输入复制、只读拒绝及非零/超时收尾，尚不代表新四包/双包编译或开发VM通过。各项范围、公开命令与待完成门槛见[开发系统交付说明](vm-developer-system.md)。
+新开发入口阶段：完整开发包只读验证器已独立Linux40/40；卸载checker、开发profile、固定镜像迁移和共享boot控制在真实Linux合计65/65、零跳过。三个开发工具链归档实际只读验证通过，但未实际加载到全新daemon。Kotlin公开包装器已从封印源码kd-ff1e822e完成全新卸载四包和开发双包实际离线编译；两代均通过独立只读容器回放，主执行者另重放宿主导出包及编排收据链，逐文件检查封印前后摘要。共六次编译实际执行，原Gradle缓存及1487个封印源文件保持不变。新Cargo home独立复制12495文件、245308651字节，原registry及目标文件/模式/owner/nlink完整清单匹配，旧派生缓存未复制；尚不等同归档恢复。新七命令cold 9436c4cf已使用该Cargo副本和新四包启动，尚在执行，不能代替最终结果。开发VM真实启动与归档恢复仍待执行。各项范围、公开命令与待完成门槛见[开发系统交付说明](vm-developer-system.md)。
 
 完整阶段记录见 [连续开发记录](continuous-development.md)、[当前环境记录](development-environment-20261107.md)、[Linux更新资格计划](superpowers/plans/2026-11-07-linux-host-qualification.md) 与 [Linux卸载资格计划](superpowers/plans/2026-11-07-linux-host-uninstall-qualification.md)。大产物按仓库约定保留本机，不提交Git。
 
