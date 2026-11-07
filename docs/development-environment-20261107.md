@@ -1,6 +1,6 @@
 # 当前开发环境恢复记录
 
-日期：2026-11-07。范围：Windows + Docker/Linux 开发工具准备；正式 Task9 构建、恢复矩阵和正常双启动仍未完成，`finalSystemAccepted=false`。
+日期：2026-11-07。范围：Windows + Docker/Linux 开发工具、真实 Kotlin 来源与 Rust 冷构建、持久更新正常双启动及独立导出回放已完成；进程中断恢复按具体范围通过，完整系统仍未验收。最新边界见 [当前状态](current-system-status.md)，`finalSystemAccepted=false`。
 
 ## 已实际验证
 
@@ -51,6 +51,10 @@ Windows 来源准备已真实编译 read-file 和 image-viewer，`npm run test:k
 
 按照[新宿主资格设计](superpowers/specs/2026-11-07-linux-host-qualification-design.md)与[实施计划](superpowers/plans/2026-11-07-linux-host-qualification.md)，准备独立 Cargo cache、真实 Kotlin 与 bootstrap 来源、boot tools 和 POSIX 存储准入，再冻结新执行器与完整输入。来源准备允许联网，正式构建与运行禁网。任何仍在执行的下载、构建或仅有启动日志的任务均不计作通过。
 
-旧 macOS/APFS 环境和完整备份目前不可访问；不修改历史 driver 的摘要/宿主合同，不续跑旧失败代。获批的镜像恢复入口现已实现：显式 `-LoadImages` 在任何 Docker 调用前核对全部三个归档的外层 tar、唯一 manifest/config、固定历史 image ID、每层 diffID 和 OCI 引用，再以私有无标签副本经 stdin 加载并检查精确 ID。只读模式仍只报告 `archive-hashes-matched`；卷恢复继续拒绝。归档控制23/23、Windows真实子进程测试通过；当前没有旧归档，未实际调用 daemon 加载镜像，因此不声称资产已恢复。
+旧 macOS/APFS 环境和完整备份目前不可访问；不修改历史 driver 的摘要/宿主合同，不续跑旧失败代。获批的镜像恢复入口现已实现：显式 `-LoadImages` 在任何 Docker 调用前核对全部三个归档的外层 tar、唯一 manifest/config、固定历史 image ID、每层 diffID 和 OCI 引用，再以私有无标签副本经 stdin 加载并检查精确 ID。只读模式仍只报告 `archive-hashes-matched`。当前没有旧归档，未实际调用 daemon 加载历史镜像，因此不声称历史资产已恢复。
+
+`-RestoreVolume` 已集成，和 `-ValidateOnly`、`-LoadImages` 互斥。它先验证外层 manifest、三个镜像归档文件哈希及严格 USTAR 的嵌入完整清单，不加载镜像；通过固定 helper `sha256:88624fbbfcb6b7ac6f1207491053cbe6fd435262f0ce547443fb36760c7e9d80`、`--pull never` 创建全新 Docker 匿名卷。来源 `volume.name` 不作为目标名。缓存位于 `payload/`，收据明确 `subpath="payload"`；根与 `control/` 为 UID/GID65534、0700。Linux worker 独立验证私有归档，以 NOFOLLOW/EXCL、lease、owner/mode/nlink/字节哈希和 fsync 写入；确认 writer 正常停止后，独立容器以真实只读挂载和 ST_RDONLY 重开核验完整 inventory 与外部收据。失败或超时停止后续操作，保留所有私有副本、日志、失败收据、部分 payload、容器和卷，不删除、覆盖或续跑失败代。命令及完整归档合同见 `scripts/boot/README.md`。
+
+实际控制代 `artifacts/environment-rebuild-20261107/restore-volume-root-controls/restore-live-b144eca66993/` 已通过两路并发公共入口恢复和各自独立只读重开，两路匿名卷不同；manifest 来源名指向的已有 sentinel 卷前后 dev/ino、UID/GID、0600、nlink1 和内容 SHA 全部相同。固定镜像 Linux 综合控制110项、108通过、2个非Linux边界跳过。`result.json` 明确 `assetOrigin="synthetic-control"`、`historicalAssetsRestored=false`：这证明新恢复工具的控制路径，不是历史缓存恢复，也不替代历史 Task9 的宿主来源合同。所有结果仍为 `formalQualification=false`、`finalSystemAccepted=false`。
 
 实际完整冷构建后，新runtime5f056322a31e4974已通过独立存储、fixture、root review、bundle和无guest admission。tools manifest3覆盖6042文件，补入实际Rust ELF依赖的libgcc_s.so.1；原manifest2的6041文件及首runtime63c6失败均保留。原checker24/24、driver31/31及真实VM拦截通过。当前只证明无guest运行时准入，guest UID namespace、正常双启动及实际导出尚未完成。

@@ -1,8 +1,8 @@
 # MingOS 文档
 
-更新：2026-10-25。Kotlin/Wasm 应用平台、图形/动画、Ming 多窗口桌面和 SDK6 输入/数据已接通；严格隔离 Linux kernel VM 短诊断和正式两次冷启动通过各自轮次，产物已导出；关闭阶段保护与可信系统镜像预编译已通过原完整双Kotlin kernel资格和同盘冷启动；当前继续kernel生命周期恢复，完整系统尚未验收。
+更新：2026-11-07。Kotlin/Wasm 应用平台、图形/动画、Ming 多窗口桌面和 SDK6 输入/数据已接通。当前 Windows + Docker/Linux 已完成持久更新正常双启动、独立导出回放及明确范围的进程中断恢复；继续持久卸载资格，完整系统尚未验收。
 
-- [当前系统验收状态](../artifacts/current-system-status-20261026.md)：当前构建、历史冻结、真实 VM 结果与剩余门槛。
+- [当前系统验收状态](current-system-status.md)：当前构建、历史冻结、真实 VM 结果与剩余门槛。
 
 - [需求与决策记录](requirements.md)：区分用户确认、架构建议和待验证事项。
 - [总体架构设计](superpowers/specs/2026-10-23-mingos-architecture-design.md)：系统分层、信任边界和路线图。
