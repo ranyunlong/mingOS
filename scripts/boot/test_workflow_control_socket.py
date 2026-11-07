@@ -152,6 +152,46 @@ class SocketTests(unittest.TestCase):
         self.assertEqual(len(self.qmp.commands),count)
         self.assertEqual(self.read(client)['type'],'control-completed')
 
+    def test_power_completed_by_guest_stream_is_acknowledged_on_next_poll(self):
+        client=self.send({'op':'power','x':1238,'y':12})
+        self.addCleanup(client.close)
+        self.controller.poll(self.stream,self.qmp)
+        self.stream.receipt={'entered':True,'bootId':'boot-one','sessionId':'session-one','desktopPid':42,
+            'logOffset':11,'pointer':1,'surface':1,'x':1238,'y':12}
+        self.controller.poll(self.stream,self.qmp)
+        self.assertTrue(self.stream.plan.waiting)
+        self.stream.state=copy.deepcopy(self.stream.state)
+        self.stream.state.update(revision=4,phase='stopped')
+        self.stream.state['apps'][0].update(state='closed',inputReady=False,outer=None)
+        # GuestStream.poll advances the plan before Controller.poll in vm.main.
+        self.stream.advance_plan(self.stream.state,self.qmp)
+        self.assertTrue(self.stream.plan.complete)
+        count=len(self.qmp.commands)
+        try:
+            self.controller.poll(self.stream,self.qmp)
+        except ValueError as error:
+            self.fail('completed POWER was rejected by the pre-dispatch guard: '+str(error))
+        self.assertEqual(len(self.qmp.commands),count)
+        self.assertIsNone(self.stream.plan)
+        self.assertEqual(self.read(client)['state']['phase'],'stopped')
+
+    def test_next_type_step_still_rejects_changed_layout_before_dispatch(self):
+        client=self.send({'op':'type','text':'abcdefghijk'})
+        self.addCleanup(client.close)
+        self.controller.poll(self.stream,self.qmp)
+        self.stream.state=copy.deepcopy(self.stream.state)
+        self.stream.state['revision']+=1
+        self.stream.state['root']['presentedSequence']+=1
+        self.stream.state['apps'][0]['presentedSourceSequence']+=1
+        self.stream.state['apps'][0]['outer']={'x':30,'y':30,'width':500,'height':400}
+        self.stream.advance_plan(self.stream.state,self.qmp)
+        self.assertFalse(self.stream.plan.complete)
+        self.assertFalse(self.stream.plan.waiting)
+        count=len(self.qmp.commands)
+        with self.assertRaisesRegex(ValueError,'target layout changed'):
+            self.controller.poll(self.stream,self.qmp)
+        self.assertEqual(len(self.qmp.commands),count)
+
     def test_out_of_geometry_is_rejected_without_poisoning_active_owner(self):
         client=self.send({'op':'click','x':2000,'y':12})
         self.assertEqual(self.read(client)['status'],'rejected')

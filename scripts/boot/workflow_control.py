@@ -138,7 +138,9 @@ class Controller:
         if self.active:
             active=self.active
             active['plan'].check_deadline()
-            if (active['plan'].pending_pointer is not None or not active['plan'].waiting) and layout_digest(stream.state)!=active['layoutSha256']:
+            # GuestStream can complete the last step before this poll. Its
+            # resulting layout (for example stopped after POWER) is expected.
+            if not active['plan'].complete and (active['plan'].pending_pointer is not None or not active['plan'].waiting) and layout_digest(stream.state)!=active['layoutSha256']:
                 raise ValueError('presented target layout changed before workflow input dispatch')
             if stream.state: stream.advance_plan(stream.state,qmp)
             if active['plan'].complete:
