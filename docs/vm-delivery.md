@@ -23,6 +23,8 @@ $Outer = "$Source/scripts/boot/workflow_outer.py"
 
 等 `ready`、`active=false` 后，按 [Notes 操作说明](vm-workflow.md) 截图并通过正常 UI 保存、POWER、`reopen`。真实三阶段记录已验证：保存 A 后放弃未保存编辑；第二个容器读 A 并保存 B；离线备份恢复到新卷后第三个容器初载 B，未再次保存。最后原始回放 SHA256 为 `04e7156313fa64ad7b0b0a81668076311ea06b5ef191add522c7a3b0547b6698`。
 
+Windows 必须使用短源码路径和短证据路径。外层将完整源码复制到 `$Evidence/trusted-source`；先计算源树每个相对文件名在该目标下的完整长度，确保低于260字符，并为后续生成文件留余量。本次短路径 `artifacts/sr-0c9f60f` 与 `artifacts/w` 的冻结文件最长258字符，实际可用；两次更长路径的 `new` 在冻结源码阶段触发 WinError206，失败目录保留，尚未创建 Docker 资源。不要通过修改旧失败目录或放宽驱动继续操作。受沙箱限制的 Docker 查询同样会留下失败记录；需要输入的后续操作将拒绝该代。
+
 `offlinebackup` 仅接受正常停止实例，创建新备份卷；`restore` 以精确 `backup.json` SHA256 入场，创建新工作/结果卷，首次启动用 `reopen`。备份还依赖保留的 Docker 卷、原 prior 容器和完整 lineage，单独复制收据无法迁机。失败代保留全部资源，不清除锁存或原地重试。
 
 ## 复建应用与系统

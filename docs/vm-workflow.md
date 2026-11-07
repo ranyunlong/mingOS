@@ -14,6 +14,8 @@ Notes 的私有目录由可信宿主按已选择的包身份提供，无需共�
 
 ## 公开外层快速操作
 
+Windows 使用短的 Source/Evidence 路径，并预先核算完整源码冻结到 `$Evidence/trusted-source` 后的最长路径低于260字符。真实交付使用 `artifacts/sr-0c9f60f` 与 `artifacts/w`；较长路径已实际触发 WinError206，失败代保留。Docker 操作必须在能访问 daemon 的执行环境运行；失败查询也会留下记录，后续输入拒绝复用该代。
+
 公开 `scripts/boot/workflow_outer.py` 提供 `new/start/status/capture/click/key/type/power/reopen/offlinebackup/restore/inspect`。内部生命周期的 `backup` 对应外层 `offlinebackup`；外层没有 `verify` 子命令。下面的 PowerShell 命令使用此公开外层配置和监督 Docker 隔离。
 
 截至 2026-11-07，真实 `developer-workflow-v1` 已完成三阶段持久化验收：首次保存 `MingOS note A` 后追加未保存编辑并正常关机；第二个容器读出精确 A，保存 `MingOS note B` 并正常关机；离线备份恢复到新工作/结果卷后，第三个容器初始读出精确 B，未再次保存并正常关机。完整原始日志、SDK 操作、离线文件及历史链回放通过。运行 pack manifest 为 `273b38ceb8665d92743d8c4820939fb2c2a858deee4bb330e4af886b3fb7d1e6`；最终源码与整包摘要由包外交接收据固定。以下 `<...>` 是使用者路径或名称参数，不能直接照抄执行。

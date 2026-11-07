@@ -2,6 +2,14 @@
 
 更新：2026-10-27。用户授权每个阶段完成后直接进入下一阶段，直到整体任务结束。阶段验收通过只表示该阶段结束，不表示整个操作系统已经完成。
 
+## 2026-11-07 八组件交付、独立导入与恢复源码实际运行
+
+完成 `artifacts/mingos-vm-dev-20261107-0c9f60f`，归档3544954880字节、SHA256 `cb8ef776f35584c915ad4b72d322e1973a06ca9b856c8790625e6b23a09dc744`，handoff manifest `7a4ad1336705de97fd51eb1602fed4d852d54935f3ee3f6764ad96d2ce2d1a68`。实际导入未挂载原checkout，完整源码1561文件/406目录恢复及独立只读重开通过，Windows副本再逐字节核验。原始三阶段SDK回放review与原件同为04e71563…，不把回放称为新guest运行。
+
+导入runtime新卷根投影及8次完整writer扫描通过；新 `artifacts/w` 使用完整恢复源码和投影pack实际启动Notes/Motion，两应用严格隔离，新盘便签为空且零保存。桌面POWER正常完成，CID f5eedeeb3027c0db9474dd9d8b28101ea2d0063dbb7578ad20e301d3ee3b4465 精确exit0/非OOM，driver workflow-session-normal/normalBoots1。完整原始结果和外层收据保留。两长路径源码冻结失败及v代受沙箱限制的查询失败均保留，后续输入严格拒绝；无清除锁存、资源删除或失败代续用。
+
+完整导入/投影/短路径启动命令、外部pins和目录校验清单与产物一起交付。tar内源码快照为0c9f60f，后续提交只记录交付事实和操作限制，不伪装成重编runtime。具体实际身份见 [交付记录](vm-delivery-release-20261107.md)。二进制工具链、同daemon lineage恢复、全新daemon加载未实测及历史旧probe失败边界均保留。远程推送仍因原自动审批拒绝未执行，等待目标/内容授权明确；本地阶段提交继续。formalQualification=false、finalSystemAccepted=false。
+
 ## 2026-11-07 Notes 三阶段持久化验收
 
 最终当前源码计划在实际 `gradlew.bat` 的 lstat/fstat 模式差异处失败，目录 `current-source-delivery-9248741-31ad7c82` 保持空且另存失败收据。诊断证明同一文件各身份/字节字段相同，仅 Windows 路径 API 按后缀推导的执行位不同；初步身份修正又由回归发现 CRT 文本读取会转换CRLF并在Ctrl-Z截断。最终修正仅在首次跨API比较规范化Windows推导位，原同API模式/ctime/身份检查保留，读取加O_BINARY。主执行者8回归RED实际1失败2错误，整合后Windows源码控制42项中40通过/2Linux恢复边界跳过；新冻结完整Linux控制54/54、零跳过。全部1561跟踪文件与独立binary reader逐字节摘要和长度一致。新归档须使用新代，不覆盖失败输出。

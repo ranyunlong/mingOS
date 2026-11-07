@@ -4,6 +4,8 @@
 
 当前范围：`persistentUpdateNormalRebootVerified=true`；`persistentUpdateExplicitRecoveryVerified=true` 仅覆盖下述 Linux 受控进程中断与显式恢复。`formalQualification=false`、`finalSystemAccepted=false`。
 
+2026-11-07 开发交付已生成：`artifacts/mingos-vm-dev-20261107-0c9f60f/README.md`。3544954880字节归档（SHA256 `cb8ef776f35584c915ad4b72d322e1973a06ca9b856c8790625e6b23a09dc744`）已在不挂载原checkout的情况下严格导入、恢复完整源码及独立只读重开；原始三阶段 Notes SDK 回放一致。导入 runtime 投影后，以恢复的1561文件源码实际启动 Notes/Motion，新盘空便签，正常桌面POWER及精确exit0通过。该本机交付不包含全新daemon加载或可迁携用户数据恢复结论。具体pins、失败保留和源码快照/最终记录区别见 [本次交付记录](vm-delivery-release-20261107.md)。
+
 ## 已验证范围
 
 - cold `89161e5b1ad44f96` 完成全部十条固定 release 命令：all-targets 775 passed、0 failed、24 ignored；三个真实 controller 和 public integration 各1/0/0/0，recovery 父矩阵18/0/1/0。固定镜像、禁网、单 writer、空 target、UID65534、2CPU/4GiB及1800/900秒上限保持。
