@@ -135,6 +135,9 @@ def checked_path(base, relative):
     return target
 
 def checked_session(review, payload):
+    if review.get("profile") == "developer-vm-v1":
+        from developer_profile import session_contract
+        session_contract(review)
     if review.get("reviewed") is not True or not review.get("reviewer"):
         raise ValueError("main-thread session/payload review is pending")
     for name, field in (("ming-app-host", "hostSha256"), ("catalog.json", "catalogSha256")):
@@ -167,7 +170,9 @@ def checked_session(review, payload):
     if any(arg.split("=", 1)[0] in ("--backend", "--renderer", "--snapshot", "--events") for arg in extra):
         raise ValueError("session cannot override native CPU presentation or inject test events")
     if mode == "bounded":
-        if review.get("profile") == "public-probe":
+        if review.get("profile") == "developer-vm-v1":
+            pass  # Independent exact contract checked before shared hash validation.
+        elif review.get("profile") == "public-probe":
             expected = ["--duration-ms", "15000", "--isolation", "strict", "--data-root", "/data/mingos",
                         "--state-file", "/run/evidence/desktop-state.json"]
             if extra != expected:
@@ -180,6 +185,10 @@ def checked_session(review, payload):
 
 def validate_reviewed_input(review, path, boot_number=None):
     """Return frozen input bytes and their digest for both validation and use."""
+    if review.get("profile") == "developer-vm-v1":
+        if path is not None or boot_number is not None:
+            raise ValueError("developer-vm-v1 forbids input scripts and qualification boot roles")
+        return None, None
     if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES:
         if review["profile"] == "persistent-update": persistent_update_boot_role(boot_number)
         elif review["profile"] == "persistent-uninstall": persistent_uninstall_boot_role(boot_number)

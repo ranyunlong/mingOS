@@ -1,0 +1,335 @@
+[
+    {
+        "Id": "435b00f9706515c5c3229a93d0b4a360162fd903aa2e1fe5ea00782dc50fcff8",
+        "Created": "2026-11-07T10:47:12.931770399Z",
+        "Path": "node",
+        "Args": [
+            "/harness/pipeline.mjs",
+            "prepare"
+        ],
+        "State": {
+            "Status": "created",
+            "Running": false,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 0,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "0001-01-01T00:00:00Z",
+            "FinishedAt": "0001-01-01T00:00:00Z"
+        },
+        "Image": "sha256:5fba561826e826a26e5179d8b58425d0b5125d679e7dc64459d38bad0c6e417f",
+        "ResolvConfPath": "",
+        "HostnamePath": "",
+        "HostsPath": "",
+        "LogPath": "",
+        "Name": "/mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-prepare",
+        "RestartCount": 0,
+        "Driver": "overlayfs",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": null,
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+            "NetworkMode": "none",
+            "PortBindings": {},
+            "RestartPolicy": {
+                "Name": "no",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": [
+                "ALL"
+            ],
+            "CgroupnsMode": "private",
+            "Dns": null,
+            "DnsOptions": [],
+            "DnsSearch": [],
+            "ExtraHosts": null,
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": true,
+            "SecurityOpt": [
+                "no-new-privileges"
+            ],
+            "Tmpfs": {
+                "/tmp": "rw,nosuid,nodev,size=1g,mode=1777"
+            },
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 4294967296,
+            "NanoCpus": 2000000000,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": [],
+            "BlkioDeviceReadBps": [],
+            "BlkioDeviceWriteBps": [],
+            "BlkioDeviceReadIOps": [],
+            "BlkioDeviceWriteIOps": [],
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": [],
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 8589934592,
+            "MemorySwappiness": null,
+            "OomKillDisable": false,
+            "PidsLimit": 256,
+            "Ulimits": null,
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "Mounts": [
+                {
+                    "Type": "bind",
+                    "Source": "C:\\Users\\example\\projects\\mingOS\\artifacts\\environment-rebuild-20261107\\kotlin-synthetic-actual-b09a3187",
+                    "Target": "/harness",
+                    "ReadOnly": true
+                },
+                {
+                    "Type": "volume",
+                    "Source": "mingos-kotlin-linux-prep-20261107-gradle",
+                    "Target": "/original-cache",
+                    "ReadOnly": true,
+                    "VolumeOptions": {
+                        "NoCopy": true
+                    }
+                },
+                {
+                    "Type": "bind",
+                    "Source": "/run/desktop/mnt/host/c/Users/example/projects/mingOS/artifacts/ks-740082ff",
+                    "Target": "/checkout",
+                    "ReadOnly": true
+                },
+                {
+                    "Type": "volume",
+                    "Source": "mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-source",
+                    "Target": "/source",
+                    "VolumeOptions": {
+                        "NoCopy": true
+                    }
+                },
+                {
+                    "Type": "volume",
+                    "Source": "mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-cache",
+                    "Target": "/deps/gradle",
+                    "VolumeOptions": {
+                        "NoCopy": true
+                    }
+                },
+                {
+                    "Type": "volume",
+                    "Source": "mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-work",
+                    "Target": "/work",
+                    "VolumeOptions": {
+                        "NoCopy": true
+                    }
+                },
+                {
+                    "Type": "volume",
+                    "Source": "mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-output",
+                    "Target": "/out",
+                    "VolumeOptions": {
+                        "NoCopy": true
+                    }
+                }
+            ],
+            "MaskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ],
+            "Init": true
+        },
+        "Storage": {
+            "RootFS": {
+                "Snapshot": {
+                    "Name": "overlayfs"
+                }
+            }
+        },
+        "Mounts": [
+            {
+                "Type": "bind",
+                "Source": "/run/desktop/mnt/host/c/Users/example/projects/mingOS/artifacts/ks-740082ff",
+                "Destination": "/checkout",
+                "Mode": "",
+                "RW": false,
+                "Propagation": "rprivate"
+            },
+            {
+                "Type": "bind",
+                "Source": "C:\\Users\\example\\projects\\mingOS\\artifacts\\environment-rebuild-20261107\\kotlin-synthetic-actual-b09a3187",
+                "Destination": "/harness",
+                "Mode": "",
+                "RW": false,
+                "Propagation": "rprivate"
+            },
+            {
+                "Type": "volume",
+                "Name": "mingos-kotlin-linux-prep-20261107-gradle",
+                "Source": "/var/lib/docker/volumes/mingos-kotlin-linux-prep-20261107-gradle/_data",
+                "Destination": "/original-cache",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": false,
+                "Propagation": ""
+            },
+            {
+                "Type": "volume",
+                "Name": "mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-output",
+                "Source": "/var/lib/docker/volumes/mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-output/_data",
+                "Destination": "/out",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": true,
+                "Propagation": ""
+            },
+            {
+                "Type": "volume",
+                "Name": "mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-source",
+                "Source": "/var/lib/docker/volumes/mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-source/_data",
+                "Destination": "/source",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": true,
+                "Propagation": ""
+            },
+            {
+                "Type": "volume",
+                "Name": "mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-work",
+                "Source": "/var/lib/docker/volumes/mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-work/_data",
+                "Destination": "/work",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": true,
+                "Propagation": ""
+            },
+            {
+                "Type": "volume",
+                "Name": "mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-cache",
+                "Source": "/var/lib/docker/volumes/mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a-cache/_data",
+                "Destination": "/deps/gradle",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": true,
+                "Propagation": ""
+            }
+        ],
+        "Config": {
+            "Hostname": "435b00f97065",
+            "Domainname": "",
+            "User": "65534:65534",
+            "AttachStdin": false,
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "NODE_VERSION=24.22.1",
+                "YARN_VERSION=1.22.22",
+                "DEBIAN_FRONTEND=noninteractive",
+                "JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64",
+                "HOME=/tmp",
+                "GRADLE_USER_HOME=/deps/gradle"
+            ],
+            "Cmd": [
+                "/harness/pipeline.mjs",
+                "prepare"
+            ],
+            "Image": "sha256:5fba561826e826a26e5179d8b58425d0b5125d679e7dc64459d38bad0c6e417f",
+            "Volumes": null,
+            "WorkingDir": "/workspace",
+            "Entrypoint": [
+                "node"
+            ],
+            "Labels": {
+                "org.mingos.generation": "mingos-kotlin-delivery-e043cc9a8b41407c867834823efda96a",
+                "org.mingos.nonce": "69f5f4592e4e4a39a249a30fce6cb45e"
+            }
+        },
+        "NetworkSettings": {
+            "SandboxID": "",
+            "SandboxKey": "",
+            "Ports": {},
+            "Networks": {
+                "none": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": null,
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "",
+                    "EndpointID": "",
+                    "Gateway": "",
+                    "IPAddress": "",
+                    "MacAddress": "",
+                    "IPPrefixLen": 0,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": null
+                }
+            }
+        },
+        "ImageManifestDescriptor": {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:57e861ebb9c1561e6eeb587a8ea36792e349ec299de6ba0bfca860d4dafed58a",
+            "size": 1625,
+            "platform": {
+                "architecture": "amd64",
+                "os": "linux"
+            }
+        }
+    }
+]

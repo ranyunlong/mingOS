@@ -578,6 +578,10 @@ def verify_boot(run, number, review, spec=None, signed=None, bundle_identity=Non
     else:
         require(all(same_json(before[key], after[key]) for key in ('content', 'removed', 'privateContent')), 'boot2 reseeded/mutated disk/private data')
     full_trace = outcome['trace']
+    launch_input = next((row['record']['receipt'] for row in inputs
+        if row['record']['receipt']['sequence'] == parser.app2_down), None)
+    worker_started = next((row['record']['receipt'] for row in rows
+        if row['record']['kind'] == 'native-launch' and row['record']['receipt']['phase'] == 'worker-started'), None)
     for row in rows:
         record = row['record']
         value = record['receipt']
@@ -585,7 +589,27 @@ def verify_boot(run, number, review, spec=None, signed=None, bundle_identity=Non
         for anchor in anchors:
             require(anchor['traceCount'] <= len(full_trace), 'native anchor exceeds full outcome trace')
             for historical in anchor['history']:
-                matching = [item for item in outcome['instances'] if parser.identity(item) == parser.identity(historical)]
+                identity = parser.identity(historical)
+                matching = [item for item in outcome['instances'] if parser.identity(item) == identity]
+                if historical['workerPid'] == 0:
+                    # Rust records a starting instance before its supervisor publishes the PID.
+                    # Bind only that native launch's pre-spawn down/up anchors to its later worker.
+                    pending = [app for app in anchor['state']['apps'] if parser.identity(app) == identity]
+                    launches = [index for index, event in enumerate(full_trace) if event['kind'] == 'launch'
+                        and tuple(event[key] for key in ('app', 'generation', 'window')) == identity[:3]]
+                    require(number == 1 and historical['status'] == 'starting' and historical['completed'] is False
+                        and record['kind'] == 'native-input' and launch_input is not None and worker_started is not None
+                        and value['pressSequence'] == parser.app2_down
+                        and value['sequence'] in (parser.app2_down, parser.app2_down + 1)
+                        and parser.launch is not None and parser.launch[1][:3] == identity[:3]
+                        and len(pending) == 1 and pending[0]['state'] == 'starting'
+                        and launch_input['after']['state']['revision'] <= anchor['state']['revision']
+                            < worker_started['anchor']['state']['revision']
+                        and len(launches) == 1
+                        and launch_input['before']['traceCount'] <= launches[0] < launch_input['after']['traceCount']
+                            <= anchor['traceCount'] <= worker_started['anchor']['traceCount'],
+                        'pending native history lacks its pre-spawn launch binding')
+                    matching = [item for item in outcome['instances'] if parser.identity(item) == parser.launch[1]]
                 require(len(matching) == 1, 'native history missing from complete outcome')
                 if historical['completed']:
                     require(all(same_json(matching[0].get(key), item) for key, item in historical.items()),

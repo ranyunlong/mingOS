@@ -30,6 +30,15 @@ test('uninstall selects its own offline source task without update fixture argum
   assert.ok(!args.includes(':persistent-update-demo:compileProductionExecutableKotlinWasmWasi'));
   for(const fixture of ['old','new','absent-write'])assert.throws(()=>parseOptions(['persistent-uninstall-demo',fixture]));
 });
+test('developer Motion selects its own forced offline SDK5 source task',()=>{
+  const options=parseOptions(['animated-demo']);
+  assert.equal(options.sample,'animated-demo');assert.equal(options.fixture,null);
+  const args=gradleArguments({...paths,...options});
+  assert.ok(args.includes(':animated-demo:compileProductionExecutableKotlinWasmWasi'));
+  for(const flag of ['--offline','--rerun-tasks','--no-build-cache','--no-configuration-cache'])assert.ok(args.includes(flag));
+  assert.ok(!args.some(arg=>arg.startsWith('-PpersistentUpdateFixture=')));
+  for(const fixture of ['old','new','absent-write'])assert.throws(()=>parseOptions(['animated-demo',fixture]));
+});
 test('compiler failure and signals cannot reach packaging',()=>{
   requireCompilerSuccess({exitCode:0,signal:null});
   for(const result of [{exitCode:1,signal:null},{exitCode:null,signal:'SIGKILL'},{exitCode:0,signal:'SIGTERM'}])assert.throws(()=>requireCompilerSuccess(result));
@@ -92,6 +101,16 @@ test('viewer, bootstrap and update use real adapter rewrite plus distinct capabi
   }
 });
 const uninstallImports=[['ming_input_v1','poll',2],['ming_input_v1','text_focus',2],['ming_frame_v1','wait',4],['ming_v4','frame_submit',2],['wasi_snapshot_preview1','random_get',2],['ming_private_files_v2','call',4]];
+test('developer Motion admits SDK5 frame clock and rejects SDK6 authority',()=>{
+  const manifest={schemaVersion:1,id:'dev.ming.animated-demo',version:'0.1.0',sdkVersion:5,entry:'main.wasm'};
+  const imports=[['ming_frame_v1','wait',4],['ming_frame_v1','clock_monotonic_ns',2],['ming_v4','frame_submit',2],['wasi_snapshot_preview1','random_get',2]];
+  assert.equal(validatePackage(wasm(imports),'animated-demo',null,manifest).rewrites.length,1);
+  for(const capability of [['ming_input_v1','poll',2],['ming_input_v1','text_focus',2],['ming_private_files_v2','call',4]])
+    assert.throws(()=>validatePackage(wasm([...imports,capability]),'animated-demo',null,manifest));
+  for(const sdkVersion of [2,6])assert.throws(()=>validatePackage(wasm(imports),'animated-demo',null,{...manifest,sdkVersion}));
+  for(const missing of ['wait','clock_monotonic_ns','frame_submit'])assert.throws(()=>validatePackage(wasm(imports.filter(row=>row[1]!==missing)),'animated-demo',null,manifest));
+  assert.throws(()=>validatePackage(wasm(imports),'animated-demo','new',manifest));
+});
 const uninstallManifest={schemaVersion:1,id:'dev.ming.install-demo',version:'1.0.0',sdkVersion:6,entry:'main.wasm'};
 test('uninstall validates its actual install-demo identity and SDK6 adapter contract',()=>{
   const result=validatePackage(wasm(uninstallImports),'persistent-uninstall-demo',null,uninstallManifest);

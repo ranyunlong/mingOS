@@ -18,7 +18,7 @@ const inside=(base,path)=>path===base||(!relative(base,path).startsWith('..'+sep
 
 export function parseOptions(argv){
   const args=[...argv],sample=args.shift();
-  if(!['read-file','image-viewer','text-entry-demo','persistent-update-demo','persistent-uninstall-demo'].includes(sample))fail('expected read-file, image-viewer, text-entry-demo, persistent-update-demo or persistent-uninstall-demo');
+  if(!['read-file','image-viewer','text-entry-demo','animated-demo','persistent-update-demo','persistent-uninstall-demo'].includes(sample))fail('expected read-file, image-viewer, text-entry-demo, animated-demo, persistent-update-demo or persistent-uninstall-demo');
   const fixture=sample==='persistent-update-demo'?args.shift():null;
   if(sample==='persistent-update-demo'&&!['old','new','absent-write'].includes(fixture))fail('expected update fixture old, new or absent-write');
   const value={sample,fixture,repo:resolve(here,'../..')};
@@ -74,6 +74,7 @@ async function sourceInputs(repo){
 const sdk1={'ming_v1.file_open':1,'ming_v1.file_length':1,'ming_v1.file_read_byte':2,'ming_v1.file_close':1,'ming_v1.log':2};
 const sdk2={...sdk1,'ming_v2.file_read':4,'ming_v2.image_open':1,'ming_v2.image_width':1,'ming_v2.image_height':1,'ming_v2.image_close':1,'ming_v2.frame_submit':2,'ming_v2.event_next':2,'ming_v2.random_fill':2};
 const sdk6={'ming_private_files_v2.call':4,'ming_v1.log':2,'ming_v2.random_fill':2,'ming_v2.event_next':2,'ming_input_v1.poll':2,'ming_input_v1.text_focus':2,'ming_frame_v1.wait':4,'ming_frame_v1.clock_monotonic_ns':2,'ming_v3.text_layout_create':5,'ming_v3.text_layout_metrics':3,'ming_v3.text_layout_close':1,'ming_v4.frame_submit':2,'ming_v4.shadow_style_create':2,'ming_v4.shadow_style_close':1};
+const sdk5=Object.fromEntries(Object.entries(sdk6).filter(([key])=>!key.startsWith('ming_input_v1.')&&key!=='ming_private_files_v2.call'));
 function entryAbi(bytes,imports,exports){
   assert.ok(exports.some(row=>row.name==='_start'&&row.kind==='function'),'Missing _start function export');
   assert.ok(exports.some(row=>row.name==='memory'&&row.kind==='memory'),'Missing memory export');
@@ -93,13 +94,14 @@ function entryAbi(bytes,imports,exports){
 export function validatePackage(raw,sample,fixture,manifest){
   const uninstall=sample==='persistent-uninstall-demo';
   if(uninstall&&fixture!==null)fail('uninstall source does not accept an update fixture');
-  const sdk=sample==='read-file'?1:sample==='image-viewer'?2:6;
+  if(sample==='animated-demo'&&fixture!==null)fail('Motion source does not accept an update fixture');
+  const sdk=sample==='read-file'?1:sample==='image-viewer'?2:sample==='animated-demo'?5:6;
   assert.equal(manifest.schemaVersion,1);assert.equal(manifest.id,uninstall?'dev.ming.install-demo':'dev.ming.'+sample);assert.equal(manifest.sdkVersion,sdk);assert.equal(manifest.entry,'main.wasm');assert.equal(manifest.version,uninstall?'1.0.0':sample==='persistent-update-demo'&&fixture!=='old'?'0.2.0':'0.1.0');
   const adapted=adaptKotlinWasi(raw),replay=adaptKotlinWasi(raw);assert.deepEqual(adapted,replay);
   assert.deepEqual(adapted.rewrites,sdk===1?[]:[{from:'wasi_snapshot_preview1.random_get',to:'ming_v2.random_fill'}]);
-  const imports=inspectImports(adapted.bytes).imports,allowed=sdk===1?sdk1:sdk===2?sdk2:sdk6;
+  const imports=inspectImports(adapted.bytes).imports,allowed=sdk===1?sdk1:sdk===2?sdk2:sdk===5?sdk5:sdk6;
   for(const entry of imports){const key=entry.module+'.'+entry.name;assert.ok(Object.hasOwn(allowed,key),'Unexpected SDK capability '+key);assert.equal(entry.kind,'function');assert.deepEqual(entry.params,Array(allowed[key]).fill('i32'),key);assert.deepEqual(entry.results,['i32'],key)}
-  const required=sdk===1?Object.keys(sdk1):sdk===2?['ming_v1.file_open','ming_v1.file_close','ming_v2.file_read','ming_v2.image_open','ming_v2.image_width','ming_v2.image_height','ming_v2.image_close','ming_v2.event_next','ming_v2.frame_submit','ming_v2.random_fill']:[...(sample==='persistent-update-demo'||uninstall?['ming_private_files_v2.call']:[]),'ming_input_v1.poll','ming_input_v1.text_focus','ming_frame_v1.wait','ming_v4.frame_submit'];
+  const required=sdk===1?Object.keys(sdk1):sdk===2?['ming_v1.file_open','ming_v1.file_close','ming_v2.file_read','ming_v2.image_open','ming_v2.image_width','ming_v2.image_height','ming_v2.image_close','ming_v2.event_next','ming_v2.frame_submit','ming_v2.random_fill']:sdk===5?['ming_frame_v1.clock_monotonic_ns','ming_frame_v1.wait','ming_v4.frame_submit']:[...(sample==='persistent-update-demo'||uninstall?['ming_private_files_v2.call']:[]),'ming_input_v1.poll','ming_input_v1.text_focus','ming_frame_v1.wait','ming_v4.frame_submit'];
   for(const key of required)assert.ok(imports.some(entry=>entry.module+'.'+entry.name===key),'Missing SDK capability '+key);
   const module=new WebAssembly.Module(adapted.bytes);assert.deepEqual(imports.map(({module,name,kind})=>({module,name,kind})),WebAssembly.Module.imports(module));
   const exports=WebAssembly.Module.exports(module);entryAbi(adapted.bytes,imports,exports);

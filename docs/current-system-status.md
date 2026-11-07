@@ -15,9 +15,11 @@
 
 ## 继续交付的门槛
 
-1. 独立 Linux 持久卸载资格：四包真实 Kotlin 来源重编/重放与首个七命令冷构建59f0274d已完成（776通过、0失败、24忽略）；独立probe/geometry/tools资产核验完成。runtime bfcc983e在prepare加载/assets/checker/driver.py时因目录层级计算错误失败，尚未启动客体；失败代保留，修复后必须全新冻结构建。七步/一步同盘双启动及独立导出回放仍待执行。
-2. 按实际系统需求继续核对剩余日常工作流、系统集成与发布标准。物理鼠标专项仍暂停；TCG、虚拟输入和软件呈现不能作为物理硬件资格。
+1. 独立 Linux 持久卸载资格：四包真实 Kotlin 来源重编/重放与新七命令冷构建3a4b4a45已完成（776通过、0失败、24忽略）。部署目录修复后，runtime 5d98a41e实际完成首轮安装、启动、Close、卸载和正常关机；强raw检查拒绝启动阶段PID0与最终PID211不相等，第二轮未启动。检查器现已仅对同次唯一启动、worker-started之前的starting锚点完成绑定修复；原失败首轮的只读诊断通过，不改变该代失败状态。原盘、卷、容器和全部日志保留，该失败代不续用。新runner加入Motion导致旧四包来源收据不再匹配，须重新编译，再执行全新冻结、同盘双启动及独立导出回放，不能声明卸载资格通过。
+2. 用户确认优先交付可复建的x86_64 VM开发系统，含应用、持久数据、更新/卸载和恢复说明。公共只读developer pack验证器已通过主执行者独立Linux40项控制；源码/缓存迁移、实际干净重建与开发会话仍在实施，详见[交付范围与检查入口](vm-developer-system.md)。物理鼠标专项仍暂停；TCG、虚拟输入和软件呈现不能作为物理硬件资格。
 3. 历史APFS资格不能由新Linux证据替代；280个deb的观察记录也不构成完整签名离线APT重建闭包。
+
+新开发入口阶段：完整开发包只读验证器已独立Linux40/40；卸载checker、开发profile、固定镜像迁移和共享boot控制在真实Linux合计65/65、零跳过。三个开发工具链归档实际只读验证通过，但未实际加载到全新daemon。Kotlin公开包装器的16项编排控制、18项链路控制和20项runner控制通过；其原型另完成真实Docker输入复制、只读拒绝及非零/超时收尾，尚不代表新四包/双包编译或开发VM通过。各项范围、公开命令与待完成门槛见[开发系统交付说明](vm-developer-system.md)。
 
 完整阶段记录见 [连续开发记录](continuous-development.md)、[当前环境记录](development-environment-20261107.md)、[Linux更新资格计划](superpowers/plans/2026-11-07-linux-host-qualification.md) 与 [Linux卸载资格计划](superpowers/plans/2026-11-07-linux-host-uninstall-qualification.md)。大产物按仓库约定保留本机，不提交Git。
 

@@ -40,7 +40,7 @@ def install_fault_injection(root, scripts, fault_config):
 def verify_payload(payload, review):
     checked_session(review, payload)
     profile = review.get("profile", "desktop")
-    if profile not in ("desktop", "data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "persistent-update", "data-text-private-probe", "data-text-public-probe", "public-probe"):
+    if profile not in ("desktop", "data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "persistent-update", "data-text-private-probe", "data-text-public-probe", "public-probe", "developer-vm-v1"):
         raise ValueError("unknown reviewed payload profile")
     if any(item.is_symlink() for item in payload.rglob("*")):
         raise ValueError("frozen payload must contain no symlinks")
@@ -49,7 +49,10 @@ def verify_payload(payload, review):
     if header != b"\x7fELF":
         raise ValueError("Linux ELF release host required")
     raw_catalog = (payload / "catalog.json").read_text()
-    catalog = strict_json(raw_catalog) if profile in PERSISTENT_PAYLOAD_PROFILES else json.loads(raw_catalog)
+    catalog = strict_json(raw_catalog) if profile in (*PERSISTENT_PAYLOAD_PROFILES, "developer-vm-v1") else json.loads(raw_catalog)
+    if profile == "developer-vm-v1":
+        from developer_profile import verify_developer_vm
+        return verify_developer_vm(payload, review, catalog)
     if profile == "data-text":
         return verify_data_text(payload, review, catalog)
     if profile == "data-text-update":
@@ -95,6 +98,7 @@ def copy_guest_scripts(root, scripts, profile):
              "wayland_receipt.py", "worker_resources.py", "weston.ini")
     if profile == "persistent-uninstall": names += ("persistent_uninstall_receipt.py",)
     if profile == "persistent-update": names += ("persistent_update_receipt.py",)
+    if profile == "developer-vm-v1": names += ("developer_profile.py",)
     hashes = {}
     for name in names:
         raw = (scripts / name).read_bytes()
@@ -182,7 +186,14 @@ def main():
         raise ValueError("non-legacy isolation profile requires --isolation-probes")
     raw_review = args.review.read_text()
     review = json.loads(raw_review)
-    if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES: review = strict_json(raw_review)
+    if review.get("profile") in (*PERSISTENT_PAYLOAD_PROFILES, "developer-vm-v1"): review = strict_json(raw_review)
+    developer = review.get("profile") == "developer-vm-v1"
+    developer_probe_contract = None
+    if developer:
+        from developer_profile import validate_bundle_options
+        developer_probe_contract = validate_bundle_options(review, args.isolation_profile, args.isolation_probes,
+            input_diagnostics=args.input_diagnostics, wayland_client_diagnostics=args.wayland_client_diagnostics,
+            pointer_handshake_diagnostics=args.pointer_handshake_diagnostics)
     fault_config = fault_config_from_review(review)
     catalog = verify_payload(args.payload, review)  # before any large filesystem write
     if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "persistent-update", "data-text-private-probe", "data-text-public-probe", "public-probe") or not args.isolation_probes):
@@ -205,8 +216,8 @@ def main():
             "observerMaxSeconds":900, "exclusiveGrab":False, "readyCaptureSeconds":None}
         if review.get("instrumentation") != expected_instrumentation:
             raise ValueError("reviewed instrumentation does not match actual bounded guest configuration")
-    probe_contract = None
-    if args.isolation_probes:
+    probe_contract = developer_probe_contract
+    if args.isolation_probes and not developer:
         probe_contract = verify_review_and_files(args.isolation_profile, review, args.isolation_probes)
     args.output.mkdir(parents=True, exist_ok=False)
     root = args.output / "rootfs"
@@ -307,6 +318,12 @@ def main():
                 "payloadSha256": {str(p.relative_to(args.payload)): sha256(p) for p in args.payload.rglob("*") if p.is_file()},
                 "scriptSha256": {name: sha256(scripts / name) for name in (("bundle.py", "isolation_profiles.py", "payload_profiles.py", "evdev_observer.py", "bounded_log.py", "wayland_receipt.py", "worker_resources.py", "bootlib.py", "guest.py", "guest_platform.py", "infra.py", "init", "weston.ini") + (("fault_injector.py",) if fault_config else ())) if name not in guest_script_hashes}}
     manifest["scriptSha256"].update(guest_script_hashes)
+    if developer:
+        manifest.update(diagnosticOnly=True, instrumentedQualification=False, formalQualification=False,
+                        finalSystemAccepted=False, developerProfile="developer-vm-v1",
+                        probeBuildReceiptSha256=review["probeBuildReceiptSha256"],
+                        probeSourceFreezeSha256=review["probeSourceFreezeSha256"],
+                        hostProvenance=review["hostProvenance"])
     (args.output / "bundle.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest, indent=2))
 

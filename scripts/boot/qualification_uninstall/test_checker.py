@@ -10,11 +10,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 if not shutil.which('openssl') and Path('C:/Program Files/Git/usr/bin/openssl.exe').is_file():
     os.environ['PATH'] = 'C:/Program Files/Git/usr/bin' + os.pathsep + os.environ['PATH']
-from fixtures import Fixture, RawBoot, load, put, encoded, portable_pair, seal, digest
+from fixtures import Fixture, RawBoot, load, put, encoded, portable_pair, seal, digest, controls
 
 
 class InterfaceTests(unittest.TestCase):
@@ -58,6 +59,62 @@ class EvidenceTests(unittest.TestCase):
             audited = self.check(self.boot(number))
             self.assertEqual(audited['bootNumber'], number)
             self.assertEqual(audited['after']['privateContent'], self.checker.PRIVATE_CONTENT)
+
+    def pending_launch_boot(self, mutate=None):
+        values = controls.chain(old=False)
+        for record in values:
+            value = record['receipt']
+            if record['kind'] != 'native-input' or value['sequence'] not in (1, 2):
+                continue
+            for key in ('before', 'after'):
+                anchor = value[key]
+                for row in anchor['history']:
+                    if row['app'] == 2 and row['status'] == 'starting':
+                        row['workerPid'] = 0
+                for app in anchor['state']['apps']:
+                    if app['app'] == 2 and app['state'] == 'starting':
+                        app['workerPid'] = 0
+        original_line, changed = controls.line, False
+        def line(record):
+            nonlocal changed
+            # Mutate after RawBoot normalizes generation/revision, before it seals transport bytes.
+            if mutate and not changed:
+                mutate(values)
+                changed = True
+            return original_line(record)
+        with mock.patch.object(controls, 'chain', return_value=values), \
+                mock.patch.object(controls, 'line', side_effect=line):
+            return self.boot()
+
+    def test_pending_native_launch_history_binds_to_later_worker(self):
+        boot = self.pending_launch_boot()
+        audited = self.check(boot)
+        self.assertEqual(audited['bootNumber'], 1)
+
+    def test_pending_native_launch_does_not_hide_invalid_history(self):
+        def pending(values):
+            return values[2]['receipt']['after']
+        def completed(values):
+            return values[-2]['receipt']['before']['history'][0]
+        for label, mutate in (
+                ('nonzero-pid', lambda v: pending(v)['history'][0].update(workerPid=999)),
+                ('wrong-generation', lambda v: pending(v)['history'][0].update(generation=99)),
+                ('wrong-window', lambda v: pending(v)['history'][0].update(window=99)),
+                ('wrong-app', lambda v: pending(v)['history'][0].update(app=3)),
+                ('completed-zero', lambda v: pending(v)['history'][0].update(completed=True)),
+                ('running-zero', lambda v: pending(v)['history'][0].update(status='running')),
+                ('state-pid', lambda v: pending(v)['state']['apps'][0].update(workerPid=999)),
+                ('no-launch-trace', lambda v: v[2]['receipt']['trace'][0].update(kind='other')),
+                ('duplicate', lambda v: pending(v)['history'].append(copy.deepcopy(pending(v)['history'][0]))),
+                ('terminal-pid-zero', lambda v: completed(v).update(workerPid=0)),
+                ('terminal-content', lambda v: completed(v).update(requests=999))):
+            with self.subTest(change=label):
+                boot = self.pending_launch_boot(mutate)
+                try:
+                    with self.assertRaises(ValueError):
+                        self.check(boot)
+                finally:
+                    shutil.rmtree(boot.run)
 
     def test_private_and_removed_snapshots_fail_closed(self):
         for number, phase in ((1, 'pre-desktop'), (1, 'post-desktop'), (2, 'pre-desktop'), (2, 'post-desktop')):
