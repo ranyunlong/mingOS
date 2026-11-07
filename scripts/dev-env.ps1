@@ -13,7 +13,7 @@ if (!$javaHome -or !(Test-Path -LiteralPath (Join-Path $javaHome 'bin\java.exe')
 }
 
 $env:JAVA_HOME = $javaHome
-$env:GRADLE_USER_HOME = Join-Path $cache 'gradle-user'
+$env:GRADLE_USER_HOME = Join-Path $cache 'gradle'
 $env:CARGO_HOME = Join-Path $cache 'cargo'
 $env:RUSTUP_HOME = Join-Path $cache 'rustup'
 $env:CARGO_TARGET_DIR = Join-Path $cache 'rust-target'

@@ -336,3 +336,5 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 
 此前“恢复三个镜像和 build-cache volume 即可续跑”的说明不完整：历史 Task9 还要求 Darwin/APFS、原宿主缓存及真实 Kotlin/网络隔离/外部输入收据；prepare 必须使用全新目标 build volume，恢复已有卷不满足该合同。用户已确认目前无法访问原 macOS 或完整备份。旧失败代与历史 driver 不续用；当前 Windows + Docker/Linux 将以独立工具链、fixture、存储合同和完整冻结建立新代。该调整保留持久更新、显式恢复和正常双启动要求，`finalSystemAccepted=false`。
 本阶段验证：PowerShell 恢复入口测试退出0（包含两个禁用写入入口、fake Docker 未调用与只读状态断言），JavaScript 语法检查通过，Node 测试22通过、0失败、2项POSIX跳过；独立只读代码复核未发现本次遏制的阻断项。上述结果不验证镜像导入、卷恢复、Rust 构建或 guest。
+
+2026-11-07 当前宿主工具链重建：原 scripts/linux/Dockerfile 在新 tag mingos-linux-win-20261107 下真实构建成功，Docker inspect ID=sha256:88624fbbfcb6b7ac6f1207491053cbe6fd435262f0ce547443fb36760c7e9d80。实际 UID65534、禁网、只读容器确认 Rust/Cargo1.99.1、Python3.13.5、Weston14.0.2 可运行，完整包清单/来源及原始输出与hash收据保存 artifacts/environment-rebuild-20261107/toolchain-observation.json。Gradle8.14.5 镜像归档经仓库固定SHA验证后，原wrapper --version成功；环境入口缓存改为与构建脚本一致的.cache/gradle。新增当前宿主设计与分阶段实施计划，独立于历史APFS/缓存合同。Cargo/Kotlin依赖、boot tools闭包、正式构建与VM尚未完成；工具准备不代表Task9或系统交付，finalSystemAccepted=false。

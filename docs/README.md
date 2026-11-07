@@ -65,3 +65,4 @@
 - [AppData写入进程崩溃与恢复验证](app-data-process-crash-verification.md)：生产存储API的8个SIGKILL场景、16个子进程回收、完整文件与孤儿元数据审计。
 
 - [交付主线恢复检查点](boot-delivery-recovery-20261027.md)：离线工具镜像、当前系统Host、kernel候选输入和仍缺的原冻结输入。
+- [当前开发环境恢复](development-environment-20261107.md)：Windows + Docker/Linux 的实际新工具链与后续独立资格路线。
