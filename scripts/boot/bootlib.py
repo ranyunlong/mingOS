@@ -135,6 +135,9 @@ def checked_path(base, relative):
     return target
 
 def checked_session(review, payload):
+    if review.get("profile") == "developer-workflow-v1":
+        from workflow_profile import session_contract
+        session_contract(review)
     if review.get("profile") == "developer-vm-v1":
         from developer_profile import session_contract
         session_contract(review)
@@ -185,6 +188,12 @@ def checked_session(review, payload):
 
 def validate_reviewed_input(review, path, boot_number=None):
     """Return frozen input bytes and their digest for both validation and use."""
+    if review.get("profile") == "developer-workflow-v1":
+        from workflow_profile import session_contract
+        session_contract(review)
+        if boot_number is not None: raise ValueError("workflow forbids qualification boot roles")
+        if (path is None) != (review["inputScriptSha256"] is None):
+            raise ValueError("workflow replay/interactive mode differs from review")
     if review.get("profile") == "developer-vm-v1":
         if path is not None or boot_number is not None:
             raise ValueError("developer-vm-v1 forbids input scripts and qualification boot roles")
@@ -215,7 +224,7 @@ def validate_reviewed_input(review, path, boot_number=None):
 def reviewed_input_spec(review, raw):
     if raw is None: return None
     persistent = review.get("profile") in PERSISTENT_PAYLOAD_PROFILES
-    value = strict_json(raw) if persistent else json.loads(raw)
+    value = strict_json(raw) if persistent or review.get("profile") == "developer-workflow-v1" else json.loads(raw)
     if persistent and (not isinstance(value, dict) or set(value) != {"schemaVersion", "requireApps", "steps"}):
         raise ValueError("persistent input requires exact schemaVersion/requireApps/steps fields")
     return value

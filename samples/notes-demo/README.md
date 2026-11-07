@@ -17,12 +17,15 @@ application does not promise protection against another instance editing the sam
 note concurrently. Use one instance for this development demonstration.
 
 `MingPrivateFiles` is typed SDK6 API; the sample never constructs raw RPC or grants
-itself access. The Linux parent must grant the actual installed package
-`dev.ming.notes-demo` private-file capability through the normal authorization UI.
-Without a grant startup displays a read error and **保存不可用**. Authorize the
-package, then explicitly reload. `sdkVersion: 6` alone grants nothing. `MingAppData`
-slots are unnecessary here: the existing installed-package private-file flow
-already provides a named, atomic file with directory-sync feedback.
+itself access. With a data root configured, the Linux desktop selects the trusted
+catalog package `dev.ming.notes-demo` and provides its package-bound private-file
+capability. Private files need no user permission dialog. Public shared storage
+has a separate consent flow, which this sample does not request. SDK6 identifies
+the protocol; the parent still controls the actual capability and package binding.
+Without a usable capability startup displays a read error and **保存不可用**.
+After the underlying problem is resolved, explicitly reload. `MingAppData` slots
+are unnecessary here: private files support a named atomic replacement with
+directory-sync feedback.
 
 ## Build integration
 

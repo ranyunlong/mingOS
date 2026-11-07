@@ -40,7 +40,7 @@ def install_fault_injection(root, scripts, fault_config):
 def verify_payload(payload, review):
     checked_session(review, payload)
     profile = review.get("profile", "desktop")
-    if profile not in ("desktop", "data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "persistent-update", "data-text-private-probe", "data-text-public-probe", "public-probe", "developer-vm-v1"):
+    if profile not in ("desktop", "data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "persistent-update", "data-text-private-probe", "data-text-public-probe", "public-probe", "developer-vm-v1", "developer-workflow-v1"):
         raise ValueError("unknown reviewed payload profile")
     if any(item.is_symlink() for item in payload.rglob("*")):
         raise ValueError("frozen payload must contain no symlinks")
@@ -49,7 +49,10 @@ def verify_payload(payload, review):
     if header != b"\x7fELF":
         raise ValueError("Linux ELF release host required")
     raw_catalog = (payload / "catalog.json").read_text()
-    catalog = strict_json(raw_catalog) if profile in (*PERSISTENT_PAYLOAD_PROFILES, "developer-vm-v1") else json.loads(raw_catalog)
+    catalog = strict_json(raw_catalog) if profile in (*PERSISTENT_PAYLOAD_PROFILES, "developer-vm-v1", "developer-workflow-v1") else json.loads(raw_catalog)
+    if profile == "developer-workflow-v1":
+        from workflow_profile import verify_workflow
+        return verify_workflow(payload, review, catalog)
     if profile == "developer-vm-v1":
         from developer_profile import verify_developer_vm
         return verify_developer_vm(payload, review, catalog)
@@ -99,6 +102,7 @@ def copy_guest_scripts(root, scripts, profile):
     if profile == "persistent-uninstall": names += ("persistent_uninstall_receipt.py",)
     if profile == "persistent-update": names += ("persistent_update_receipt.py",)
     if profile == "developer-vm-v1": names += ("developer_profile.py",)
+    if profile == "developer-workflow-v1": names += ("workflow_profile.py",)
     hashes = {}
     for name in names:
         raw = (scripts / name).read_bytes()
@@ -186,9 +190,15 @@ def main():
         raise ValueError("non-legacy isolation profile requires --isolation-probes")
     raw_review = args.review.read_text()
     review = json.loads(raw_review)
-    if review.get("profile") in (*PERSISTENT_PAYLOAD_PROFILES, "developer-vm-v1"): review = strict_json(raw_review)
+    if review.get("profile") in (*PERSISTENT_PAYLOAD_PROFILES, "developer-vm-v1", "developer-workflow-v1"): review = strict_json(raw_review)
     developer = review.get("profile") == "developer-vm-v1"
+    workflow = review.get("profile") == "developer-workflow-v1"
     developer_probe_contract = None
+    if workflow:
+        from workflow_profile import validate_bundle_options as workflow_options
+        developer_probe_contract = workflow_options(review, args.isolation_profile, args.isolation_probes,
+            input_diagnostics=args.input_diagnostics, wayland_client_diagnostics=args.wayland_client_diagnostics,
+            pointer_handshake_diagnostics=args.pointer_handshake_diagnostics)
     if developer:
         from developer_profile import validate_bundle_options
         developer_probe_contract = validate_bundle_options(review, args.isolation_profile, args.isolation_probes,
@@ -196,7 +206,7 @@ def main():
             pointer_handshake_diagnostics=args.pointer_handshake_diagnostics)
     fault_config = fault_config_from_review(review)
     catalog = verify_payload(args.payload, review)  # before any large filesystem write
-    if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "persistent-update", "data-text-private-probe", "data-text-public-probe", "public-probe") or not args.isolation_probes):
+    if args.input_diagnostics and (review.get("profile") not in ("data-text", "data-text-update", "install-lifecycle", "persistent-install", "persistent-uninstall", "persistent-update", "data-text-private-probe", "data-text-public-probe", "public-probe", "developer-workflow-v1") or not args.isolation_probes):
         raise ValueError("input diagnostics requires reviewed data-text with strict probes")
     if args.wayland_client_diagnostics and not args.input_diagnostics:
         raise ValueError("Wayland client logging requires diagnostic-only input bundle")
@@ -217,7 +227,7 @@ def main():
         if review.get("instrumentation") != expected_instrumentation:
             raise ValueError("reviewed instrumentation does not match actual bounded guest configuration")
     probe_contract = developer_probe_contract
-    if args.isolation_probes and not developer:
+    if args.isolation_probes and not developer and not workflow:
         probe_contract = verify_review_and_files(args.isolation_profile, review, args.isolation_probes)
     args.output.mkdir(parents=True, exist_ok=False)
     root = args.output / "rootfs"
@@ -273,7 +283,7 @@ def main():
             "diagnosticOnly": not qualification, "profile": "input-pointer-ready-v1" if args.pointer_handshake_diagnostics else ("input-wayland-client-v1" if env else "input-transport-v1"),
             "evdevSha256": sha256(scripts / "evdev_observer.py"), "desktopEnv": env,
             "desktopEnvSha256": sha256(env_file), "stderrLimitBytes": 8 * 1024 * 1024,
-            "readyCaptureSeconds": 15 if env and not qualification else None, "pointerHandshake": args.pointer_handshake_diagnostics}))
+            "readyCaptureSeconds": 15 if env and not qualification and not workflow else None, "pointerHandshake": args.pointer_handshake_diagnostics}))
     if args.isolation_probes:
         for source_name, destination in (("mingos-isolation-probe", "usr/local/bin/mingos-isolation-probe"), ("vm-prepare.sh", "usr/local/libexec/mingos-isolation-prepare.sh")):
             target = root / destination; target.parent.mkdir(parents=True, exist_ok=True)
@@ -324,6 +334,12 @@ def main():
                         probeBuildReceiptSha256=review["probeBuildReceiptSha256"],
                         probeSourceFreezeSha256=review["probeSourceFreezeSha256"],
                         hostProvenance=review["hostProvenance"])
+    if workflow:
+        manifest.update(diagnosticOnly=True, instrumentedQualification=False, formalQualification=False,
+            finalSystemAccepted=False, developerProfile="developer-workflow-v1",
+            workflowBudgets=review["budgetEvidence"], controlPolicy=review["controlPolicy"],
+            probeBuildReceiptSha256=review["probeBuildReceiptSha256"],
+            probeSourceFreezeSha256=review["probeSourceFreezeSha256"], hostProvenance=review["hostProvenance"])
     (args.output / "bundle.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest, indent=2))
 

@@ -87,7 +87,7 @@ class GuestStream:
         before = self.plan.index
         self.plan.advance(state, qmp, self.pointer_context())
         if self.plan.index > before and state["phase"] == "ready":
-            name = "input-confirmed-%02d.ppm" % self.plan.index
+            name = getattr(self, "input_capture_prefix", "input-confirmed") + ("-%02d.ppm" % self.plan.index)
             qmp.execute("screendump", {"filename": str(self.path.parent / name)})
             self.input_captures.append(name)
 
@@ -158,6 +158,7 @@ def main():
     parser.add_argument("--runtime-root", type=Path, help="owned Linux tmpfs for disk lease and QMP socket")
     parser.add_argument("--data-manifest", help="relative manifest inside owned work-root")
     parser.add_argument("--input-script", type=Path)
+    parser.add_argument("--workflow-control", type=Path, help="new private Linux directory inside owned runtime-root")
     parser.add_argument("--boot-number", type=int, choices=(1, 2))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--diagnostic-split-input", action="store_true")
@@ -173,7 +174,7 @@ def main():
         manifest = validate_bundle(args.bundle, sha256(args.review))
         raw_review = args.review.read_text()
         review = json.loads(raw_review)
-        if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES: review = strict_json(raw_review)
+        if review.get("profile") in PERSISTENT_PAYLOAD_PROFILES or review.get("profile") == "developer-workflow-v1": review = strict_json(raw_review)
         if review.get("reviewed") is not True or not review.get("reviewer") or review != manifest["sessionReview"]:
             raise ValueError("main-thread review absent/changed")
         if manifest.get("faultInjection") is not None:
@@ -193,12 +194,28 @@ def main():
                 raise ValueError("input requires explicitly reviewed --state-file " + STATE_PATH)
     elif args.input_script or args.boot_number is not None:
         parser.error("paused probes cannot run ready-driven input scripts or persistent boot roles")
-    if args.diagnostic_split_input and (not manifest or not manifest.get("inputDiagnostics") or not args.input_script):
-        parser.error("split input requires an input-diagnostics bundle and reviewed input script")
+    workflow = bool(review and review.get("profile") == "developer-workflow-v1")
+    interactive_workflow = workflow and bool(args.workflow_control) and not args.input_script
+    if args.diagnostic_split_input and (not manifest or not manifest.get("inputDiagnostics")
+            or not (args.input_script or interactive_workflow)):
+        parser.error("split input requires an input-diagnostics bundle and reviewed input mode")
     if args.diagnostic_pointer_handshake and (not args.diagnostic_split_input or not manifest or manifest.get("diagnosticProfile") != "input-pointer-ready-v1"):
         parser.error("pointer handshake requires explicit instrumented pointer-ready bundle and split input")
     if manifest and manifest.get("diagnosticProfile") == "input-pointer-ready-v1" and not args.diagnostic_pointer_handshake:
         parser.error("pointer-ready bundle cannot fall back to unacknowledged input")
+    if workflow:
+        from workflow_profile import session_contract, BUDGETS
+        session_contract(review)
+        if (args.timeout != BUDGETS["guestSeconds"] or not args.runtime_root or not args.data_manifest
+            or not args.diagnostic_pointer_handshake or not args.diagnostic_split_input
+            or bool(args.workflow_control) == bool(args.input_script)
+            or manifest.get("developerProfile") != "developer-workflow-v1"
+            or manifest.get("workflowBudgets") != BUDGETS
+            or manifest.get("formalQualification") is not False or manifest.get("finalSystemAccepted") is not False
+            or manifest.get("instrumentedQualification") is not False):
+            raise ValueError("workflow requires fixed bounds, disk, runtime and exactly one reviewed input mode")
+    elif args.workflow_control:
+        parser.error("workflow control requires independent developer-workflow-v1 review")
     runtime = None
     qmp_path = args.output / "qmp.sock"
     if args.runtime_root is not None:
@@ -249,6 +266,7 @@ def main():
         qmp = proc = None
         stream = GuestStream(args.output / "guest.jsonl", plan, fault_config=fault_config)
         timed_out = False
+        controller = None
         try:
             with (args.output / "qemu.stdout.log").open("wb") as out, (args.output / "qemu.stderr.log").open("wb") as err:
                 proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
@@ -271,10 +289,16 @@ def main():
                 report["status"] = "paused-qmp-probe-passed"
             else:
                 deadline = time.monotonic() + args.timeout
+                if args.workflow_control:
+                    from workflow_control import Controller
+                    controller = Controller(args.workflow_control, runtime, args.output)
+                    report["workflowControlInstance"] = controller.instance
+                    save()
                 capture_at = time.monotonic() + 5
                 captures = []
                 while proc.poll() is None and time.monotonic() < deadline:
                     stream.poll(qmp)
+                    if controller: controller.poll(stream, qmp)
                     if plan: plan.check_deadline()
                     if time.monotonic() >= capture_at:
                         name = "scanout-%03d.ppm" % len(captures)
@@ -289,6 +313,7 @@ def main():
                     qmp.execute("system_powerdown")
                 else:
                     stream.poll(qmp)
+                    if controller: controller.finish(stream)
                     report["guestExitCode"] = proc.returncode
                     report["status"] = classify_guest(stream.records, False)
                     serial = (args.output / "kernel-serial.log").read_text(errors="replace")
@@ -318,6 +343,11 @@ def main():
             report["status"] = "timeout-unaccepted" if timed_out else "failed"
             report["error"] = repr(error)
         finally:
+            if controller:
+                try: controller.close(qmp)
+                except Exception as error:
+                    report["workflowControlCleanupError"] = repr(error)
+                    report["status"] = "failed"
             if qmp:
                 if plan:
                     try: plan.release(qmp)
