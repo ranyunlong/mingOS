@@ -52,11 +52,18 @@ def stamp(info):
  # Compare stable identity/bytes/mtime plus birthtime on Windows; Linux uses ctime.
  return (info.st_dev,info.st_ino,info.st_mode,info.st_nlink,info.st_size,info.st_mtime_ns,
          getattr(info,'st_birthtime_ns',None) if sys.platform=='win32' else info.st_ctime_ns)
+def cross_api_stamp(info):
+ # Windows path stat synthesizes execute bits from .bat/.cmd/.exe/.com suffixes;
+ # fd stat has no filename. Normalize only those bits across APIs. Same-API
+ # path and fd checks below still compare every mode bit through stamp().
+ value=stamp(info)
+ return value[:2]+(value[2]&~0o111,)+value[3:] if sys.platform=='win32' else value
+
 def file_record(root,name,expected):
  path=root/name;no_links(path);before=path.lstat();require(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and before.st_size<=MAX_SOURCE_FILE,'bounded single-link regular source required')
- fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0));h=hashlib.sha256();size=0
+ fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0));h=hashlib.sha256();size=0
  try:
-  opened=os.fstat(fd);require(stamp(opened)==stamp(before),'source replaced before open')
+  opened=os.fstat(fd);require(cross_api_stamp(opened)==cross_api_stamp(before),'source replaced before open')
   while True:
    raw=os.read(fd,1024**2)
    if not raw:break

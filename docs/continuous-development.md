@@ -4,6 +4,8 @@
 
 ## 2026-11-07 Notes 三阶段持久化验收
 
+最终当前源码计划在实际 `gradlew.bat` 的 lstat/fstat 模式差异处失败，目录 `current-source-delivery-9248741-31ad7c82` 保持空且另存失败收据。诊断证明同一文件各身份/字节字段相同，仅 Windows 路径 API 按后缀推导的执行位不同；初步身份修正又由回归发现 CRT 文本读取会转换CRLF并在Ctrl-Z截断。最终修正仅在首次跨API比较规范化Windows推导位，原同API模式/ctime/身份检查保留，读取加O_BINARY。主执行者8回归RED实际1失败2错误，整合后Windows源码控制42项中40通过/2Linux恢复边界跳过；新冻结完整Linux控制54/54、零跳过。全部1561跟踪文件与独立binary reader逐字节摘要和长度一致。新归档须使用新代，不覆盖失败输出。
+
 全新外层 `workflow-notes-actual-5de8a419`：首次保存13字节 `MingOS note A`，追加未保存编辑后正常 POWER；第二个容器初载精确 A，保存13字节 `MingOS note B` 并正常 POWER。停止后只读 fsck、文件导出、完整原始日志和SDK回放均通过。第二轮审查 SHA256 `8b71c9bbaa8347b53dc84c6f4edfc7b7089b920e3ad5f17dc455ffbff803f6bc`。
 
 离线备份收据 SHA256 `6e4b72f5595521cb0cde3dfc413e0783e87b46a054d20ae223ccfc2166731c7b`，backup manifest `542ad8ca4ad1f38d72d4525479fc413e4535b91e3afc272a00f6fae6934dbe7f`。恢复到新外层 `workflow-notes-restored-6bf321a8`、新工作/结果卷及新实例身份；第三次启动初载精确 B，未调用 save，正常 POWER。最终原始回放 `workflow-notes-sdk-restored3-73c9ed21/review-original.json` SHA256 `04e7156313fa64ad7b0b0a81668076311ea06b5ef191add522c7a3b0547b6698`，三次marker/session、应用严格资源回收、同步/卸载/kernel powerdown、精确容器exit0及磁盘字节均绑定，`threeStagePersistenceVerified=true`。原盘与备份保留。该备份仍依赖原daemon卷与lineage，不声称可迁携用户数据归档或断电恢复。

@@ -117,4 +117,65 @@ class CurrentSource(unittest.TestCase):
   a,d=self.export();out=pathlib.Path(self.tmp.name)/'symlink';out.symlink_to(self.root,target_is_directory=True)
   with a.open('rb') as stream:
    with self.assertRaises((ValueError,FileExistsError)):c.restore(stream,d.read_bytes(),c.sha(d.read_bytes()),out)
+
+class StatIdentityRegression(unittest.TestCase):
+ def setUp(self):
+  self.temp=tempfile.TemporaryDirectory();self.root=pathlib.Path(self.temp.name);self.path=self.root/'identity.txt';self.path.write_bytes(b'stable source bytes\n')
+ def tearDown(self):self.temp.cleanup()
+ def proxy(self,info,**changes):
+  keys=('st_dev','st_ino','st_mode','st_nlink','st_size','st_mtime_ns','st_ctime_ns','st_birthtime_ns')
+  return SimpleNamespace(**{**{key:getattr(info,key,None) for key in keys},**changes})
+ def test_real_batch_suffix_file_identity_and_hash(self):
+  path=self.root/'gradlew.bat';path.write_bytes(b'@echo off\r\n');result=c.file_record(self.root,path.name,{})
+  self.assertEqual(result,{'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'bytes':path.stat().st_size})
+ def test_binary_record_preserves_crlf_and_control_z(self):
+  payload=b'first\r\n\x1asecond\r\n';self.path.write_bytes(payload);result=c.file_record(self.root,self.path.name,{})
+  self.assertEqual(result,{'sha256':hashlib.sha256(payload).hexdigest(),'bytes':len(payload)})
+ def test_windows_path_synthetic_exec_bits_are_cross_api_compatible(self):
+  original=pathlib.Path.lstat
+  def lstat(path,*args,**kwargs):
+   info=original(path,*args,**kwargs)
+   return self.proxy(info,st_mode=info.st_mode|0o111) if path==self.path else info
+  with patch.object(c.sys,'platform','win32'),patch.object(pathlib.Path,'lstat',lstat):
+   result=c.file_record(self.root,self.path.name,{})
+  self.assertEqual(result['sha256'],hashlib.sha256(self.path.read_bytes()).hexdigest())
+ def test_windows_cross_api_identity_and_rw_mode_changes_rejected(self):
+  original=os.fstat
+  for field in ('st_dev','st_ino','st_nlink','st_size','st_mtime_ns','st_birthtime_ns','st_mode'):
+   calls=0
+   def fstat(fd):
+    nonlocal calls
+    calls+=1;info=original(fd);value=getattr(info,field,None)
+    changed=(value^0o200) if field=='st_mode' else ((value or 0)+1)
+    return self.proxy(info,**{field:changed}) if calls==1 else info
+   with self.subTest(field=field),patch.object(c.sys,'platform','win32'),patch.object(os,'fstat',fstat),self.assertRaisesRegex(ValueError,'source replaced before open'):
+    c.file_record(self.root,self.path.name,{})
+ def descriptor_change(self,field):
+  original=os.fstat;calls=0
+  def fstat(fd):
+   nonlocal calls
+   calls+=1;info=original(fd);changed=(info.st_mode^0o111) if field=='st_mode' else info.st_ctime_ns+1
+   return self.proxy(info,**{field:changed}) if calls==2 else info
+  with patch.object(c.sys,'platform','win32'),patch.object(os,'fstat',fstat),self.assertRaisesRegex(ValueError,'source changed while reading'):
+   c.file_record(self.root,self.path.name,{})
+ def test_windows_same_descriptor_exec_mode_change_rejected(self):self.descriptor_change('st_mode')
+ def test_windows_same_descriptor_ctime_change_rejected(self):self.descriptor_change('st_ctime_ns')
+ def test_windows_same_path_exec_mode_change_after_close_rejected(self):
+  original=pathlib.Path.lstat;calls=0
+  def lstat(path,*args,**kwargs):
+   nonlocal calls
+   info=original(path,*args,**kwargs)
+   if path==self.path:
+    calls+=1
+    if calls>=4:return self.proxy(info,st_mode=info.st_mode^0o111)
+   return info
+  with patch.object(c.sys,'platform','win32'),patch.object(pathlib.Path,'lstat',lstat),self.assertRaisesRegex(ValueError,'source changed after close'):
+   c.file_record(self.root,self.path.name,{})
+ def test_linux_cross_api_execution_mode_change_rejected(self):
+  original=os.fstat
+  def fstat(fd):
+   info=original(fd);return self.proxy(info,st_mode=info.st_mode^0o111)
+  with patch.object(c.sys,'platform','linux'),patch.object(os,'fstat',fstat),self.assertRaisesRegex(ValueError,'source replaced before open'):
+   c.file_record(self.root,self.path.name,{})
+
 if __name__=='__main__':unittest.main()
