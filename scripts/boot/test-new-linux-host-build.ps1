@@ -165,6 +165,9 @@ try {
   if (!(Test-Path -LiteralPath "$testRoot/evidence/build-started.json")) {throw 'detached build identity was not retained'}
   $result=Get-Content -LiteralPath "$testRoot/evidence/orchestration-result.json" -Raw | ConvertFrom-Json -AsHashtable
   if ($result.status -cne 'prepared' -or $result.buildStarted -ne $true -or $result.finalSystemAccepted -ne $false) {throw 'prepared result claims differ'}
+  $prepareCall=@($script:CoordinatorCalls | Where-Object {$_.name -ceq 'prepare-create'})[0].argv
+  if ($prepareCall -cnotcontains '/cold-receipts/capacity.json' -or
+      @($prepareCall | Where-Object {$_ -like 'type=bind,*target=/cold-receipts,readonly'}).Count -ne 1) {throw 'capacity receipt must use relocatable directory mount'}
   $callsBefore=$script:CoordinatorCalls.Count
   Rejected { New-LinuxHostBuild $repository "$testRoot/evidence" "$testRoot/inputs" 'packages-control' 'cargo-control' "$testRoot/backing.vhdx" } 'existing generation reuse'
   if ($script:CoordinatorCalls.Count -ne $callsBefore) {throw 'existing evidence reached Docker'}

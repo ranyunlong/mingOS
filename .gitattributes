@@ -44,3 +44,4 @@ artifacts/**/stdout.log binary
 artifacts/**/stderr.log binary
 artifacts/**/*.jsonl binary
 scripts/boot/init text eol=lf
+scripts/boot/weston.ini text eol=lf

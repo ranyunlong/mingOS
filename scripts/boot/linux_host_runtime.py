@@ -24,6 +24,9 @@ CHECKER_FILES = ('verify-persistent-update-evidence.py', 'raw_boot_audit.py', 'r
 SOURCE_EXTENSIONS = {'probes/linux-isolation-source-v2/profile.json', 'scripts/boot/README.md',
     'scripts/boot/new-linux-host-build.ps1', 'scripts/boot/snapshot_linux_host_source.py',
     'scripts/boot/test_snapshot_linux_host_source.py', 'scripts/boot/test-new-linux-host-build.ps1',
+    'scripts/boot/new-linux-host-runtime.ps1', 'scripts/boot/snapshot_linux_host_runtime.py',
+    'scripts/boot/test_snapshot_linux_host_runtime.py', 'scripts/boot/test-new-linux-host-runtime.ps1',
+    'scripts/boot/test_guest_startup_diagnostics.py',
     'scripts/boot/qualification_image_archive.py', 'scripts/boot/test_qualification_image_archive.py',
     'scripts/boot/restore-qualification-assets.ps1', 'scripts/test-restore-qualification-assets.ps1',
     'scripts/boot/test-restore-qualification-assets.ps1'}
@@ -35,7 +38,15 @@ SOURCE_NORMALIZATIONS = {
         {'sha256': '4fb1c7ff87a1d1b99cd3fbf175d347f67b2d8e86c643ef8d02430cb7ee5e0c05', 'bytes': 734}),
     '.gitattributes': (
         {'sha256': 'c4bdbfe6a1ec1421ed59531e5026a53570a54427f65bd73fbad3f6932de4fac3', 'bytes': 1023},
-        {'sha256': '1484e582bc789fa0ac31a59e275907b745269cf20e7ea47e2809c9ece379b5a2', 'bytes': 1053}),
+        {'sha256': '69bf90f5abe951734d63f2c15c27f7f8597b14bc67b49b65af7566911a7c766a', 'bytes': 1089}),
+    'scripts/boot/weston.ini': (
+        {'sha256': 'd1464b7384678e1d87569817455c59b7e0638bac8d52efbbc66fc4e3b923bdd5', 'bytes': 132},
+        {'sha256': '712ec3f4d31bab00eaf62fbc7294a0b34440ae999e294237e5127b37959c44f6', 'bytes': 122}),
+}
+REVIEWED_RUNTIME_CHANGES = {
+    'scripts/boot/guest.py': (
+        {'sha256': '1b8e5346be661d3a25a995d57136563de939f77219479c5359be03ef12c2b1fa', 'bytes': 54539},
+        {'sha256': '286e2ce11c83ca149e0f28edf073d6252e45e93274da6f1646f56bdf21f43580', 'bytes': 57257}),
 }
 
 
@@ -47,6 +58,11 @@ def source_extension(original, current):
             if name in SOURCE_NORMALIZATIONS:
                 if (original.get(name), current.get(name)) != SOURCE_NORMALIZATIONS[name]:
                     raise ValueError('unreviewed source normalization: ' + name)
+                changes[name] = {'before': original.get(name), 'after': current.get(name)}
+                continue
+            if name in REVIEWED_RUNTIME_CHANGES:
+                if (original.get(name), current.get(name)) != REVIEWED_RUNTIME_CHANGES[name]:
+                    raise ValueError('unreviewed runtime source transition: ' + name)
                 changes[name] = {'before': original.get(name), 'after': current.get(name)}
                 continue
             if not (name.startswith('docs/') or name.startswith('scripts/boot/linux_host_')

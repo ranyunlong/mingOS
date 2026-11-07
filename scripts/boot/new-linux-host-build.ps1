@@ -57,9 +57,17 @@ function Resolve-LinuxHostBuildPath([string]$Path, [ValidateSet('Directory','Fil
   return $full
 }
 
+function Assert-LinuxHostResourceOwned($Inspection, [string]$Cid, [string]$Generation, [string]$Nonce, [string]$Image) {
+  if ($Cid -cnotmatch '^[a-f0-9]{64}$' -or $Inspection.Id -cne $Cid -or $Inspection.Image -cne $Image -or
+      $Inspection.Config.Labels['org.mingos.generation'] -cne $Generation -or
+      $Inspection.Config.Labels['org.mingos.nonce'] -cne $Nonce) { throw 'owned container identity differs' }
+}
+
 function Assert-LinuxHostBuildInspection($Inspection, [string]$Cid, [string]$Generation,
-                                        [string]$Nonce, [object[]]$Mounts, [string]$User, [bool]$Initializer) {
-  Assert-LinuxHostOwned $Inspection $Cid $Generation $Nonce
+                                        [string]$Nonce, [object[]]$Mounts, [string]$User, [bool]$Initializer,
+                                        [string]$Image=$script:LinuxHostRustImage,
+                                        [hashtable]$Tmpfs=@{'/tmp'='rw,nosuid,nodev,size=512m,mode=1777'}) {
+  Assert-LinuxHostResourceOwned $Inspection $Cid $Generation $Nonce $Image
   $h = $Inspection.HostConfig
   if ($Inspection.Config.User -cne $User -or $h.NetworkMode -cne 'none' -or !$h.ReadonlyRootfs -or $h.Privileged -or
       $h.NanoCpus -ne 2000000000 -or $h.Memory -ne 4294967296 -or $h.PidsLimit -ne 256 -or
@@ -71,7 +79,10 @@ function Assert-LinuxHostBuildInspection($Inspection, [string]$Cid, [string]$Gen
   if (@($h['Binds'] | Where-Object { $null -ne $_ }).Count -or
       @($h['VolumesFrom'] | Where-Object { $null -ne $_ }).Count) { throw 'unrequested legacy mounts' }
   if ($Initializer) { if ($h['Tmpfs']) { throw 'initializer tmpfs differs' } }
-  elseif ($h['Tmpfs'].Count -ne 1 -or $h['Tmpfs']['/tmp'] -cne 'rw,nosuid,nodev,size=512m,mode=1777') { throw 'runtime tmpfs differs' }
+  else {
+    if ($h['Tmpfs'].Count -ne $Tmpfs.Count) { throw 'runtime tmpfs count differs' }
+    foreach ($name in $Tmpfs.Keys) { if ($h['Tmpfs'][$name] -cne $Tmpfs[$name]) { throw 'runtime tmpfs differs' } }
+  }
   if (@($Inspection.Mounts).Count -ne $Mounts.Count -or @($h.Mounts).Count -ne $Mounts.Count) { throw 'actual mount count differs' }
   foreach ($mount in $Mounts) {
     $sources = @($mount.source)
@@ -128,17 +139,18 @@ function Invoke-LinuxHostBuildContainer($Context, [string]$Label, [object[]]$Mou
 }
 
 function Stop-LinuxHostBuildContainers($Context, $Errors) {
+  $image = if ($Context.ContainsKey('image')) { $Context.image } else { $script:LinuxHostRustImage }
   foreach ($entry in $Context.owned) {
     try {
       if ($entry.cid -cnotmatch '^[a-f0-9]{64}$') { throw 'invalid owned cleanup container ID' }
       $owned = @(ConvertFrom-Json -AsHashtable (Invoke-LinuxHostDocker @('inspect',$entry.cid) ("cleanup-inspect-"+$entry.name) 15 $Context.docker))
       if ($owned.Count -ne 1) { throw 'one exact owned cleanup inspection required' }
-      Assert-LinuxHostOwned $owned[0] $entry.cid $Context.generation $Context.nonce
+      Assert-LinuxHostResourceOwned $owned[0] $entry.cid $Context.generation $Context.nonce $image
       if ($owned[0].State.Running) {
         [void](Invoke-LinuxHostDocker @('kill',$entry.cid) ("cleanup-kill-"+$entry.name) 15 $Context.docker)
         $after = @(ConvertFrom-Json -AsHashtable (Invoke-LinuxHostDocker @('inspect',$entry.cid) ("cleanup-after-"+$entry.name) 15 $Context.docker))
         if ($after.Count -ne 1) { throw 'one exact stopped cleanup inspection required' }
-        Assert-LinuxHostOwned $after[0] $entry.cid $Context.generation $Context.nonce
+        Assert-LinuxHostResourceOwned $after[0] $entry.cid $Context.generation $Context.nonce $image
         if ($after[0].State.Running) { throw 'owned container remains running' }
       }
     } catch { $Errors.Add($_.Exception.ToString()) }
@@ -206,7 +218,9 @@ function New-LinuxHostBuild([string]$Repository, [string]$Evidence, [string]$Inp
     if ($snap.literalEmptyTarget -ne $true -or $snap.sourceFiles -lt 1 -or $snap.linuxAvailableBytes -lt 1) { throw 'actual source snapshot admission differs' }
     $disk = Get-Item -LiteralPath $Vhd
     $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($Vhd))
-    $capacity = Join-Path $Evidence 'capacity.json'
+    $receipts = Join-Path $Evidence 'receipts'
+    [void](New-Item -ItemType Directory -Path $receipts)
+    $capacity = Join-Path $receipts 'capacity.json'
     Write-LinuxHostJson $capacity @{schemaVersion=1;observedAt=[DateTime]::UtcNow.ToString('o');backingDiskPath=$disk.FullName
       backingDiskLogicalLength=$disk.Length;hostFilesystem=$drive.DriveFormat;hostAvailableBytes=$drive.AvailableFreeSpace
       linuxAvailableBytes=$snap.linuxAvailableBytes;logicalLengthIsPhysicalAllocation=$false;finalSystemAccepted=$false}
@@ -216,13 +230,13 @@ function New-LinuxHostBuild([string]$Repository, [string]$Evidence, [string]$Inp
       @{type='volume';source=$Cargo;target='/cargo-cache';readonly=$false},
       @{type='volume';source=$Cargo;target='/cargo-cache/cargo/registry';readonly=$true;subpath='cargo/registry'},
       @{type='bind';source=$Inputs;target='/runtime';readonly=$true},
-      @{type='bind';source=$capacity;target='/capacity.json';readonly=$true})
+      @{type='bind';source=$receipts;target='/cold-receipts';readonly=$true})
     $common = @('python3','-B','/repo/scripts/boot/linux_host_freeze.py')
     [void](Invoke-LinuxHostBuildContainer $context 'storage-probe' $mounts ($common+@('--stage','storage-probe','--root','/prep')))
     [void](Invoke-LinuxHostBuildContainer $context 'storage-reopen' $mounts ($common+@('--stage','storage-reopen','--root','/prep')))
     $prepared = Invoke-LinuxHostBuildContainer $context 'prepare' $mounts ($common+@('--stage','prepare','--root','/prep','--repo','/repo',
       '--cargo-home','/cargo-cache/cargo','--packages-root','/packages','--image-receipt','/runtime/rust-image.json',
-      '--capacity-receipt','/capacity.json','--node','/runtime/node','--node-sha256',$nodeSha,'--toolchain-receipt','/runtime/toolchain-observation.json'))
+      '--capacity-receipt','/cold-receipts/capacity.json','--node','/runtime/node','--node-sha256',$nodeSha,'--toolchain-receipt','/runtime/toolchain-observation.json'))
     [void](Invoke-LinuxHostDocker @('cp',"${prepared}:/prep",(Join-Path $Evidence 'prepared')) 'prepared-export' 180 $Docker)
     if ($Build) {
       $buildMounts = $mounts + @(@{type='volume';source=$volumes.target;target='/target';readonly=$false})

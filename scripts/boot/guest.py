@@ -20,6 +20,8 @@ from worker_resources import process_table
 LOG = Path("/run/evidence")
 channel = None
 log_offsets = {}
+STARTUP_LOG_NAMES = ('weston.log', 'weston-stderr.log', 'seatd.log')
+STARTUP_LOG_MAX_BYTES = 4096
 
 class PersistentDesktopReceipts:
     """Relay bounded producer records without losing their raw stderr positions."""
@@ -495,6 +497,60 @@ def emit(kind, **fields):
     if channel:
         channel.write(line); channel.flush()
 
+def startup_diagnostic_error(error):
+    # Exception messages may be arbitrarily large or contain unrelated data.
+    return {'error': type(error).__name__[:64],
+            'errno': error.errno if type(getattr(error, 'errno', None)) is int else None}
+
+
+def startup_diagnostics():
+    """Read at most one 4KiB tail from each fixed local startup log.
+
+    No glob, EOF loop, child process, or additional transport write is involved.
+    FIFO/device/link paths cannot turn this failure path into a blocking stream.
+    """
+    result = {'maxBytesPerFile': STARTUP_LOG_MAX_BYTES,
+              'maxTotalBytes': len(STARTUP_LOG_NAMES) * STARTUP_LOG_MAX_BYTES, 'files': {}}
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        directory = os.open(LOG, flags | os.O_DIRECTORY)
+    except OSError as error:
+        result['directoryError'] = startup_diagnostic_error(error)
+        return result
+    try:
+        for name in STARTUP_LOG_NAMES:
+            descriptor = None
+            try:
+                descriptor = os.open(name, flags, dir_fd=directory)
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    result['files'][name] = {'status': 'unavailable', 'error': 'single-link-regular-required'}
+                    continue
+                offset = max(0, info.st_size - STARTUP_LOG_MAX_BYTES)
+                count = min(STARTUP_LOG_MAX_BYTES, info.st_size - offset)
+                raw = os.pread(descriptor, count, offset)
+                result['files'][name] = {'status': 'captured', 'offset': offset,
+                    'observedBytes': info.st_size, 'bytes': len(raw), 'complete': len(raw) == count,
+                    'truncated': offset > 0, 'encoding': 'base64', 'data': base64.b64encode(raw).decode('ascii')}
+            except OSError as error:
+                result['files'][name] = {'status': 'unavailable', **startup_diagnostic_error(error)}
+            finally:
+                if descriptor is not None: os.close(descriptor)
+    finally:
+        os.close(directory)
+    return result
+
+
+def emit_guest_error(error, traceback_text):
+    try:
+        diagnostics = startup_diagnostics()
+    except Exception as caught:
+        diagnostics = {'collectionError': startup_diagnostic_error(caught)}
+    # The first fatal record carries the diagnostics itself. The host may kill
+    # immediately after that record without racing later log-flush events.
+    emit('guest-error', error=error, traceback=traceback_text, startupDiagnostics=diagnostics)
+
+
 def flush_logs():
     for log in LOG.glob("*.log"):
         offset = log_offsets.get(log.name, 0)
@@ -773,7 +829,7 @@ def main():
         platform.strict_after()
     except Exception as caught:
         error = repr(caught)
-        emit("guest-error", error=error, traceback=traceback.format_exc())
+        emit_guest_error(error, traceback.format_exc())
     finally:
         for proc, label in ((desktop, "desktop"), (weston, "weston"), (seat, "seatd"), (observer, "input-observer"), (fault_injector, "fault-injector")):
             try: stop(proc, label)

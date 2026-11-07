@@ -152,3 +152,34 @@ source-v2 probe 路径；后续阶段使用 `--root /prep --repo /repo`。
 `linux_host_pair.py --root /prep --repo /repo` 仅接受已经完成 admission 的同一冻结。
 外层协调器仍须实施1950秒容器限制及既定 mount/UID/资源检查。这些入口与控制测试
 不能替代实际双启动与独立导出验收。
+
+## Windows 宿主的运行时与可迁移重放入口
+
+`new-linux-host-runtime.ps1` 使用成功冷构建的 `generation.json`、已核验的
+assets/packages 卷及 runtime inputs，依次执行下面的独立阶段。每阶段只允许一次尝试，
+失败保留容器、卷、盘和原始输出。源码快照隔离后续工作区开发；工具清单默认为
+`tools-manifest3.stdout.log`，也可通过 `-ToolsManifestName` 明确选择一个叶文件名，
+选择随状态冻结，后续不能替换。
+
+~~~powershell
+$state = 'C:\absolute\new-runtime-state.json'
+$coordinator = '.\scripts\boot\new-linux-host-runtime.ps1'
+& $coordinator -Stage new -StatePath $state `
+  -ColdStatePath C:\absolute\cold-generation\generation.json `
+  -RuntimeInputs C:\absolute\verified-runtime-inputs `
+  -AssetsVolume verified-runtime-assets
+foreach ($step in 'storage-probe','storage-reopen','prepare','fixture') {
+  & $coordinator -Stage $step -StatePath $state
+}
+~~~
+
+fixture 导出 `review-base.json` 与实际签名核验结果。独立审阅具体 payload、源码、
+输入、仪表和预算后，在完整字段一致的副本上明确设置 `reviewed=true` 和非空
+`reviewer`，再用 `-Stage bundle -ReviewPath C:\absolute\review.json`。
+协调器和 helper 不会生成批准。之后逐步运行 `admission`、`pair`、`export`、
+`verify`、`replay`；pair 每轮900秒、外层1950秒，第一轮失败不执行第二轮。
+
+export 创建独立输出卷；verify/replay 仅挂载密封导出为只读与新的结果卷，使用
+导出自身的 stdlib bootstrap 和 checker。阶段性的 `/prep` 副本不是 portable export。
+公共冷构建把容量收据放在 `receipts/` 目录，运行时协调器保留 `/cold-receipts`
+映射用于独立重放。实现与控制测试通过不表示实际双启动或完整系统已验收。

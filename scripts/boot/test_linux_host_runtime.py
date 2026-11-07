@@ -77,7 +77,9 @@ class RuntimeControls(unittest.TestCase):
 
     def test_source_extension_binds_public_coordinator_updates_and_rejects_unlisted_scripts(self):
         names = ('scripts/boot/new-linux-host-build.ps1', 'scripts/boot/snapshot_linux_host_source.py',
-                 'scripts/boot/test_snapshot_linux_host_source.py', 'scripts/boot/test-new-linux-host-build.ps1')
+                 'scripts/boot/test_snapshot_linux_host_source.py', 'scripts/boot/test-new-linux-host-build.ps1',
+                 'scripts/boot/new-linux-host-runtime.ps1', 'scripts/boot/snapshot_linux_host_runtime.py',
+                 'scripts/boot/test_snapshot_linux_host_runtime.py', 'scripts/boot/test-new-linux-host-runtime.ps1')
         current = {name: {'sha256': 'd'} for name in names}
         self.assertEqual(set(runtime.source_extension({}, current)), set(names))
         with self.assertRaisesRegex(ValueError, 'production'):
@@ -89,6 +91,16 @@ class RuntimeControls(unittest.TestCase):
                              {name: {'before': before, 'after': after}})
             for old, new in ((before, dict(after, sha256='f' * 64)), (None, after), (before, None)):
                 with self.subTest(name=name, old=old, new=new), self.assertRaisesRegex(ValueError, 'normalization'):
+                    runtime.source_extension({name: old}, {name: new})
+
+    def test_only_exact_reviewed_startup_diagnostics_source_transition_is_allowed(self):
+        repo = Path(__file__).resolve().parents[2]
+        for name, (before, after) in runtime.REVIEWED_RUNTIME_CHANGES.items():
+            self.assertEqual(q.stable_hash(repo / name), after)
+            self.assertEqual(runtime.source_extension({name: before}, {name: after}),
+                             {name: {'before': before, 'after': after}})
+            for old, new in ((before, dict(after, sha256='f' * 64)), (None, after), (before, None)):
+                with self.subTest(name=name, old=old, new=new), self.assertRaisesRegex(ValueError, 'transition'):
                     runtime.source_extension({name: old}, {name: new})
 
     def test_native_inputs_bind_exact_historical_bytes_and_step_geometry(self):
