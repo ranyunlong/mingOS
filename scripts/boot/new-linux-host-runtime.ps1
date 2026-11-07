@@ -215,7 +215,7 @@ function Invoke-LinuxHostRuntime([string]$RequestedStage,[string]$StateFile,[str
         @{type='volume';source=$state.volumes.prep;target='/prep';readonly=$false},
         @{type='volume';source=$state.volumes.work;target='/work';readonly=$false})
       $command=@('python3','-B','/checkout/scripts/boot/snapshot_linux_host_runtime.py','--action','initialize')
-      $copies=@(@('/source/runtime-source-snapshot.json','runtime-source-snapshot.json'))
+      $copies=@(@{source='/source/runtime-source-snapshot.json';destination='runtime-source-snapshot.json'})
       $cid=Invoke-LinuxHostRuntimeContainer $context 'new' $mounts $command $true
     }elseif($stageName -cin @('verify','replay')){
       Assert-LinuxHostRuntimeVolume $context $state.volumes.export "$stageName-sealed"
@@ -227,24 +227,24 @@ function Invoke-LinuxHostRuntime([string]$RequestedStage,[string]$StateFile,[str
       $mounts=@(@{type='volume';source=$state.volumes.export;target='/sealed';readonly=$true;subpath='export'},
         @{type='volume';source=$resultsVolume;target='/results';readonly=$false})
       $command=@('python3','-I','-B','/sealed/source/scripts/boot/linux_host_export.py',$stageName,'--export','/sealed','--output',"/results/$stageName-result.json")
-      $copies=@(@("/results/$stageName-result.json","$stageName-portable-result.json"))
+      $copies=@(@{source="/results/$stageName-result.json";destination="$stageName-portable-result.json"})
       $cid=Invoke-LinuxHostRuntimeContainer $context $stageName $mounts $command
     }else{
       foreach($role in @('source','prep','work')){Assert-LinuxHostRuntimeVolume $context $state.volumes[$role] "$stageName-$role"}
       $mounts=@(Get-LinuxHostRuntimeMounts $state)
       if($stageName -cin @('storage-probe','storage-reopen')){
         $command=@('python3','-B','/repo/scripts/boot/linux_host_freeze.py','--stage',$stageName,'--root','/prep')
-        $copies=@(@("/prep/$stageName.json","$stageName-storage.json"))
+        $copies=@(@{source="/prep/$stageName.json";destination="$stageName-storage.json"})
       }elseif($stageName -ceq 'prepare'){
         $command=@('python3','-B','/repo/scripts/boot/linux_host_runtime.py','--stage','prepare','--root','/prep','--repo','/repo',
           '--build-root','/coldbuild','--build-freeze','/coldbuild/freeze.json','--target','/target','--packages-root','/packages',
           '--checker-dir','/assets/checker','--input1','/assets/input-boot1.json','--input2','/assets/input-boot2.json',
           '--tools-receipt','/runtime/tools-image.stdout.log','--tools-manifest',"/runtime/$($state.toolsManifestName)",'--probe-dir','/assets/probes')
-        $copies=@(@('/prep/runtime-freeze.json','runtime-freeze.json'))
+        $copies=@(@{source='/prep/runtime-freeze.json';destination='runtime-freeze.json'})
       }elseif($stageName -ceq 'pair'){
         $mounts+=@{type='volume';source=$state.volumes.work;target='/work';readonly=$false}
         $command=@('python3','-B','/repo/scripts/boot/linux_host_pair.py','--root','/prep','--repo','/repo')
-        $copies=@(@('/prep/stages/pair/result.json','pair-stage.json'),@('/work/mingos-boot-infra-20261025/cold-pair/result.json','pair-boots.json'))
+        $copies=@(@{source='/prep/stages/pair/result.json';destination='pair-stage.json'},@{source='/work/mingos-boot-infra-20261025/cold-pair/result.json';destination='pair-boots.json'})
       }elseif($stageName -ceq 'export'){
         New-LinuxHostRuntimeVolume $context $state.volumes.export 'export-output'
         $initMounts=@(@{type='volume';source=$state.volumes.source;target='/repo';readonly=$true;subpath='repo'},
@@ -255,21 +255,21 @@ function Invoke-LinuxHostRuntime([string]$RequestedStage,[string]$StateFile,[str
         $command=@('python3','-B','/repo/scripts/boot/linux_host_export.py','create','--root','/prep','--repo','/repo','--cold-repo','/coldrepo',
           '--assets-root','/assets','--tools-root','/runtime','--export','/out/export')
         if($state.coldReceipts){$command+=@('--receipt-root','/cold-receipts=/cold-receipts')}
-        $copies=@(@('/out/export/linux-export-manifest.json','linux-export-manifest.json'))
+        $copies=@(@{source='/out/export/linux-export-manifest.json';destination='linux-export-manifest.json'})
       }elseif($stageName -ceq 'bundle' -and $Review){
         $mounts+=@{type='bind';source=$Review;target='/review-input.json';readonly=$true}
         $command=@('python3','-B','/repo/scripts/boot/snapshot_linux_host_runtime.py','--action','bundle-reviewed','--root','/prep','--repo','/repo','--review','/review-input.json')
       }else{
         $command=@('python3','-B','/repo/scripts/boot/linux_host_runtime.py','--stage',$stageName,'--root','/prep','--repo','/repo')
       }
-      if($stageName -ceq 'fixture'){$copies=@(@('/prep/build/review-base.json','review-base.json'),@('/prep/fixture-verification.json','fixture-verification.json'))}
-      if($stageName -ceq 'admission'){$copies=@(@('/prep/stages/admission/result.json','admission-stage.json'),@('/prep/stages/admission/pair-boundary-result.json','pair-boundary-result.json'))}
-      if($stageName -ceq 'bundle'){$copies=@(@('/prep/bundle/bundle.json','bundle.json'))}
+      if($stageName -ceq 'fixture'){$copies=@(@{source='/prep/build/review-base.json';destination='review-base.json'},@{source='/prep/fixture-verification.json';destination='fixture-verification.json'})}
+      if($stageName -ceq 'admission'){$copies=@(@{source='/prep/stages/admission/result.json';destination='admission-stage.json'},@{source='/prep/stages/admission/pair-boundary-result.json';destination='pair-boundary-result.json'})}
+      if($stageName -ceq 'bundle'){$copies=@(@{source='/prep/bundle/bundle.json';destination='bundle.json'})}
       $cid=Invoke-LinuxHostRuntimeContainer $context $stageName $mounts $command
     }
     $n=0
     foreach($copy in $copies){
-      [void](Invoke-LinuxHostDocker @('cp',"${cid}:$($copy[0])",(Join-Path $state.evidence $copy[1])) "$stageName-copy-$n" 180 $context.docker)
+      [void](Invoke-LinuxHostDocker @('cp',"${cid}:$($copy.source)",(Join-Path $state.evidence $copy.destination)) "$stageName-copy-$n" 180 $context.docker)
       $n++
     }
     if((Get-FileHash -LiteralPath $StateFile -Algorithm SHA256).Hash.ToLowerInvariant() -cne $digest){throw 'runtime state changed during stage'}

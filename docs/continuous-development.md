@@ -372,3 +372,7 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 2026-11-07 公开运行协调与启动配置修复：新增new-linux-host-runtime.ps1及snapshot_linux_host_runtime.py，参数化冷代state、packages/assets/runtime inputs、工具manifest；顺序执行new/probe/reopen/prepare/fixture/bundle/admission/pair/export/verify/replay，每阶段首尝试锁存。review只消费独立提供且逐字段相同的批准；pair保持1950秒外限，export使用新独占输出卷，verify/replay只读挂密封导出与独立结果卷。共享实际mount/CID/image/nonce/权限检查，cleanup保留原错误、单列清理错误并复验停止。公共cold容量收据改目录挂载，保留可迁移路径映射；主执行者PowerShell25+10全部通过，均未实际启动guest。
 
 weston.ini现仅132→122字节CRLF转LF，精确eol属性防止再次checkout污染；真实headless Weston/Pixman/kiosk解析控制通过。guest-error同一fatal记录新增固定weston/seatd三日志各最多4096字节尾部，fd/no-follow/nonblock、单次pread、常规单链接检查，读取失败不覆盖原错误/traceback；不推迟RawGuard或增加transport事件。runtime source extension只接受已审阅的配置/属性规范化与guest诊断精确before/after SHA+size，仍拒绝任意生产源码变化。主执行者Linux45项通过；初次合并控制因Docker默认noexec tmpfs导致两项无害shebang执行控制被拒绝，失败日志保留，随后仅诊断容器显式exec tmpfs后45项通过，正式runtime挂载合同未改。新runtime实际执行尚待重新冻结，旧失败代和冷构建字节保留，`finalSystemAccepted=false`。
+
+2026-11-07 公共运行入口复制参数修复：`b47108f3b8834736` 代实际初始化退出0、非OOM，但单记录嵌套数组被PowerShell展开成字符串，收据复制误构造为 `docker cp <CID>:/ <evidence>/s`。180秒复制超时后该代锁存失败，清理inspect也超时；原始错误、部分复制、source/prep/work与容器全部保留，没有probe或guest。后续独立只读inspect确认原初始化容器已停止、退出0，Docker重新响应；不重试失败代。
+
+全部11个阶段的复制记录统一改为具名source/destination对象，避免单元素与多元素形状不同。fake Docker现逐阶段核对精确三参数、完整CID和源路径、目标路径及复制次数；新增控制先在 `new-copy-0 ...:/ .../s` 真实RED，修复后21项全部通过。独立只读审查确认八个单复制阶段受同一缺陷影响，其他参数数组未发现同类阻断。日志见environment-rebuild-20261107/public-runtime-controls/root-copy-{red,green}.log；这些控制不代表实际pair或portable export通过，`finalSystemAccepted=false`。

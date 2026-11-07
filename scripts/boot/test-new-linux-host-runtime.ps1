@@ -20,6 +20,19 @@ $script:RuntimeFakeVolumes=@{}
 $script:RuntimeFailure=''
 $script:RuntimeCleanupFailure=$false
 $script:RuntimeWrongImage=$false
+$script:RuntimeExpectedCopies=@{
+  new=@{source='/source/runtime-source-snapshot.json';destination='runtime-source-snapshot.json'}
+  'storage-probe'=@{source='/prep/storage-probe.json';destination='storage-probe-storage.json'}
+  'storage-reopen'=@{source='/prep/storage-reopen.json';destination='storage-reopen-storage.json'}
+  prepare=@{source='/prep/runtime-freeze.json';destination='runtime-freeze.json'}
+  fixture=@(@{source='/prep/build/review-base.json';destination='review-base.json'},@{source='/prep/fixture-verification.json';destination='fixture-verification.json'})
+  bundle=@{source='/prep/bundle/bundle.json';destination='bundle.json'}
+  admission=@(@{source='/prep/stages/admission/result.json';destination='admission-stage.json'},@{source='/prep/stages/admission/pair-boundary-result.json';destination='pair-boundary-result.json'})
+  pair=@(@{source='/prep/stages/pair/result.json';destination='pair-stage.json'},@{source='/work/mingos-boot-infra-20261025/cold-pair/result.json';destination='pair-boots.json'})
+  export=@{source='/out/export/linux-export-manifest.json';destination='linux-export-manifest.json'}
+  verify=@{source='/results/verify-result.json';destination='verify-portable-result.json'}
+  replay=@{source='/results/replay-result.json';destination='replay-portable-result.json'}
+}
 function Invoke-LinuxHostDocker([string[]]$Arguments,[string]$Name,[int]$TimeoutSeconds=180,[string]$Executable=''){
   $script:RuntimeFakeCalls.Add(@{name=$Name;argv=$Arguments;timeout=$TimeoutSeconds})
   switch -Wildcard($Name){
@@ -64,7 +77,17 @@ function Invoke-LinuxHostDocker([string[]]$Arguments,[string]$Name,[int]$Timeout
       if($Name -ceq $script:RuntimeFailure){$script:RuntimeFakeInspections[$Arguments[2]].State.Running=$true;throw 'EXPECTED_PRIMARY_FAILURE'}
       return ''
     }
-    *-copy-* {[IO.File]::WriteAllText($Arguments[2], '{}');return ''}
+    *-copy-* {
+      $copyStage,$copyIndex=$Name -split '-copy-'
+      $expected=@($script:RuntimeExpectedCopies[$copyStage])[[int]$copyIndex]
+      $run=@($script:RuntimeFakeCalls|Where-Object {$_.name -ceq "$copyStage-run"})[-1]
+      if($Arguments.Count -ne 3 -or $Arguments[0] -cne 'cp' -or
+         $Arguments[1] -cne "$($run.argv[2]):$($expected.source)" -or
+         $Arguments[2] -cne (Join-Path $script:LinuxHostEvidence $expected.destination)){
+        throw "exact receipt copy arguments differ: $Name $($Arguments -join ' ')"
+      }
+      [IO.File]::WriteAllText($Arguments[2], '{}');return ''
+    }
     default {throw "unexpected runtime fake command: $Name"}
   }
 }
@@ -88,6 +111,11 @@ try{
   if($script:RuntimeFakeCalls.Count -ne $before){throw 'incomplete prerequisite reached Docker'}
   Invoke-LinuxHostRuntime -RequestedStage bundle -StateFile $state -Review "$testRoot/explicit-review.json"
   foreach($testStageName in @('admission','pair','export','verify','replay')){Invoke-LinuxHostRuntime $testStageName $state}
+  foreach($copyStage in $script:RuntimeExpectedCopies.Keys){
+    $copyCalls=@($script:RuntimeFakeCalls|Where-Object {$_.name -clike "$copyStage-copy-*"})
+    if($copyCalls.Count -ne @($script:RuntimeExpectedCopies[$copyStage]).Count){throw "receipt copy count differs: $copyStage"}
+    $count++
+  }
   $bundleCall=@($script:RuntimeFakeCalls|Where-Object {$_.name -ceq 'bundle-create'})[0].argv
   if($bundleCall -cnotcontains 'bundle-reviewed' -or $bundleCall -cnotcontains '/review-input.json' -or
      @($bundleCall|Where-Object {$_ -like 'type=bind,*target=/review-input.json,readonly'}).Count -ne 1){throw 'explicit root review was not passed verbatim readonly'}
