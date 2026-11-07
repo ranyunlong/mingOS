@@ -27,6 +27,7 @@ SOURCE_EXTENSIONS = {'probes/linux-isolation-source-v2/profile.json', 'scripts/b
     'scripts/boot/new-linux-host-runtime.ps1', 'scripts/boot/snapshot_linux_host_runtime.py',
     'scripts/boot/test_snapshot_linux_host_runtime.py', 'scripts/boot/test-new-linux-host-runtime.ps1',
     'scripts/boot/test_guest_startup_diagnostics.py',
+    'scripts/boot/test_infra.py',
     'scripts/boot/qualification_image_archive.py', 'scripts/boot/test_qualification_image_archive.py',
     'scripts/boot/restore-qualification-assets.ps1', 'scripts/test-restore-qualification-assets.ps1',
     'scripts/boot/test-restore-qualification-assets.ps1'}
@@ -44,6 +45,9 @@ SOURCE_NORMALIZATIONS = {
         {'sha256': '712ec3f4d31bab00eaf62fbc7294a0b34440ae999e294237e5127b37959c44f6', 'bytes': 122}),
 }
 REVIEWED_RUNTIME_CHANGES = {
+    'scripts/boot/infra.py': (
+        {'sha256': 'f617e795f12683129eb246817f4062a19f0050c28394ffb821ecfd7eacc584de', 'bytes': 26769},
+        {'sha256': '4de246e44b2a9224628669bb947c5242ff2f53d5596d8e5fcdb0e58d4f8bb62d', 'bytes': 26930}),
     'scripts/boot/guest.py': (
         {'sha256': '1b8e5346be661d3a25a995d57136563de939f77219479c5359be03ef12c2b1fa', 'bytes': 54539},
         {'sha256': '286e2ce11c83ca149e0f28edf073d6252e45e93274da6f1646f56bdf21f43580', 'bytes': 57257}),

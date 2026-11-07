@@ -732,14 +732,44 @@ class InfraTests(unittest.TestCase):
         s = self.state()
         events = input_events([{"kind": "pointer", "x": 1279, "y": 799},
                                {"kind": "key", "qcode": "esc", "down": True}], s)
-        self.assertEqual(events[0], {"type": "abs", "data": {"axis": "x", "value": 32767}})
-        self.assertEqual(events[1]["data"]["value"], 32767)
+        self.assertEqual(events[0], {"type": "abs", "data": {"axis": "x", "value": 32742}})
+        self.assertEqual(events[1]["data"]["value"], 32727)
         self.assertEqual(events[2]["data"]["key"]["data"], "esc")
         for event in ({"kind": "pointer", "x": 1280, "y": 0},
                       {"kind": "shell", "command": "anything"},
                       {"kind": "key", "qcode": "esc", "down": 1}):
             with self.subTest(event=event), self.assertRaises(ValueError):
                 input_events([event], s)
+
+    def test_pointer_pixels_roundtrip_through_observed_tablet_wayland_extent(self):
+        # Actual QEMU tablet/Weston receipts map ABS to extent/32768,
+        # then wl_fixed coordinates and the native UI round to a pixel.
+        # In particular the old endpoint mapping turned x=1148 into 1149.
+        import math
+        points = ((1148, 12), (880, 478), (676, 766), (96, 104), (1238, 12))
+        for x, y in points:
+            with self.subTest(x=x, y=y):
+                rows = input_events([{'kind': 'pointer', 'x': x, 'y': y}], self.state())
+                actual = []
+                for row, extent in zip(rows, (1280, 800)):
+                    absolute = row['data']['value']
+                    self.assertGreaterEqual(absolute, 0)
+                    self.assertLessEqual(absolute, 32767)
+                    fixed = math.floor(absolute * extent / 32768 * 256) / 256
+                    actual.append(math.floor(fixed + 0.5))
+                self.assertEqual(actual, [x, y])
+
+    def test_pointer_origin_and_last_pixel_remain_inside_continuous_extent(self):
+        import math
+        for extent in (2, 800, 1280, 4096):
+            for pixel in (0, extent // 2, extent - 1):
+                with self.subTest(extent=extent, pixel=pixel):
+                    state = {'root': {'width': extent, 'height': extent}}
+                    rows = input_events([{'kind': 'pointer', 'x': pixel, 'y': pixel}], state)
+                    for row in rows:
+                        absolute = row['data']['value']
+                        self.assertTrue(0 <= absolute <= 32767)
+                        self.assertEqual(math.floor(absolute * extent / 32768 + 0.5), pixel)
 
     def test_timeout_and_abnormal_exit_never_classify_normal(self):
         good = [{"type": "guest-result", "status": "normal", "desktopExitCode": 0,

@@ -180,7 +180,9 @@ def input_events(events, state):
             width, height = state["root"]["width"], state["root"]["height"]
             if not integer(event["x"], 0, width-1) or not integer(event["y"], 0, height-1) or width < 2 or height < 2:
                 raise ValueError("pointer outside presented root")
-            result += [{"type": "abs", "data": {"axis": axis, "value": round(value * 32767 / (extent-1))}}
+            # The tablet maps ABS/32768 into the continuous output extent.
+            # Mapping the last pixel to ABS max shifts rounded native hits.
+            result += [{"type": "abs", "data": {"axis": axis, "value": min(32767, round(value * 32768 / extent))}}
                        for axis, value, extent in (("x", event["x"], width), ("y", event["y"], height))]
         elif kind in ("key", "button"):
             field = "qcode" if kind == "key" else "button"
