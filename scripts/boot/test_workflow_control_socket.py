@@ -158,4 +158,105 @@ class SocketTests(unittest.TestCase):
         self.assertIsNone(self.controller.active)
         self.assertIsNone(self.stream.plan)
 
+    def test_noop_key_observes_new_state_without_requiring_a_frame(self):
+        client=self.send({'op':'key','qcode':'end'})
+        self.addCleanup(client.close)
+        self.controller.poll(self.stream,self.qmp)
+        self.assertTrue(self.stream.plan.waiting)
+        self.assertEqual(self.stream.plan.held,{})
+        self.controller.poll(self.stream,self.qmp)
+        self.assertIsNotNone(self.controller.active)  # Same revision is insufficient.
+        self.stream.state=copy.deepcopy(self.stream.state)
+        self.stream.state['revision']+=1
+        self.controller.poll(self.stream,self.qmp)
+        self.assertIsNone(self.controller.active,'legal no-op key waited for an unrelated frame')
+        result=self.read(client)
+        self.assertEqual(result['completionScope'],'qmp-dispatched-desktop-state-observed')
+        self.assertFalse(result['applicationEffectVerified'])
+        events=[e for name,args in self.qmp.commands if name=='input-send-event' for e in args['events']]
+        self.assertEqual([e['data']['down'] for e in events],[True,False])
+        self.assertEqual([e['data']['key']['data'] for e in events],['end','end'])
+
+    def test_noop_key_rejects_changed_boot_session_or_nonready_phase(self):
+        client=self.send({'op':'key','qcode':'a','modifiers':['ctrl']})
+        self.addCleanup(client.close)
+        self.controller.poll(self.stream,self.qmp)
+        baseline=copy.deepcopy(self.stream.state)
+        for field,value in [('bootId','other-boot'),('sessionId','other-session'),('phase','stopped')]:
+            self.stream.state=copy.deepcopy(baseline)
+            self.stream.state['revision']+=1;self.stream.state[field]=value
+            self.controller.poll(self.stream,self.qmp)
+            self.assertIsNotNone(self.controller.active)
+        self.stream.state=copy.deepcopy(baseline);self.stream.state['revision']+=1
+        self.controller.poll(self.stream,self.qmp)
+        self.assertIsNone(self.controller.active)
+        self.assertFalse(self.read(client)['applicationEffectVerified'])
+
+    def test_key_qmp_failure_cannot_emit_completion(self):
+        client=self.send({'op':'key','qcode':'end'})
+        def fail(name,args=None):
+            if name=='input-send-event':raise RuntimeError('QMP refused input')
+            return {'running':True}
+        self.qmp.execute=fail
+        try:
+            with self.assertRaisesRegex(RuntimeError,'QMP refused'):
+                self.controller.poll(self.stream,self.qmp)
+            rows=[json.loads(line) for line in (self.output/'workflow-control.jsonl').read_text().splitlines()]
+            self.assertFalse(any(row['type']=='control-completed' for row in rows))
+        finally:client.close()
+
+    def test_noop_key_waits_through_stale_revisions_and_starting_phase(self):
+        client=self.send({'op':'key','qcode':'home'})
+        self.addCleanup(client.close)
+        self.controller.poll(self.stream,self.qmp)
+        baseline=copy.deepcopy(self.stream.state)
+        for revision,phase in [(2,'ready'),(3,'ready'),(4,'starting')]:
+            self.stream.state=copy.deepcopy(baseline)
+            self.stream.state.update(revision=revision,phase=phase)
+            self.controller.poll(self.stream,self.qmp)
+            self.assertIsNotNone(self.controller.active)
+        self.stream.state=copy.deepcopy(baseline)
+        self.stream.state['revision']=5
+        self.controller.poll(self.stream,self.qmp)
+        self.assertIsNone(self.controller.active)
+        self.assertEqual(self.read(client)['completionScope'],'qmp-dispatched-desktop-state-observed')
+
+    def test_ctrl_noop_releases_modifier_in_exact_order_before_completion(self):
+        client=self.send({'op':'key','qcode':'a','modifiers':['ctrl']})
+        self.addCleanup(client.close)
+        self.controller.poll(self.stream,self.qmp)
+        events=[e for name,args in self.qmp.commands if name=='input-send-event' for e in args['events']]
+        self.assertEqual([(e['data']['key']['data'],e['data']['down']) for e in events],
+                         [('ctrl',True),('a',True),('a',False),('ctrl',False)])
+        self.assertEqual(self.stream.plan.held,{})
+        self.stream.state=copy.deepcopy(self.stream.state)
+        self.stream.state['revision']+=1
+        self.controller.poll(self.stream,self.qmp)
+        self.assertIsNone(self.controller.active)
+        self.assertFalse(self.read(client)['applicationEffectVerified'])
+
+    def test_modifier_release_qmp_failure_is_not_a_completed_key(self):
+        client=self.send({'op':'key','qcode':'a','modifiers':['ctrl']})
+        self.addCleanup(client.close)
+        original=self.qmp.execute
+        def refuse_release(name,args=None):
+            if name=='input-send-event' and any(e['data']['key']['data']=='ctrl' and not e['data']['down'] for e in args['events']):
+                raise RuntimeError('modifier release refused')
+            return original(name,args)
+        self.qmp.execute=refuse_release
+        try:
+            with self.assertRaisesRegex(RuntimeError,'modifier release refused'):
+                self.controller.poll(self.stream,self.qmp)
+            self.assertFalse(self.stream.plan.waiting)
+            self.assertFalse(self.stream.plan.complete)
+            self.assertTrue(self.stream.plan.held)
+            rows=[json.loads(line) for line in (self.output/'workflow-control.jsonl').read_text().splitlines()]
+            self.assertFalse(any(row['type']=='control-completed' for row in rows))
+        finally:
+            self.qmp.execute=original
+        # Releasing the held modifier during shutdown is cleanup, not success.
+        self.stream.plan.release(self.qmp)
+        self.assertEqual(self.stream.plan.held,{})
+        self.assertFalse(self.stream.plan.complete)
+
 if __name__=='__main__': unittest.main()

@@ -75,6 +75,8 @@ Notes 必须点击 **保存**。编辑、关应用和重启不会自动保存。
 
 输入绑定当前 session、布局和 epoch。只有未发送输入的过期布局拒绝允许内部有限刷新；外层不会自动重发已接受或超时的输入。收到执行失败时保留现场，不重复输入来猜测结果。
 
+单独 `key` 允许合法的无画面变化操作，例如光标已在末尾时按 End。其完成回执的 `completionScope=qmp-dispatched-desktop-state-observed` 与 `applicationEffectVerified=false` 仅表示 QMP 按键事务派发成功、按键已释放，并观察到同 boot/session 的更新 ready 状态；该状态可能在派发前生成，不是应用处理确认。保存内容仍需应用回读及停止后文件核对，正常 POWER 仍需完整退出证据。
+
 ### 正常关机、重开和离线备份
 
 保存后，按本次截图识别桌面 POWER 按钮坐标。`power` 是正常 UI 点击，不是直接 kill 或 ACPI 捷径：

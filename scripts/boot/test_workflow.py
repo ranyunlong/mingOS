@@ -134,4 +134,38 @@ class WorkflowTests(unittest.TestCase):
                  contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):vm.main()
 
+    def test_key_noop_scope_does_not_relax_click_type_or_power_expectations(self):
+        m=self.control()
+        self.assertEqual(m.command_steps({'op':'key','qcode':'end'})[0]['expect'],{'phase':'ready'})
+        self.assertEqual(m.command_steps({'op':'click','x':150,'y':170})[0]['expect'],{'rootAdvance':True})
+        self.assertEqual(m.command_steps({'op':'type','text':'A'})[0]['expect'],{'sourceAdvance':[1],'rootAdvance':True})
+        self.assertEqual(m.command_steps({'op':'power','x':1238,'y':12})[0]['expect'],{'phase':'stopped'})
+
+    def test_click_type_and_power_still_reject_insufficient_post_dispatch_evidence(self):
+        from infra import InputPlan
+        import test_workflow_control_socket as sockets
+        m=self.control()
+        cases=[({'op':'click','x':150,'y':170},False,False),
+               ({'op':'type','text':'A'},True,False),
+               ({'op':'type','text':'A'},False,True),
+               ({'op':'power','x':1238,'y':12},True,True)]
+        with tempfile.TemporaryDirectory() as temporary:
+            for index,(command,root_advance,source_advance) in enumerate(cases):
+                with self.subTest(command=command,root=root_advance,source=source_advance):
+                    # Real InputPlan; the transport is an explicit no-guest double.
+                    plan=InputPlan({'schemaVersion':1,'requireApps':[1],'steps':m.command_steps(command)},
+                                   Path(temporary)/str(index),10,split_transactions=True)
+                    base=sockets.Stream().state;qmp=sockets.Qmp()
+                    plan.advance(base,qmp)
+                    after=copy.deepcopy(base);after['revision']+=1
+                    if root_advance:after['root']['presentedSequence']+=1
+                    if source_advance:
+                        after['apps'][0]['sourceSequence']+=1
+                        after['apps'][0]['presentedSourceSequence']+=1
+                    plan.advance(after,qmp)
+                    self.assertFalse(plan.complete)
+                    self.assertTrue(plan.waiting)
+                    plan.deadline=0
+                    with self.assertRaisesRegex(TimeoutError,'expectation deadline'):plan.check_deadline()
+
 if __name__ == '__main__': unittest.main()

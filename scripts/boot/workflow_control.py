@@ -61,7 +61,9 @@ def command_steps(command):
             or command['qcode'] not in KEYS or type(modifiers) is not list or len(modifiers)>2
             or any(m not in ('ctrl','shift','alt') for m in modifiers) or len(set(modifiers))!=len(modifiers)):
             raise ValueError('supported qcode and unique ctrl/shift/alt modifiers required')
-        return [{'name':'key','events':key_events(command['qcode'],modifiers),'expect':{'rootAdvance':True}}]
+        # Navigation/shortcuts can be legal no-ops. Observe a newer ready state
+        # after successful QMP dispatch; this is not an application effect ack.
+        return [{'name':'key','events':key_events(command['qcode'],modifiers),'expect':{'phase':'ready'}}]
     if op=='type':
         value=command.get('text')
         if set(command)!={'op','text'} or type(value) is not str or not 1<=len(value)<=512 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \n' for c in value):
@@ -195,6 +197,9 @@ class Controller:
         active=self.active
         record={'type':'control-completed','sequence':active['sequence'],'instance':self.instance,
             'command':active['command'],'state':stream.state,'capture':capture}
+        if active['command']['op']=='key':
+            if active['plan'].held: raise ValueError('key completion has held input')
+            record.update(completionScope='qmp-dispatched-desktop-state-observed',applicationEffectVerified=False)
         append_record(self.log,record); self.reply(active['client'],record)
         self.active=None; stream.plan=None
 
