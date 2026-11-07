@@ -6,7 +6,8 @@ param(
   [switch]$ValidateOnly,
   [switch]$LoadImages,
   [switch]$RestoreVolume,
-  [string]$VolumeHelperImage = 'debian:trixie-slim'
+  [string]$VolumeHelperImage = 'debian:trixie-slim',
+  [string]$PythonExecutable = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,8 +23,11 @@ function Fail([string]$Message) {
   throw ('QUALIFICATION_ASSET_RESTORE_BLOCKED: ' + $Message)
 }
 
-if ($LoadImages -or $RestoreVolume) {
-  Fail 'mutating restore is disabled pending safe archive provenance and ownership verification'
+if ($RestoreVolume) {
+  Fail 'mutating restore is disabled for volumes pending safe ownership verification'
+}
+if ($ValidateOnly -and $LoadImages) {
+  Fail 'cannot combine ValidateOnly and LoadImages'
 }
 
 function Assert-Hash([string]$Value, [string]$Name) {
@@ -124,6 +128,27 @@ if ($null -ne $record.volume) {
   if (!(Test-Path -LiteralPath $volumeArchive -PathType Leaf)) { Fail 'volume archive is missing' }
   $actual = (Get-FileHash -LiteralPath $volumeArchive -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($actual -ne $record.volume.archiveSha256) { Fail 'volume archive SHA-256 mismatch' }
+}
+
+if ($LoadImages) {
+  $helper = Join-Path $PSScriptRoot 'qualification_image_archive.py'
+  if (!(Test-Path -LiteralPath $helper -PathType Leaf)) { Fail 'image archive verification helper is missing' }
+  if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
+    $bundledPython = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+    if (Test-Path -LiteralPath $bundledPython -PathType Leaf) {
+      $PythonExecutable = $bundledPython
+    } else {
+      $pythonCommand = Get-Command python3.exe, python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($null -eq $pythonCommand) { Fail 'Python 3 is required; provide PythonExecutable' }
+      $PythonExecutable = $pythonCommand.Source
+    }
+  }
+  if (![IO.Path]::IsPathRooted($PythonExecutable) -or !(Test-Path -LiteralPath $PythonExecutable -PathType Leaf)) {
+    Fail 'PythonExecutable must name an existing absolute Python 3 executable'
+  }
+  & $PythonExecutable -B $helper --asset-root $root --manifest $manifest
+  if ($LASTEXITCODE -ne 0) { Fail ('verified image load failed; preserved prior operations; exit ' + $LASTEXITCODE) }
+  return
 }
 
 $result = [ordered]@{

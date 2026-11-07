@@ -16,7 +16,15 @@
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/boot/restore-qualification-assets.ps1 -AssetRoot C:\path\to\qualification-assets -Manifest C:\path\to\qualification-assets\manifest.json -ValidateOnly
 ~~~
 
-`-LoadImages` 和 `-RestoreVolume` 当前在读取资产和调用 Docker 前明确拒绝；`-VolumeHelperImage` 仅为保留的兼容参数。原实现未证明加载归档与目标镜像的绑定，volume 检查与创建之间也存在覆盖竞态，因此暂时移除了写入路径。安全恢复功能仍待实现，不能以只读校验成功代替恢复完成。
+`-LoadImages` 是显式镜像加载入口，不能与 `-ValidateOnly` 同用。它通过 Python 3 helper 先验证全部三个 Docker save 归档：每档唯一镜像、config 原始字节 SHA-256 等于历史固定 image ID、config 的每个 `rootfs.diff_ids` 等于对应 layer 解压后的 SHA-256。支持 legacy `layer.tar`、blob 路径和 gzip layer；含 OCI index 的归档只接受能绑定相同 config/layers 的单一引用链。多镜像、多平台、外部引用、重复成员/JSON key、路径穿越、link/device 和额外 payload 均拒绝。OCI-only 导出不在支持范围。
+
+全部归档通过后，helper 在私有临时文件中生成只含已验证 config/layers 和空 `RepoTags` 的 tar，通过 stdin 顺序执行 `docker image load --quiet`，每次随后 `docker image inspect` 核对固定 ID。源标签及其他引用不会传给 Docker；工具不提供删除、覆盖 volume 或替换固定摘要的功能。失败立即停止并输出已发生操作和首个失败，保留已加载镜像。成功状态为 `image-load-verified`，`formalQualification=false`、`finalSystemAccepted=false`。
+
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/boot/restore-qualification-assets.ps1 -AssetRoot C:\path\to\qualification-assets -LoadImages -PythonExecutable C:\path\to\python.exe
+~~~
+
+可省略 `-PythonExecutable`，入口优先使用 Codex bundled Python，再查找 PATH 中的 Python 3。`-RestoreVolume` 继续在读取资产和调用 Docker 前明确拒绝，`-VolumeHelperImage` 仅为保留的兼容参数。镜像加载不能补足历史宿主缓存或构成正式资格验收。
 
 ### 历史 Task9 的实际依赖
 

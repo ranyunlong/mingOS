@@ -1,4 +1,8 @@
+param([string]$PythonExecutable = '')
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
+  $PythonExecutable = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+}
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $script = Join-Path $repo 'scripts\boot\restore-qualification-assets.ps1'
 
@@ -74,7 +78,7 @@ $wrongImageId.images = @($valid.images | ForEach-Object { $_.Clone() })
 $wrongImageId.images[0].imageId = ('sha256:' + ('f' * 64))
 Invoke-Validation $wrongImageId 1
 
-function Invoke-DisabledAction([string]$Action) {
+function Invoke-RejectedAction([string]$Action, [switch]$ConflictingMode) {
   $root = Join-Path ([IO.Path]::GetTempPath()) ('mingos-restore-disabled-' + [guid]::NewGuid().ToString('N'))
   $bin = Join-Path $root 'bin'
   $marker = Join-Path $root 'docker-called.txt'
@@ -122,13 +126,19 @@ public static class Program {
     $env:PATH = $bin
     $env:MINGOS_TEST_DOCKER_MARKER = $marker
     $powershell = Join-Path $PSHOME 'powershell.exe'
-    $process = Start-Process $powershell -ArgumentList @(
+    $childArguments = @(
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script,
       '-AssetRoot', $root, '-Manifest', $manifestPath, ('-' + $Action)
-    ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    )
+    if ($Action -eq 'LoadImages') {
+      $childArguments += @('-PythonExecutable', $PythonExecutable)
+      if ($ConflictingMode) { $childArguments += '-ValidateOnly' }
+    }
+    $process = Start-Process $powershell -ArgumentList $childArguments -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     $output = [IO.File]::ReadAllText($stdoutPath) + [IO.File]::ReadAllText($stderrPath)
-    if ($process.ExitCode -eq 0 -or $output -notmatch 'mutating restore is disabled') {
-      throw "$Action did not report the disabled write boundary: $output"
+    $expectedFailure = if ($Action -eq 'RestoreVolume') { 'mutating restore is disabled' } elseif ($ConflictingMode) { 'cannot combine' } else { 'invalid Docker save archive' }
+    if ($process.ExitCode -eq 0 -or $output -notmatch $expectedFailure) {
+      throw "$Action did not report the expected admission boundary: $output"
     }
     if (Test-Path -LiteralPath $marker) { throw "$Action invoked docker before refusal" }
   } finally {
@@ -138,8 +148,9 @@ public static class Program {
   }
 }
 
-Invoke-DisabledAction 'RestoreVolume'
-Invoke-DisabledAction 'LoadImages'
+Invoke-RejectedAction 'RestoreVolume'
+Invoke-RejectedAction 'LoadImages'
+Invoke-RejectedAction 'LoadImages' -ConflictingMode
 
 $outsideRoot = Join-Path ([IO.Path]::GetTempPath()) ('mingos-restore-outside-' + [guid]::NewGuid().ToString('N'))
 $outsideManifest = Join-Path ([IO.Path]::GetTempPath()) ('mingos-restore-manifest-' + [guid]::NewGuid().ToString('N') + '.json')
