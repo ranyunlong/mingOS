@@ -44,6 +44,27 @@ python3 -I -B /repo/scripts/boot/source_archive.py restore \
 
 恢复后应在另一容器只读挂载消费者卷，重新核对全部文件、目录、模式和 owner，再运行构建。Windows 宿主副本另核全部字节/目录；它不保留 Linux 模式。公开 Kotlin 入口当前只接受宿主 `--repo`，使用较短的新路径可避免 Windows MAX_PATH。不要修复或覆盖原始长路径副本。
 
+## 当前完整源码与独立交接清单
+
+`current_source.py` 用当前 Git index 选择完整源码，记录实际工作树字节和精确 HEAD；它不会把新源码伪装成旧冷构建 freeze。所有未跟踪公开文件须逐项 `--extra`，已跟踪修改会按当前字节收入。归档包含完整文件、目录、Git 可执行模式与许可文件清单。Windows 模式按 Git index 规范化，不声称保留 NTFS 权限。
+
+```sh
+python -B scripts/boot/current_source.py plan --repo . --commit <完整HEAD> \
+  --output <全新目录>/source-inventory.json
+python -B scripts/boot/current_source.py export --repo . \
+  --manifest <目录>/source-inventory.json --manifest-sha256 <独立固定摘要> \
+  --archive <目录>/source.tar --descriptor <目录>/source-descriptor.json
+python -B scripts/boot/current_source.py verify \
+  --archive <目录>/source.tar --descriptor <目录>/source-descriptor.json \
+  --descriptor-sha256 <包外固定摘要>
+```
+
+独立复制 `current_source.py` 与 `strict_ustar.py` 后，可在原仓库之外校验。Linux 下将最后一个命令的 `verify` 换为 `restore` 并增加 `--destination <不存在的绝对目录>`，即可用独占创建和目录描述符恢复；失败的部分输出保持。归档按短别名保存长路径，拒绝链接、特殊文件、路径穿越、重复成员和额外元数据。
+
+`handoff_manifest.py` 在 Linux 核对八个独立组件：`runtime-pack`、`current-source`、缓存、镜像、更新证据、卸载证据、许可和收据。`make` 要求包外 runtime manifest 和 source descriptor 摘要，`verify` 要求包外 handoff 摘要，并拒绝整个交付目录中的额外文件。文件模式严格绑定，目录允许 0700 或 0755。源码、缓存和镜像保持各自来源；运行包中的旧解释源码是历史记录，实际工作流仅执行 `workflow_outer.py --source` 冻结的新可信源码。该清单只证明字节完整性与模式策略，实际构建、应用保存及恢复证据单独保留。
+
+公开工具在独立冻结的固定 Tools 容器内通过 46 项 Linux 控制，零跳过；这些是夹具控制，实际最终归档和交付包另行记录。
+
 ## 2026-11-07 实际证据
 
 - 缓存导出 `developer-cache-actual-export-290da81f`：descriptor `5ee32079347e5bc107bc3196ed22ac8bd33d224f55c465e316a225fa5790be9d`；归档 936744960 字节，SHA256 `77b59c4e3a4aa96485fabf2c009ba7e7e6e05aadfd37d8f68cb22c863c5d84c6`。
