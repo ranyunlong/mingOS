@@ -169,6 +169,8 @@ def runtime_snapshot(*, repo, build_root, build_freeze, target, packages_root, c
     profile = load_profile('source-v2')
     probes = verify_review_and_files('source-v2', {'strictProbeProfile': 'source-v2',
         'strictProbeSha256': profile['artifactSha256']}, probe_dir)
+    from linux_host_probe import verify_probe_build
+    probe_build = verify_probe_build(probe_dir, repo, cold['freezeSha256'])
     first, second = (q.read_json(Path('/prep') / name) for name in ('storage-probe.json', 'storage-reopen.json'))
     freezer.validate_reopen(first, second)
     return {'schemaVersion': 1, 'profile': 'persistent-update-linux-runtime', 'paths': paths,
@@ -176,7 +178,7 @@ def runtime_snapshot(*, repo, build_root, build_freeze, target, packages_root, c
             'checker': {name: q.stable_hash(checker_dir / name) for name in CHECKER_FILES},
             'inputs': native_inputs(input1, input2), 'tools': tools,
             'toolReceipts': {str(path): q.stable_hash(path) for path in map(Path, (tools_receipt, tools_manifest))},
-            'probes': {'contract': probes, 'files': q.tree_inventory(probe_dir)},
+            'probes': {'contract': probes, 'files': q.tree_inventory(probe_dir), 'build': probe_build},
             'storage': {'probe': first, 'reopen': second},
             'formalQualification': False, 'finalSystemAccepted': False}
 

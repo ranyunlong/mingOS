@@ -45,7 +45,7 @@ Windows 来源准备已真实编译 read-file 和 image-viewer，`npm run test:k
 
 构建准入要求原始固定镜像检查、可重放六包、完整源码/registry hash、真实存储收据和 Windows Docker backing VHDX/双层剩余容量，额外预算32.5GiB。Cargo registry 必须只读，Cargo 自身锁与全局索引可写。Rust target 必须是新卷中的字面空目录；前五条与后五条显式测试分别使用固定环境和1800/900秒上限。失败保留并拒绝同代重试。完整源码副本使后续开发不修改正在构建的输入。
 
-上述 `prepare/build` 由独立 Python 入口提供；Windows 公共 wrapper 当前只集成 source-check，其余阶段仍拒绝。这里记录的是来源及执行器控制阶段，不是 Task9、runtime bundle 或 guest 资格，`finalSystemAccepted=false`。
+公共 `new-linux-host-build.ps1` 已提供参数化冷构建协调与源码快照，包含source/storage/freeze/prepare/build入口；旧 linux-host-qualification.ps1 wrapper 仍仅source-check。真实fd90代由保留的协调脚本完成十步冷构建，独立核对通过：all-targets773/0/24、三个controller与public integration各1/0/0/0、recovery18/0/1/0。独立source-v2探针和真实几何来源已完成；公共完整runtime/pair/export协调仍待集成，未启动guest，`finalSystemAccepted=false`。
 
 ## 接续工作
 

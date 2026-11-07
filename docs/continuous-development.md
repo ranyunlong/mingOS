@@ -354,3 +354,9 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 2026-11-07 公开冷构建协调与 Linux init 可移植性：新增参数化 new-linux-host-build.ps1 与快照 helper，真实 image/Node 固定值、请求和有效 mount、nonce/CID/权限、卷空目录、存储 probe/reopen、六包重放和异步 build 均有分步证据；不依赖开发者硬编码工作区。主执行者独立25项 PowerShell 与4项 Linux 快照控制通过。root 仅 CHOWN 的真实隔离初始化先在活动工作树稳定性检查处拒绝，证据保留；随后以不可变冷源码副本完成真实快照及 UID65534/0700 转交，退出0、非OOM。转交通过预先打开的 fd 执行 chmod/chown/fsync，避免转交后 root 无权重开目录。
 
 独立运行时审阅发现实际冷源码 scripts/boot/init 含 CRLF，Linux kernel 会将 shebang 解释成不存在的 /bin/sh\r。现只将该文件 CRLF 转为 LF（751→734字节），补精确 eol 属性和安全复现；主执行者5项 init 与21项 runtime 控制全部通过。runtime source extension 对 init 与 .gitattributes 仅接受已审阅的两组精确 before/after hash+size，不接受任意启动脚本改动，旧冷源码及冻结字节保留。新冷构建 fd90bae03bd34a57 已完成实际存储与六包冻结并在运行；正式 Task9、runtime admission 和 guest 仍未验收，finalSystemAccepted=false。
+
+2026-11-07 Linux 新代完整冷构建及几何来源通过：`persistent-update-20261107-linux-fd90bae03bd34a57` 于 UTC06:27:28至06:48:17完成全部十条固定命令，退出0、非OOM。all-targets为773 passed、0 failed、24 ignored、58组；两种feature check、Host/helper release build通过，三个controller与public integration各1/0/0/0，串行recovery为18/0/1/0。固定1800/900秒、禁网、UID65534、2CPU/4GiB及只读源码/registry均未放宽；完整prep、final inspect、源码/包/阶段产品hash独立核验通过，见cold-independent-verification。当前成功代没有续用旧失败target。
+
+独立导出核对先拒绝Host前半段与最终摘要不同；实际后续Cargo重新生成Host，两个时点的原始seal均正确且helper不变。导出器现分别绑定pre-explicit清单与pre seal、最终清单/实际target与final seal；真实RED后26项控制通过，包含合法重新生成和四种重封装阶段错配拒绝。独立source-v2探针以新空target、固定Rust镜像真实禁网构建成功，二进制970680字节、SHA256=`32a0f022b96cff657c066bd1da40b91ff72d1c957503593a4e731ddccc0f326b`；共享校验绑定精确命令、1800秒、四源码、冷freeze、完整原始日志及两产物，并接入runtime/export。公开可迁移export基础校验清单、封闭导入、十步构建、包、工具、几何、实际payload及原checker强raw证据；合成重放不是实际guest导出。
+
+真实Cargo lib ELF的几何测试1/0/0/0通过，原driver.validate_geometry通过，三份证据已逐字节投影到assets/checker。早期诊断分别因导出器跨时点误断言、历史driver挂载层级过浅而失败，原始失败保留；最终新几何诊断成功，冷冻结和target未改写。主执行者实际冷构建独立核验、最终34项probe/export控制及21项runtime控制证据位于environment-rebuild-20261107；尚未启动guest或创建资格数据盘，实际runtime freeze/admission、pair、portable export仍待执行，`finalSystemAccepted=false`。

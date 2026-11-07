@@ -10,7 +10,7 @@
   "cargoLockSha256": "6d1f84d985b65f09c9bc536b89708d2f40580c8d4e93911ca9fa938f2fac235f",
   "rustToolchainSha256": "d13306be0ecda81ce779baa290ffb417380d525928477f16200884b5169cca33",
   "artifacts": {
-    "mingos-isolation-probe": "f70072ef5f115d2ceb5523accdb7e478d152d548f99415fe7ad7e77c0a133bd7",
+    "mingos-isolation-probe": "32a0f022b96cff657c066bd1da40b91ff72d1c957503593a4e731ddccc0f326b",
     "vm-prepare.sh": "7b7140efb3b9c073dd38db9382ccbcf3794626603e5f5afb2b6475eae9d769fe"
   }
 }
