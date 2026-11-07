@@ -1,0 +1,30 @@
+// The source mount remains read-only, including included Compose/coroutines builds.
+import java.security.MessageDigest
+
+def work = System.getenv('MINGOS_KOTLIN_WORK')
+if (!work) throw new GradleException('MINGOS_KOTLIN_WORK is required')
+def identity = { File directory ->
+    MessageDigest.getInstance('SHA-256').digest(directory.canonicalPath.getBytes('UTF-8')).encodeHex().toString()
+}
+gradle.beforeSettings { settings ->
+    settings.gradle.startParameter.projectCacheDir = new File(work, 'project-cache/' + identity(settings.settingsDir))
+}
+gradle.beforeProject { project ->
+    // Included builds have their own Gradle StartParameter/project properties.
+    // Set this before KGP is applied so its sessions never fall back to .kotlin.
+    project.extensions.extraProperties.set('kotlin.project.persistent.dir', new File(work, 'kotlin-persistent/' + identity(project.rootDir)).absolutePath)
+    project.extensions.extraProperties.set('kotlin.incremental', 'false')
+    def directory = new File(work, 'builds/' + identity(project.rootDir) + '/' + (project.path == ':' ? 'root' : project.path.substring(1).replace(':', '/')))
+    project.layout.buildDirectory.set(directory)
+    // persistent-update-demo explicitly assigns build/<fixture> in its script.
+    project.afterEvaluate { project.layout.buildDirectory.set(directory) }
+    project.plugins.whenPluginAdded { plugin ->
+        if (plugin.class.simpleName == 'NodeJsRootPlugin') {
+            def node = project.extensions.findByName('kotlinNodeJs')
+            if (node != null) {
+                node.download = false
+                node.nodeCommand = System.getenv('MINGOS_KOTLIN_NODE')
+            }
+        }
+    }
+}

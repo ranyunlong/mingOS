@@ -26,6 +26,27 @@
 
 Windows 来源准备已真实编译 read-file 和 image-viewer，`npm run test:kotlin` 为3通过、0失败。更新 old 首次离线编译因缺 `atomicfu:0.27.0` 失败，随后独立联网 Gradle 编译成功；失败输出另存 `kotlin-update-old-offline-failed/`，联网编译不能当作禁网来源资格，也没有替代正式打包收据。这些日志均在上述环境证据根目录，后续仍须执行 Linux 禁网强制重编。
 
+## Linux Kotlin 来源和执行器控制
+
+六个包已在固定 Kotlin 镜像中顺序完成真实禁网强制重编译：read-file、image-viewer、text-entry-demo、persistent-update-demo 的 old/new/absent-write。使用 UID/GID65534、只读源码与 root、外部工作目录及 Gradle cache；命令包含 `--offline --rerun-tasks --no-build-cache --no-configuration-cache`。每包保存 compiler.wasm、main.wasm、app.json、build-info/build-receipt 和完整日志、输入与依赖清单。独立容器只读重放六包通过，导出108个文件的 SHA 与大小由主执行者再次核对；runner 控制14/14通过。
+
+| 包 | main.wasm SHA-256 |
+| --- | --- |
+| read-file | `7bdc9facab6cb8cf9e593f0653733c8a02f9452b41d15572a384fbbc2d22c25e` |
+| image-viewer | `2eb888508c0fb4ac0a27df4bdbe8dfff1b402c46c1318dff56b6297c5988de21` |
+| text-entry-demo | `a38bf6b3cc2b10738fb508bb0524b44b7a5307e62159ab5e969ed0b4bdd64e3f` |
+| old | `2e523c6b5dfb9650e397af798eb34b8ef9d017bae7bd59f614c746f81a7b7e8a` |
+| new | `f3c543c80da2bed51d9e150485f23b8dd3c0bcb1bac035567a4175853728e61a` |
+| absent-write | `a1cac4c9b3e3a3e96acc94433b9245794d39bcbf3c7b0bc6d4478b03211a02ee` |
+
+证据代为 `artifacts/environment-rebuild-20261107/kotlin-linux-rebuild-8a4e2c49b74549c78c46654e205845e6/`。初始所有权设置失败、此前只读 Gradle 目录失败均保留；成功代没有将失败任务重记为成功。离线依赖准备的完整清单包含2426文件、673546220字节，SHA为 `b53a460468a58aaf56151994b6ef51f7ccc919d79d25588cf3a1dd059d599ed3`。后续每次强制重编重新封存完整清单，下载实体保持不变，派生 cache 的变化另行记录。
+
+新增 Linux 存储、源码、命令回收、冻结与冷构建控制模块。最终固定 Rust 镜像中的综合控制63/63通过；Windows wrapper35项控制通过，真实 `source-check` 代 `persistent-update-20261107-linux-250620c042ae4f97` 返回0。实际观测为 UID/GID65534、仅 lo、capability为0、no-new-privileges/seccomp开启、2CPU/4GiB/pids256、源码/root只读。存储使用独立0700目录、0600 marker/lease、真实子进程锁竞争、fsync/rename/delete及跨容器重新打开；这些结果不证明恶意宿主无法写入。
+
+构建准入要求原始固定镜像检查、可重放六包、完整源码/registry hash、真实存储收据和 Windows Docker backing VHDX/双层剩余容量，额外预算32.5GiB。Cargo registry 必须只读，Cargo 自身锁与全局索引可写。Rust target 必须是新卷中的字面空目录；前五条与后五条显式测试分别使用固定环境和1800/900秒上限。失败保留并拒绝同代重试。完整源码副本使后续开发不修改正在构建的输入。
+
+上述 `prepare/build` 由独立 Python 入口提供；Windows 公共 wrapper 当前只集成 source-check，其余阶段仍拒绝。这里记录的是来源及执行器控制阶段，不是 Task9、runtime bundle 或 guest 资格，`finalSystemAccepted=false`。
+
 ## 接续工作
 
 按照[新宿主资格设计](superpowers/specs/2026-11-07-linux-host-qualification-design.md)与[实施计划](superpowers/plans/2026-11-07-linux-host-qualification.md)，准备独立 Cargo cache、真实 Kotlin 与 bootstrap 来源、boot tools 和 POSIX 存储准入，再冻结新执行器与完整输入。来源准备允许联网，正式构建与运行禁网。任何仍在执行的下载、构建或仅有启动日志的任务均不计作通过。

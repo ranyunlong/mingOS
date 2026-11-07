@@ -1,0 +1,65 @@
+"""Freeze controls use synthetic inputs, never compiler or guest evidence."""
+from pathlib import Path
+import tempfile
+import unittest
+
+import linux_host_freeze as freeze
+
+
+class FreezeControls(unittest.TestCase):
+    def test_failed_prepare_attempt_cannot_be_retried(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = (root, root, root, root, root / 'image.json', root / 'capacity.json', root / 'node', '0' * 64)
+            with self.assertRaises(ValueError):
+                freeze.prepare(*args)
+            self.assertEqual(freeze.q.read_json(root / 'prepare-result.json')['status'], 'failed')
+            with self.assertRaises(FileExistsError):
+                freeze.prepare(*args)
+
+    def test_capacity_budget_covers_reserve_and_both_storage_layers(self):
+        budget = freeze.capacity_budget()
+        self.assertEqual(budget['reserveBytes'], 2 * 1024 ** 3)
+        required = sum(budget.values())
+        observation = {'hostAvailableBytes': required, 'linuxAvailableBytes': required,
+                       'backingDiskPath': 'C:\\Docker\\docker_data.vhdx', 'hostFilesystem': 'NTFS'}
+        freeze.validate_capacity(observation)
+        for key in ('hostAvailableBytes', 'linuxAvailableBytes'):
+            changed = dict(observation, **{key: required - 1})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                freeze.validate_capacity(changed)
+        with self.assertRaises(ValueError):
+            freeze.validate_capacity(dict(observation, backingDiskPath='unknown'))
+
+    def test_image_receipt_requires_one_exact_image(self):
+        image = {'Id': freeze.RUST_IMAGE, 'RootFS': {'Layers': ['sha256:' + 'a' * 64]}}
+        freeze.validate_image_receipt([image], freeze.RUST_IMAGE)
+        for value in ([], [image, image], [{'Id': 'sha256:' + '0' * 64}], [{}]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                freeze.validate_image_receipt(value, freeze.RUST_IMAGE)
+
+    def test_package_path_is_relative_canonical_and_within_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'old').mkdir()
+            self.assertEqual(freeze.package_path(root, 'old'), root / 'old')
+            for name in ('/old', '../old', './old', 'old/../old', 'old//x', ''):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    freeze.package_path(root, name)
+            (root / 'alias').symlink_to(root / 'old', target_is_directory=True)
+            with self.assertRaises(ValueError):
+                freeze.package_path(root, 'alias')
+
+    def test_storage_reopen_must_bind_the_same_real_objects(self):
+        original = {'schemaVersion': 1, 'root': {'ino': 1}, 'marker': {'sha256': 'a'},
+                    'lease': {'ino': 2}, 'lockCompetitorBlocked': True, 'lockAvailableAfterRelease': True}
+        freeze.validate_reopen(original, dict(original))
+        for key in ('root', 'marker', 'lease'):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                freeze.validate_reopen(original, dict(original, **{key: {}}))
+        with self.assertRaises(ValueError):
+            freeze.validate_reopen(original, dict(original, lockCompetitorBlocked=False))
+
+
+if __name__ == '__main__':
+    unittest.main()

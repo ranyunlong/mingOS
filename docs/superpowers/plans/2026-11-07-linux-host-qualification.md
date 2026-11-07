@@ -37,8 +37,8 @@ docker image inspect mingos-linux-win-20261107
 
 **Files:** `scripts/build-kotlin.mjs`、`scripts/wasm-sdk-adapter.mjs`、`gradle/wrapper/gradle-wrapper.properties`；新增 `scripts/boot/build-linux-host-kotlin.mjs`，输出本代 `kotlin/` 及 `artifacts/{read-file,image-viewer,persistent-update-demo}/` 的受控来源包。
 
-- [ ] wrapper 下载校验 Gradle8.14.5 SHA；准备实际 JDK21/Node/compiler/Maven/Wasm 依赖清单。Windows wrapper 下载属于来源准备，不能代替正式禁网证明。
-- [ ] 新 runner 调用当前 adapter/打包约束，Gradle 加 `--offline --rerun-tasks --no-build-cache`；为 read-file/viewer 保存与更新 fixture 同等的 compiler.wasm 和真实 receipt，禁止伪造编译输出或仅复用 build cache。Linux 禁网内实际执行：
+- [x] wrapper 下载校验 Gradle8.14.5 SHA；实际 Linux JDK21/Node/compiler/Maven/Wasm 依赖完整清单与逐包前后变化已保存。Windows wrapper 下载属于来源准备，不能代替正式禁网证明。
+- [x] 新 runner 调用当前 adapter/打包约束，Gradle 加 `--offline --rerun-tasks --no-build-cache --no-configuration-cache`；为 read-file/viewer 保存与更新 fixture 同等的 compiler.wasm 和真实 receipt。六包真实 Linux 禁网强制重编及独立重放通过，包含下列五包及 text-entry-demo：
 
 ```sh
 node scripts/boot/build-linux-host-kotlin.mjs read-file
@@ -48,7 +48,7 @@ node scripts/boot/build-linux-host-kotlin.mjs persistent-update-demo new
 node scripts/boot/build-linux-host-kotlin.mjs persistent-update-demo absent-write
 ```
 
-- [ ] 核对每次任务实际执行、命令/日志/退出码、工具链及输入前后 hash、adapter 重放、ABI/import/capability、raw/packaged/manifest hash；来源包完整后提交。不把 Gradle UP-TO-DATE 或空输出计作真实重编。
+- [x] 核对每次任务实际执行、命令/日志/退出码、工具链及输入前后 hash、adapter 重放、ABI/import/capability、raw/packaged/manifest hash；来源包108个文件的完整导出 hash 已独立核对，runner14项控制通过。详见环境记录中的实际代与摘要。
 
 ## 阶段3：新执行器、存储准入与完整冻结
 
