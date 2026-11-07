@@ -331,3 +331,8 @@ Kotlin SDK 新增类型化私有文件 `read` 和 `write`，后者自动分块�
 2026-11-06 qualification 恢复入口边界修复：回归测试先证明位于 AssetRoot 外部的 manifest 可以被接受；脚本现要求 manifest 本身也必须位于 AssetRoot 内，并经过同一 no-reparse 路径检查。恢复测试通过，正式镜像仍未恢复，finalSystemAccepted=false。
 2026-11-06 qualification volume 恢复集成修复：真实临时 Docker 集成先复现 Windows PowerShell 将“volume 不存在” stderr 当 terminating error，脚本在创建目标 volume 前退出；改用 Start-Process 捕获 docker inspect 的 stdout/stderr/exit code，退出码1仅表示可创建，其他错误仍拒绝。合成 tar 的 marker 已真实恢复并读取，唯一临时 volume 已精确删除；恢复测试、Node 检查和宿主测试通过，正式 qualification 镜像仍未恢复，finalSystemAccepted=false。
 2026-11-06 qualification 资产交接说明：两个 Docker context 均确认没有固定 image/volume。README 新增源机器导出流程：固定 image 用 docker save，build-cache volume 用只读 bind mount 归档，明确 docker export 不能替代 volume；目标机器先 ValidateOnly，再分别 LoadImages/RestoreVolume。正式 qualification 仍等待原始资产，finalSystemAccepted=false。
+
+2026-11-07 qualification 恢复入口安全遏制与环境路线更正：独立复核发现原镜像加载后仅检查 daemon 已有 ID，不能证明归档包含目标镜像；volume 不存在检查与幂等 create 之间存在并发覆盖窗口，tar 文件名拼接也不安全。现移除写入实现，`-LoadImages` / `-RestoreVolume` 在读取资产和调用 Docker 前失败关闭；保留只读 manifest/固定声明 ID/归档 SHA-256 检查，成功状态明确为 `archive-hashes-matched`，不承诺 tar 内容或来源验证。新增 fake Docker 子进程回归与状态断言，安全恢复功能仍待完成。
+
+此前“恢复三个镜像和 build-cache volume 即可续跑”的说明不完整：历史 Task9 还要求 Darwin/APFS、原宿主缓存及真实 Kotlin/网络隔离/外部输入收据；prepare 必须使用全新目标 build volume，恢复已有卷不满足该合同。用户已确认目前无法访问原 macOS 或完整备份。旧失败代与历史 driver 不续用；当前 Windows + Docker/Linux 将以独立工具链、fixture、存储合同和完整冻结建立新代。该调整保留持久更新、显式恢复和正常双启动要求，`finalSystemAccepted=false`。
+本阶段验证：PowerShell 恢复入口测试退出0（包含两个禁用写入入口、fake Docker 未调用与只读状态断言），JavaScript 语法检查通过，Node 测试22通过、0失败、2项POSIX跳过；独立只读代码复核未发现本次遏制的阻断项。上述结果不验证镜像导入、卷恢复、Rust 构建或 guest。

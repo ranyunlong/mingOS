@@ -29,6 +29,12 @@ function Invoke-Validation([hashtable]$Manifest, [int]$ExpectedExitCode) {
       $output = [IO.File]::ReadAllText($stdoutPath) + [IO.File]::ReadAllText($stderrPath)
       throw "Expected exit $ExpectedExitCode, got $($process.ExitCode). Output: $output"
     }
+    if ($ExpectedExitCode -eq 0) {
+      $result = [IO.File]::ReadAllText($stdoutPath) | ConvertFrom-Json
+      if ($result.status -ne 'archive-hashes-matched' -or $result.loadImages -or $result.restoreVolume) {
+        throw 'Read-only validation overstated the verified archive boundary'
+      }
+    }
   } finally {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
   }
@@ -67,6 +73,73 @@ $wrongImageId = $valid.Clone()
 $wrongImageId.images = @($valid.images | ForEach-Object { $_.Clone() })
 $wrongImageId.images[0].imageId = ('sha256:' + ('f' * 64))
 Invoke-Validation $wrongImageId 1
+
+function Invoke-DisabledAction([string]$Action) {
+  $root = Join-Path ([IO.Path]::GetTempPath()) ('mingos-restore-disabled-' + [guid]::NewGuid().ToString('N'))
+  $bin = Join-Path $root 'bin'
+  $marker = Join-Path $root 'docker-called.txt'
+  New-Item -ItemType Directory -Path (Join-Path $root 'images'), $bin -Force | Out-Null
+  $previousPath = $env:PATH
+  $previousMarker = $env:MINGOS_TEST_DOCKER_MARKER
+  try {
+    $source = Join-Path $root 'fake-docker.cs'
+    [IO.File]::WriteAllText($source, @'
+using System;
+using System.IO;
+public static class Program {
+  public static int Main(string[] args) {
+    File.WriteAllText(Environment.GetEnvironmentVariable("MINGOS_TEST_DOCKER_MARKER"), String.Join(" ", args));
+    return 42;
+  }
+}
+'@)
+    $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    if (!(Test-Path -LiteralPath $compiler)) { throw 'C# compiler required for fake docker test' }
+    & $compiler /nologo /target:exe ("/out:" + (Join-Path $bin 'docker.exe')) $source | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to compile fake docker' }
+
+    $images = @($valid.images | ForEach-Object { $_.Clone() })
+    foreach ($entry in $images) {
+      $path = Join-Path $root $entry.archive
+      [IO.File]::WriteAllBytes($path, [Text.Encoding]::UTF8.GetBytes($entry.key))
+      $entry.archiveSha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    $volumeArchive = Join-Path $root 'volume.tar'
+    [IO.File]::WriteAllText($volumeArchive, 'test-volume')
+    $manifest = @{
+      schemaVersion = 1
+      images = $images
+      volume = @{
+        name = 'mingos-test-owned-volume'
+        archive = 'volume.tar'
+        archiveSha256 = (Get-FileHash -LiteralPath $volumeArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+      }
+    }
+    $manifestPath = Join-Path $root 'manifest.json'
+    [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+    $stdoutPath = Join-Path $root 'stdout.txt'
+    $stderrPath = Join-Path $root 'stderr.txt'
+    $env:PATH = $bin
+    $env:MINGOS_TEST_DOCKER_MARKER = $marker
+    $powershell = Join-Path $PSHOME 'powershell.exe'
+    $process = Start-Process $powershell -ArgumentList @(
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script,
+      '-AssetRoot', $root, '-Manifest', $manifestPath, ('-' + $Action)
+    ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $output = [IO.File]::ReadAllText($stdoutPath) + [IO.File]::ReadAllText($stderrPath)
+    if ($process.ExitCode -eq 0 -or $output -notmatch 'mutating restore is disabled') {
+      throw "$Action did not report the disabled write boundary: $output"
+    }
+    if (Test-Path -LiteralPath $marker) { throw "$Action invoked docker before refusal" }
+  } finally {
+    $env:PATH = $previousPath
+    $env:MINGOS_TEST_DOCKER_MARKER = $previousMarker
+    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+Invoke-DisabledAction 'RestoreVolume'
+Invoke-DisabledAction 'LoadImages'
 
 $outsideRoot = Join-Path ([IO.Path]::GetTempPath()) ('mingos-restore-outside-' + [guid]::NewGuid().ToString('N'))
 $outsideManifest = Join-Path ([IO.Path]::GetTempPath()) ('mingos-restore-manifest-' + [guid]::NewGuid().ToString('N') + '.json')

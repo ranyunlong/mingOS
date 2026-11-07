@@ -10,29 +10,19 @@
 
 ## Qualification 资产恢复
 
-当原始 qualification 镜像归档和 build-cache volume 从备份取回后，先用仓库内脚本做只读校验。manifest 必须列出 rust、tools、openssl 三个镜像的归档 SHA-256 和固定 image ID；脚本默认不调用 Docker，也不会覆盖已有资源。
+当前入口仅校验归档文件与 manifest 的 SHA-256 是否一致，以及 manifest 声明的 rust、tools、openssl image ID 是否等于历史合同。成功状态为 `archive-hashes-matched`；这不证明 tar 内容有效、归档包含声明的镜像或资产来源可信。默认模式和 `-ValidateOnly` 均不调用 Docker。
 
 ~~~powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/boot/restore-qualification-assets.ps1 -AssetRoot C:\path\to\qualification-assets -Manifest C:\path\to\qualification-assets\manifest.json -ValidateOnly
 ~~~
 
-确认校验结果后，才显式使用 -LoadImages；有 volume 归档时再单独使用 -RestoreVolume。脚本拒绝路径穿越、重名镜像、摘要不匹配、已有同名 volume 和未在 manifest 中声明的资源，不提供删除或摘要替换选项。
+`-LoadImages` 和 `-RestoreVolume` 当前在读取资产和调用 Docker 前明确拒绝；`-VolumeHelperImage` 仅为保留的兼容参数。原实现未证明加载归档与目标镜像的绑定，volume 检查与创建之间也存在覆盖竞态，因此暂时移除了写入路径。安全恢复功能仍待实现，不能以只读校验成功代替恢复完成。
 
-### 从源机器导出
+### 历史 Task9 的实际依赖
 
-如果固定资产仍在另一台 Docker 环境，必须在那里导出原始 image 和 build-cache volume。镜像使用 docker save，volume 使用只读 bind mount 打 tar；docker export 不能替代 volume 归档。
+`artifacts/persistent-update-20261104-prep/run-stage.py` 还要求 Darwin/APFS、原宿主 `.cache/linux-rust/{cargo,target/release}`、历史 Kotlin 构建及网络隔离收据、bootstrap/更新/回归 fixture 和 OpenSSL 来源。prepare 从宿主缓存复制到全新 build volume，并拒绝已有目标卷；一个归档恢复卷不能替代宿主缓存。仅取得三个镜像和一个卷不足以执行该驱动。
 
-~~~powershell
-$out = 'C:\qualification-assets'
-New-Item -ItemType Directory -Force $out, (Join-Path $out 'images'), (Join-Path $out 'volume') | Out-Null
-docker save sha256:868a411f3e53b95fcdfb0604031e0172e51cf7d1ae2bce8aa0ea1c0bb82f0130 -o (Join-Path $out 'images\rust.tar')
-docker save sha256:2440560d810a834637cfeeb1057f7f471c40caa8e532645e00e063cbc8ec639a -o (Join-Path $out 'images\tools.tar')
-docker save sha256:3646133f4b4d2e007dd3eee28d9db6336c29f6ccb31b9f8a49b88bc0a70051be -o (Join-Path $out 'images\openssl.tar')
-docker run --rm --network none --mount type=volume,source=<qualification-build-volume>,target=/src,readonly --mount type=bind,source=$out\volume,target=/dst debian:trixie-slim sh -c 'tar -cf /dst/build-cache.tar -C /src .'
-Get-FileHash $out\images\*.tar,$out\volume\build-cache.tar -Algorithm SHA256
-~~~
-
-将归档 SHA-256 写入 manifest 后，在目标机器先运行 -ValidateOnly，再分开运行 -LoadImages 和 -RestoreVolume。
+2026-11-07 用户确认目前无法访问原 macOS/APFS 环境或完整备份。后续在当前 Windows + Docker/Linux 环境建立独立工具链、fixture 来源及存储合同，以新代构建和资格证据推进；历史失败代、摘要和验收状态保持原样。新环境完成依赖准备也不代表正常重启或完整系统验收通过。
 
 以下为此前真实 v4 诊断记录，镜像/volume的存在状态以新的环境证据为准。
 

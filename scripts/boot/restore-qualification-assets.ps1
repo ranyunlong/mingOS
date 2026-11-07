@@ -22,6 +22,10 @@ function Fail([string]$Message) {
   throw ('QUALIFICATION_ASSET_RESTORE_BLOCKED: ' + $Message)
 }
 
+if ($LoadImages -or $RestoreVolume) {
+  Fail 'mutating restore is disabled pending safe archive provenance and ownership verification'
+}
+
 function Assert-Hash([string]$Value, [string]$Name) {
   if ($Value -notmatch '^([0-9a-f]{64})$') { Fail ($Name + ' must be 64 lowercase hex characters') }
 }
@@ -103,13 +107,6 @@ function Assert-Archive([object]$Entry, [string]$Root) {
   return $path
 }
 
-function Invoke-Docker([string[]]$Arguments) {
-  $output = & docker.exe @Arguments 2>&1
-  $code = $LASTEXITCODE
-  if ($code -ne 0) { Fail ('docker command failed (' + ($Arguments -join ' ') + '): ' + (($output -join ([Environment]::NewLine)).Trim())) }
-  return @($output)
-}
-
 $root = [IO.Path]::GetFullPath($AssetRoot)
 if (!(Test-Path -LiteralPath $root -PathType Container)) { Fail 'AssetRoot is missing' }
 if ([string]::IsNullOrWhiteSpace($Manifest)) { $Manifest = Join-Path $root 'manifest.json' }
@@ -129,46 +126,9 @@ if ($null -ne $record.volume) {
   if ($actual -ne $record.volume.archiveSha256) { Fail 'volume archive SHA-256 mismatch' }
 }
 
-if (!$ValidateOnly -and !$LoadImages -and !$RestoreVolume) { $ValidateOnly = $true }
-if ($ValidateOnly -and ($LoadImages -or $RestoreVolume)) { Fail 'ValidateOnly cannot be combined with a mutating action' }
-
-if ($LoadImages) {
-  foreach ($entry in $record.images) {
-    Invoke-Docker @('load', '--input', $archives[$entry.key]) | Out-Null
-    $actualId = ((Invoke-Docker @('image', 'inspect', '--format', '{{.Id}}', $entry.imageId)) -join '').Trim()
-    if ($actualId -ne $entry.imageId) { Fail ($entry.key + ' loaded image ID differs from manifest') }
-  }
-}
-
-if ($RestoreVolume) {
-  if ($null -eq $record.volume) { Fail 'volume entry is required for RestoreVolume' }
-  $probeRoot = Join-Path ([IO.Path]::GetTempPath()) ('mingos-volume-probe-' + [guid]::NewGuid().ToString('N'))
-  New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
-  try {
-    $probe = Start-Process docker.exe -ArgumentList @('volume', 'inspect', $record.volume.name) -Wait -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $probeRoot 'stdout.txt') -RedirectStandardError (Join-Path $probeRoot 'stderr.txt')
-    if ($probe.ExitCode -eq 0) { Fail ('refusing to overwrite existing volume: ' + $record.volume.name) }
-    if ($probe.ExitCode -ne 1) {
-      $probeError = [IO.File]::ReadAllText((Join-Path $probeRoot 'stderr.txt')).Trim()
-      Fail ('unable to inspect target volume: ' + $probeError)
-    }
-  } finally {
-    Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
-  }
-  Invoke-Docker @('image', 'inspect', $VolumeHelperImage) | Out-Null
-  Invoke-Docker @('volume', 'create', $record.volume.name) | Out-Null
-  $volumePath = Resolve-SafeAssetPath $root ([string]$record.volume.archive) 'volume archive'
-  $volumeDir = Split-Path -Parent $volumePath
-  $volumeFile = Split-Path -Leaf $volumePath
-  $command = @('run', '--rm', '--network', 'none', '--user', '0:0',
-               '--mount', ('type=volume,source=' + $record.volume.name + ',target=/dst'),
-               '--mount', ('type=bind,source=' + $volumeDir + ',target=/src,readonly'),
-               $VolumeHelperImage, 'sh', '-c', ('tar -xf /src/' + $volumeFile + ' -C /dst --no-same-owner'))
-  Invoke-Docker $command | Out-Null
-}
-
 $result = [ordered]@{
   schemaVersion = 1
-  status = 'validated'
+  status = 'archive-hashes-matched'
   assetRoot = $root
   manifest = $manifest
   images = @($record.images | ForEach-Object { [ordered]@{ key = $_.key; imageId = $_.imageId; archive = $_.archive } })
