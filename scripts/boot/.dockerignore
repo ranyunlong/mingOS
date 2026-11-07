@@ -5,3 +5,5 @@
 !infra-packages.lock
 !Dockerfile.recovery
 !recovery-packages.lock
+!Dockerfile.linux-host-tools
+!linux-host-packages.lock

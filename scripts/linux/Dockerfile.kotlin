@@ -1,0 +1,31 @@
+# Node's embedded Mozilla roots bootstrap HTTPS before Debian ca-certificates exists.
+FROM node:24.22.1-trixie-slim@sha256:89c5244bc22a9bc3287d89ebc7e49b9cb5bb84cd40e6175ac3421d5a9f68b95a
+ENV DEBIAN_FRONTEND=noninteractive \
+    JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
+    HOME=/tmp \
+    GRADLE_USER_HOME=/deps/gradle
+RUN set -eu; \
+    test "$(dpkg --print-architecture)" = amd64; \
+    mkdir -p /etc/ssl/certs /usr/local/share/mingos-toolchain /tmp/debs/partial; \
+    node -e "require('fs').writeFileSync('/etc/ssl/certs/ca-certificates.crt',require('tls').rootCertificates.join('\n')+'\n')"; \
+    sha256sum /etc/ssl/certs/ca-certificates.crt > /usr/local/share/mingos-toolchain/bootstrap-ca.sha256; \
+    sed -i 's|http://deb.debian.org|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' 'Acquire::https::CaInfo "/etc/ssl/certs/ca-certificates.crt";' > /etc/apt/apt.conf.d/99-mingos-ca; \
+    apt-get -o APT::Update::Error-Mode=any update; \
+    cp /etc/apt/sources.list.d/debian.sources /usr/local/share/mingos-toolchain/debian.sources; \
+    sha256sum /var/lib/apt/lists/*InRelease /var/lib/apt/lists/*Packages* > /usr/local/share/mingos-toolchain/apt-index.sha256; \
+    apt-get -y --no-install-recommends -o Dir::Cache::archives=/tmp/debs --download-only install \
+      openjdk-21-jdk-headless=21.0.13+9-1~deb13u2 \
+      openjdk-21-jre-headless=21.0.13+9-1~deb13u2 \
+      ca-certificates=20250419+deb13u1 unzip; \
+    (cd /tmp/debs && sha256sum *.deb) > /usr/local/share/mingos-toolchain/deb.sha256; \
+    apt-get -y --no-install-recommends -o Dir::Cache::archives=/tmp/debs install \
+      openjdk-21-jdk-headless=21.0.13+9-1~deb13u2 \
+      openjdk-21-jre-headless=21.0.13+9-1~deb13u2 \
+      ca-certificates=20250419+deb13u1 unzip; \
+    dpkg-query -W -f='${binary:Package}\t${Version}\n' > /usr/local/share/mingos-toolchain/installed-packages.tsv; \
+    node --version; java -version; javac -version; \
+    rm -rf /tmp/debs /var/lib/apt/lists/*; \
+    mkdir -p /workspace /deps/gradle
+WORKDIR /workspace
+USER 65534:65534

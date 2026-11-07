@@ -29,9 +29,9 @@ docker build --pull=false --progress=plain -f scripts/linux/Dockerfile -t mingos
 docker image inspect mingos-linux-win-20261107
 ```
 
-- [ ] tools Dockerfile 从实际固定 digest 构建，按当前 lock 下载并记录 deb SHA、installed-packages、apt sources、QEMU/Weston/OpenSSL/kernel 版本。实际版本不可得时使用独立新 lock；不把旧私有 tag 当作存在。执行 `docker build --pull=false --progress=plain -f scripts/boot/Dockerfile.linux-host-tools -t mingos-tools-win-20261107 scripts/boot`。
-- [ ] 在专属新 Linux cache volume 内联网执行 `cargo +1.99.1 fetch --locked`，封存 Cargo registry/git 依赖完整清单；记录源、命令、退出码，target 初始为空。随后禁网运行 `cargo +1.99.1 metadata --offline --locked --format-version 1` 确认依赖齐全。
-- [ ] 验收镜像真实可运行、完整工具版本与动态库来源、依赖 hash 清单；仅构建成功后提交本阶段可复核变更。
+- [x] tools Dockerfile 从实际固定 digest 构建，独立新 lock 下载280个 deb，保存 SHA、installed-packages、apt sources、QEMU/Weston/OpenSSL/kernel 版本。固定 image ID 与真实 smoke 见环境记录；签名索引原件尚未封存，不宣称完整离线 APT 闭包。
+- [x] 专属新 Linux cache volume 联网锁定 fetch、禁网 metadata 均返回0，完整缓存 hash 清单已保存。target 没有编译产物，但 metadata 生成 `.rustc_info.json`；严格空断言失败保留，正式构建须另建字面空 target。
+- [x] 开发镜像实际运行、boot 三工具动态库、280个 deb hash、OpenSSL 正负验签及无 kernel QMP smoke 已验证并独立复核。正式工具链闭包/freeze 仍在阶段3完成，当前不能准入 Task9。
 
 ## 阶段2：真实 Kotlin 来源
 
