@@ -15,10 +15,12 @@
 
 ## 继续交付的门槛
 
-1. 独立 Linux 持久卸载资格：真实专用 Kotlin fixture、冷构建、专用 raw checker、七步/一步同盘双启动及独立导出回放。当前进入实现，尚无通过声明。
+1. 独立 Linux 持久卸载资格：四包真实 Kotlin 来源重编/重放与首个七命令冷构建59f0274d已完成（776通过、0失败、24忽略）；独立probe/geometry/tools资产核验完成。runtime bfcc983e在prepare加载/assets/checker/driver.py时因目录层级计算错误失败，尚未启动客体；失败代保留，修复后必须全新冻结构建。七步/一步同盘双启动及独立导出回放仍待执行。
 2. 按实际系统需求继续核对剩余日常工作流、系统集成与发布标准。物理鼠标专项仍暂停；TCG、虚拟输入和软件呈现不能作为物理硬件资格。
 3. 历史APFS资格不能由新Linux证据替代；280个deb的观察记录也不构成完整签名离线APT重建闭包。
 
 完整阶段记录见 [连续开发记录](continuous-development.md)、[当前环境记录](development-environment-20261107.md)、[Linux更新资格计划](superpowers/plans/2026-11-07-linux-host-qualification.md) 与 [Linux卸载资格计划](superpowers/plans/2026-11-07-linux-host-uninstall-qualification.md)。大产物按仓库约定保留本机，不提交Git。
 
 失败代及RED包：`artifacts/environment-rebuild-20261107/failure-evidence-archive-20261107-98ab2bdd71/failed-runtime-and-red-evidence.tar.gz`，1716306393字节，SHA256 `2e7527696320fe2a92f5bddc751086d5b5cbd624c18faf2a8ba106b0faa49764`。覆盖5个失败runtime及相关控制，共9293个常规文件/符号链接，含三张原失败盘；独立成员hash/链接target与源前后清单一致。只保留证据，不赋予历史恢复或系统通过含义。
+
+完整boot Python测试发现546项，实际543通过、1失败、0错误、2项非Linux边界跳过。唯一失败是原legacy frozen隔离探针文件缺失；现存source-v2字节不能替代该历史固定hash。该缺口继续保留，当前不声明全部测试通过。

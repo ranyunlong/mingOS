@@ -1,6 +1,9 @@
 """Closed uninstall orchestration controls; no guest or Docker invocation."""
 import importlib.util
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,6 +19,41 @@ def load():
 
 
 class DriverControls(unittest.TestCase):
+    def test_repository_import_and_validate_inputs(self):
+        driver = load()
+        expected = Path('/repo') if HERE in (Path('/prep'), Path('/assets/checker')) else HERE.parents[2]
+        self.assertEqual(driver.REPO, expected)
+        with tempfile.TemporaryDirectory() as directory:
+            driver.validate_inputs(*driver.input_contracts(), directory)
+
+    @unittest.skipUnless(os.name == 'posix', 'Linux deployment paths require POSIX')
+    def test_deployment_import_and_validate_inputs(self):
+        source = (HERE / 'driver.py').read_text()
+        for filename in ('/assets/checker/driver.py', '/prep/driver.py'):
+            with self.subTest(filename=filename):
+                code = """
+import sys, tempfile
+from pathlib import Path
+namespace = {'__file__': sys.argv[1], '__name__': 'deployment_driver'}
+exec(compile(sys.argv[2], sys.argv[1], 'exec'), namespace)
+assert namespace['REPO'] == Path('/repo'), namespace['REPO']
+with tempfile.TemporaryDirectory() as directory:
+    first, second = namespace['input_contracts']()
+    namespace['validate_inputs'](first, second, directory)
+    first['steps'].append(first['steps'][-1])
+    try:
+        namespace['validate_inputs'](first, second, directory)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('mutated input accepted')
+import infra
+assert Path(infra.__file__).resolve() == Path('/repo/scripts/boot/infra.py')
+"""
+                result = subprocess.run([sys.executable, '-I', '-B', '-c', code,
+                                         filename, source], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_exact_seven_one_inputs_and_retained_budget(self):
         driver = load()
         first, second = driver.input_contracts()

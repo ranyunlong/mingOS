@@ -14,7 +14,7 @@ import sys
 
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 HERE = Path(__file__).resolve().parent
-REPO = Path('/repo') if HERE == Path('/prep') else HERE.parents[2]
+REPO = Path('/repo') if HERE in (Path('/prep'), Path('/assets/checker')) else HERE.parents[2]
 
 def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
