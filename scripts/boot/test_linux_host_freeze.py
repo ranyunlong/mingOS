@@ -2,8 +2,32 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import linux_host_freeze as freeze
+
+
+class ColdProfileFreezeControls(unittest.TestCase):
+    def test_prepare_passes_explicit_profile_to_real_freezer(self):
+        root = Path('/prep')
+        args = (root, Path('/repo'), Path('/cargo'), Path('/packages'), Path('/image'), Path('/capacity'), Path('/node'), '0' * 64)
+        with mock.patch.object(freeze.q, 'checked_directory', return_value=root), \
+             mock.patch.object(freeze.q, 'write_json'), mock.patch.object(freeze.q, 'stable_hash', return_value={'sha256': 'f' * 64}), \
+             mock.patch.object(freeze, '_prepare', return_value={'profile': 'persistent-uninstall-linux-host'}) as prepare:
+            result = freeze.prepare(*args, profile='persistent-uninstall-linux-host')
+        self.assertEqual(prepare.call_args.args[-1], 'persistent-uninstall-linux-host')
+        self.assertEqual(result['profile'], 'persistent-uninstall-linux-host')
+
+    def test_uninstall_package_paths_are_exact_and_distinct(self):
+        profile = 'persistent-uninstall-linux-host'
+        expected = {key: key for key in ('read-file', 'image-viewer', 'text-entry-demo', 'uninstall')}
+        self.assertEqual(freeze.package_paths_for(profile), expected)
+        for paths in (dict(expected, old='old'), {key: 'same' for key in expected}, {}):
+            with self.subTest(paths=paths), self.assertRaises(ValueError):
+                freeze.package_paths_for(profile, paths)
+        with self.assertRaises(ValueError):
+            freeze.package_paths_for('unknown')
+        self.assertEqual(tuple(freeze.package_paths_for()), freeze.LABELS)
 
 
 class FreezeControls(unittest.TestCase):

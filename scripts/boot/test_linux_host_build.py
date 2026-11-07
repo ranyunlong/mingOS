@@ -19,7 +19,60 @@ except ModuleNotFoundError:
     b = None
 
 
+class ColdProfileBuildControls(unittest.TestCase):
+    def test_uninstall_manifest_is_install_demo_sdk6_version_one(self):
+        profile = 'persistent-uninstall-linux-host'
+        files = {'compiler.wasm': 'a', 'main.wasm': 'b', 'app.json': 'c'}
+        inputs = {'samples/persistent-uninstall-demo/app.json': 'source'}
+        info = {'inputSha256': inputs, 'rawSha256': 'a', 'packagedSha256': 'b'}
+        manifest = {'schemaVersion': 1, 'id': 'dev.ming.install-demo', 'version': '1.0.0', 'sdkVersion': 6, 'entry': 'main.wasm'}
+        receipt = {'schemaVersion': 1, 'status': 'passed', 'sample': 'persistent-uninstall-demo', 'fixture': None,
+            'offline': True, 'compilerExitCode': 0, 'compilerSignal': None, 'kotlin': '2.3.20',
+            'formalQualification': False, 'finalSystemAccepted': False, 'rawToPackageReplayVerified': True,
+            'sourceInputsStable': True, 'dependencyInputsStable': True, 'inputSha256': inputs,
+            'rawSha256': 'a', 'packagedSha256': 'b', 'manifestSha256': 'c', 'package': info,
+            'command': ['--offline', '--rerun-tasks', '--no-build-cache', '--no-configuration-cache',
+                        ':persistent-uninstall-demo:compileProductionExecutableKotlinWasmWasi']}
+        data = {'build-receipt.json': receipt, 'build-info.json': info, 'app.json': manifest}
+        with mock.patch.object(q, 'read_json', side_effect=lambda path: data[path.name]), \
+             mock.patch.object(q, 'stable_hash', side_effect=lambda path: {'sha256': files[path.name]}):
+            b.verify_package(Path('/packages/uninstall'), 'uninstall', {name: {'sha256': sha} for name, sha in inputs.items()}, profile)
+            for key, value in (('id', 'dev.ming.persistent-uninstall-demo'), ('version', '0.1.0'), ('sdkVersion', 5)):
+                original = manifest[key]; manifest[key] = value
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'identity'):
+                    b.verify_package(Path('/packages/uninstall'), 'uninstall', {name: {'sha256': sha} for name, sha in inputs.items()}, profile)
+                manifest[key] = original
+            with self.assertRaises(ValueError):
+                b.verify_package(Path('/packages/uninstall'), 'uninstall', {}, q.DEFAULT_COLD_PROFILE)
+
+    def test_incomplete_uninstall_input_inventory_is_not_accepted(self):
+        packages = {key: {'files': {}} for key in q.package_contract('persistent-uninstall-linux-host')}
+        value = {'profile': 'persistent-uninstall-linux-host', 'packages': packages,
+                 'source': {'files': {}}, 'cargoLock': {}, 'cargo': {'files': {'crate': {}}}}
+        snapshot = {'packages': {key: {} for key in packages}, 'source': {}, 'cargoLock': {}, 'registry': {'crate': {}}}
+        b.verify_inputs(snapshot, value)
+        del snapshot['packages']['uninstall']
+        with self.assertRaisesRegex(ValueError, 'package'):
+            b.verify_inputs(snapshot, value)
+
+    def test_uninstall_environment_and_two_fixed_outputs_are_profile_specific(self):
+        profile = 'persistent-uninstall-linux-host'
+        paths = {key: key for key in ('read-file', 'image-viewer', 'text-entry-demo', 'uninstall')}
+        env = b.build_environment(Path('/cargo'), Path('/target'), Path('/stage'), Path('/packages'), paths, profile)
+        self.assertEqual(env['MING_UNINSTALL_FIXTURE_WASM'], str(Path('/packages/uninstall/main.wasm')))
+        self.assertEqual(env['MING_TEST_PRIVATE_WORKER'], str(Path('/target/release/ming-app-host')))
+        self.assertEqual({key for key in env if key.startswith('MING_')}, {'MING_UNINSTALL_FIXTURE_WASM', 'MING_TEST_PRIVATE_WORKER'})
+        self.assertEqual(b.artifact_paths(profile), ('release/ming-app-host', 'release/examples/prepare_persistent_uninstall_fixture'))
+        self.assertEqual(b.artifact_paths(), b.ARTIFACT_PATHS)
+        with self.assertRaises(ValueError):
+            b.artifact_paths('unknown')
+        with self.assertRaises(ValueError):
+            b.build_environment(Path('/cargo'), Path('/target'), Path('/stage'), Path('/packages'), dict(paths, old='old'), profile)
+
+
 class ColdBuildControls(unittest.TestCase):
+    profile = q.DEFAULT_COLD_PROFILE
+
     def setUp(self):
         self.assertIsNotNone(b, 'independent cold-build controller must exist')
         self.temp = tempfile.TemporaryDirectory()
@@ -47,18 +100,19 @@ class ColdBuildControls(unittest.TestCase):
         capacity = {'hostAvailableBytes': 1024 ** 4, 'linuxAvailableBytes': 1024 ** 4,
                     'backingDiskPath': 'C:\\Docker\\docker_data.vhdx', 'hostFilesystem': 'NTFS'}
         q.write_json(self.capacity_receipt, capacity)
-        self.paths = {label: label for label in b.PACKAGES}
-        for label in b.PACKAGES:
+        self.contract = q.package_contract(self.profile)
+        self.paths = {label: label for label in self.contract}
+        for label in self.contract:
             self.make_package(label)
         for label in ('read-file', 'image-viewer'):
             import shutil
             shutil.copytree(self.packages / label, self.repo / 'artifacts' / label)
         self.freeze = self.base / 'freeze.json'
-        self.value = {'schemaVersion': 1, 'profile': 'persistent-update-linux-host',
+        self.value = {'schemaVersion': 1, 'profile': self.profile,
             'source': {'files': q.source_inventory(self.repo)},
             'cargoLock': q.stable_hash(self.repo / 'Cargo.lock'),
             'cargo': {'files': q.tree_inventory(self.cargo / 'registry')},
-            'packages': {label: {'path': label, 'files': q.tree_inventory(self.packages / label)} for label in b.PACKAGES},
+            'packages': {label: {'path': label, 'files': q.tree_inventory(self.packages / label)} for label in self.contract},
             'packageReplayFiles': q.tree_inventory(self.root / 'replay'),
             'storage': {'probe': self.storage_receipt, 'reopen': self.storage_receipt,
                 'capacityReceipt': str(self.capacity_receipt), 'capacityReceiptSha256': q.stable_hash(self.capacity_receipt)['sha256'],
@@ -81,10 +135,10 @@ class ColdBuildControls(unittest.TestCase):
     def make_package(self, label):
         directory = self.packages / label
         directory.mkdir()
-        sample, fixture = b.PACKAGES[label]
+        sample, fixture = self.contract[label]
         raw, main = b'raw wasm ' + label.encode(), b'packaged wasm ' + label.encode()
-        manifest = {'schemaVersion': 1, 'id': 'dev.ming.' + sample,
-            'version': '0.2.0' if fixture in ('new', 'absent-write') else '0.1.0',
+        manifest = {'schemaVersion': 1, 'id': 'dev.ming.install-demo' if label == 'uninstall' else 'dev.ming.' + sample,
+            'version': '1.0.0' if label == 'uninstall' else '0.2.0' if fixture in ('new', 'absent-write') else '0.1.0',
             'sdkVersion': 1 if sample == 'read-file' else 2 if sample == 'image-viewer' else 6,
             'entry': 'main.wasm'}
         for name, data in [('compiler.wasm', raw), ('main.wasm', main)]:
@@ -111,7 +165,7 @@ class ColdBuildControls(unittest.TestCase):
             return {'unitOnly': True}
         self.readonly_inputs = []
         with mock.patch.object(q, 'observe_environment', return_value=self.observed), mock.patch.object(b, 'require_readonly', side_effect=lambda p: self.readonly_inputs.append(Path(p))), mock.patch.object(storage, '_space', side_effect=control_capacity):
-            return b.run_build(self.root, self.repo, self.freeze, self.cargo, self.target, self.packages)
+            return b.run_build(self.root, self.repo, self.freeze, self.cargo, self.target, self.packages, self.profile)
 
     def replace_freeze(self, mutate):
         value = copy.deepcopy(self.value)
@@ -123,11 +177,11 @@ class ColdBuildControls(unittest.TestCase):
         index = len(self.calls)
         self.calls.append((command, timeout, kwargs))
         if index == 4:
-            for file in (self.target / 'release/ming-app-host', self.target / 'release/examples/prepare_persistent_update_fixture'):
+            for file in (self.target / name for name in b.artifact_paths(self.profile)):
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.write_bytes(b'\x7fELF' + b'control executable')
                 file.chmod(0o755)
-        expected = q.build_commands()[index]['expectedSummary']
+        expected = q.build_commands(self.profile)[index]['expectedSummary']
         text = ('test result: ok. %d passed; %d failed; %d ignored; %d measured; 9 filtered out; finished in 0.01s\n' % expected) if expected else 'control command passed\n'
         if index == 0:
             text = 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
@@ -357,6 +411,68 @@ class ColdBuildControls(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'read-only'):
                 b.run_build(self.root, self.repo, self.freeze, self.cargo, self.target, self.packages)
             execute.assert_not_called()
+
+
+class UninstallColdBuildControls(unittest.TestCase):
+    """Real POSIX controls, synthetic compiler only; run in admitted Linux."""
+    profile = 'persistent-uninstall-linux-host'
+    setUp = ColdBuildControls.setUp
+    make_package = ColdBuildControls.make_package
+    run_build = ColdBuildControls.run_build
+    simulated_execute = ColdBuildControls.simulated_execute
+
+    def test_seven_commands_bind_uninstall_environment_and_both_artifact_seals(self):
+        self.calls, self.original_execute = [], q.execute
+        def execute(directory, command, timeout, **kwargs):
+            result = self.simulated_execute(directory, command, timeout, **kwargs)
+            if len(self.calls) == 5:
+                for name in b.artifact_paths(self.profile):
+                    path = self.target / name
+                    os.link(path, path.with_name(path.name + '-cargo-alias'))
+            if len(self.calls) == 6:
+                for name in b.artifact_paths(self.profile):
+                    path = self.target / name
+                    self.assertEqual(path.stat().st_nlink, 1)
+                    path.unlink()
+                    os.link(path.with_name(path.name + '-cargo-alias'), path)
+            return result
+        with mock.patch.object(q, 'execute', side_effect=execute):
+            record = self.run_build()
+        self.assertEqual(record['detail']['coldBuildCommands'], 7)
+        self.assertEqual([row[0] for row in self.calls], [row['command'] for row in q.build_commands(self.profile)])
+        self.assertEqual([row[1] for row in self.calls], [1800] * 5 + [900] * 2)
+        self.assertFalse(any(key.startswith('MING_') for key in self.calls[0][2]['env']))
+        self.assertEqual(self.calls[5][2]['env']['MING_UNINSTALL_FIXTURE_WASM'], str(self.packages / 'uninstall/main.wasm'))
+        directory = self.root / 'stages/build'
+        for name in ('pre-explicit-artifact-seal.json', 'final-artifact-seal.json'):
+            self.assertEqual(set(q.read_json(directory / name)), set(b.artifact_paths(self.profile)))
+        for name in b.artifact_paths(self.profile):
+            self.assertEqual((self.target / name).stat().st_nlink, 1)
+        self.assertFalse((self.target / 'release/examples/prepare_persistent_update_fixture').exists())
+
+    def test_default_update_request_rejects_uninstall_freeze_without_execution(self):
+        with mock.patch.object(q, 'observe_environment', return_value=self.observed), mock.patch.object(q, 'execute') as execute:
+            with self.assertRaisesRegex(ValueError, 'profile'):
+                b.run_build(self.root, self.repo, self.freeze, self.cargo, self.target, self.packages)
+            execute.assert_not_called()
+
+    def test_zero_match_stops_second_uninstall_test_and_preserves_failed_generation(self):
+        self.calls, self.original_execute = [], q.execute
+        def execute(directory, command, timeout, **kwargs):
+            if len(self.calls) == 5:
+                self.calls.append((command, timeout, kwargs))
+                return self.original_execute(directory, [sys.executable, '-c',
+                    'print("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s")'],
+                    5, **kwargs)
+            return self.simulated_execute(directory, command, timeout, **kwargs)
+        with mock.patch.object(q, 'execute', side_effect=execute):
+            with self.assertRaisesRegex(ValueError, 'summary'):
+                self.run_build()
+        self.assertEqual(len(self.calls), 6)
+        self.assertEqual(q.read_json(self.root / 'stages/build/result.json')['status'], 'failed')
+        self.assertTrue((self.root / 'stages/build/inputs-after.json').exists())
+        with self.assertRaises(FileExistsError):
+            self.run_build()
 
 
 class ArtifactSealControls(unittest.TestCase):

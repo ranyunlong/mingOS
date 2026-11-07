@@ -45,3 +45,6 @@ artifacts/**/stderr.log binary
 artifacts/**/*.jsonl binary
 scripts/boot/init text eol=lf
 scripts/boot/weston.ini text eol=lf
+# Native qualification inputs bind exact raw bytes across checkouts.
+scripts/boot/qualification_uninstall/input-boot1.json binary
+scripts/boot/qualification_uninstall/input-boot2.json binary

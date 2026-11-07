@@ -4,8 +4,9 @@
 Create one independent Linux cold-build generation, optionally starting its build.
 .DESCRIPTION
 RuntimeInputs must already contain verified rust-image.json, node and
-toolchain-observation.json. PackagesVolume must contain the six independently
-verified packages under packages/; CargoVolume must contain the verified offline
+toolchain-observation.json. PackagesVolume must contain the independently
+verified packages under packages/ (six for update, four for uninstall);
+CargoVolume must contain the verified offline
 Cargo home under cargo/. This command does not acquire or repair those inputs.
 Every Docker command retains argv, output and result captures in a new evidence
 directory. Failed volumes and containers are preserved; only this generation's
@@ -21,6 +22,8 @@ param(
   [string]$CargoVolume = '',
   [string]$BackingVhd = '',
   [string]$DockerExecutable = '',
+  [ValidateSet('persistent-update-linux-host','persistent-uninstall-linux-host')]
+  [string]$ColdProfile = 'persistent-update-linux-host',
   [switch]$StartBuild
 )
 $ErrorActionPreference = 'Stop'
@@ -159,7 +162,12 @@ function Stop-LinuxHostBuildContainers($Context, $Errors) {
 
 function New-LinuxHostBuild([string]$Repository, [string]$Evidence, [string]$Inputs,
                             [string]$Packages, [string]$Cargo, [string]$Vhd,
-                            [bool]$Build=$false, [string]$Docker='') {
+                            [bool]$Build=$false, [string]$Docker='',
+                            [string]$Profile='persistent-update-linux-host') {
+  if ($Profile -cnotin @('persistent-update-linux-host','persistent-uninstall-linux-host')) {
+    throw 'fixed Linux cold qualification profile required'
+  }
+  $profileArguments = if ($Profile -ceq 'persistent-uninstall-linux-host') { @('--profile',$Profile) } else { @() }
   $Repository = Resolve-LinuxHostBuildPath $Repository Directory
   $Inputs = Resolve-LinuxHostBuildPath $Inputs Directory
   $Vhd = Resolve-LinuxHostBuildPath $Vhd File
@@ -177,7 +185,8 @@ function New-LinuxHostBuild([string]$Repository, [string]$Evidence, [string]$Inp
   $nodeSha = 'e32e2d16081cf644f88392934288086e7662529d0d43277c34f7aad2207cfafb'
   if ((Get-FileHash -LiteralPath (Join-Path $Inputs 'node') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $nodeSha) { throw 'verified pinned replay Node bytes required' }
   if ($Docker) { $Docker = Resolve-LinuxHostBuildPath $Docker File }
-  $generation = 'persistent-update-' + [DateTime]::UtcNow.ToString('yyyyMMdd') + '-linux-' + [Guid]::NewGuid().ToString('N').Substring(0,16)
+  $prefix = if ($Profile -ceq 'persistent-uninstall-linux-host') { 'persistent-uninstall-' } else { 'persistent-update-' }
+  $generation = $prefix + [DateTime]::UtcNow.ToString('yyyyMMdd') + '-linux-' + [Guid]::NewGuid().ToString('N').Substring(0,16)
   $nonce = [Guid]::NewGuid().ToString('N')
   if (!$Evidence) { $Evidence = Join-Path $Repository "artifacts/$generation" }
   $Evidence = Resolve-LinuxHostBuildPath $Evidence NewDirectory
@@ -190,7 +199,7 @@ function New-LinuxHostBuild([string]$Repository, [string]$Evidence, [string]$Inp
   $volumes = @{source="$generation-source";prep="$generation-prep";target="$generation-target"}
   Write-LinuxHostJson (Join-Path $Evidence 'generation.json') @{schemaVersion=1;generation=$generation;nonce=$nonce;volumes=$volumes
     repo=$Repository;runtimeInputs=$Inputs;packagesVolume=$Packages;cargoVolume=$Cargo;backingVhd=$Vhd
-    rustImage=$script:LinuxHostRustImage;runtimeInputsAlreadyVerifiedRequired=$true;finalSystemAccepted=$false}
+    rustImage=$script:LinuxHostRustImage;runtimeInputsAlreadyVerifiedRequired=$true;finalSystemAccepted=$false;profile=$Profile}
   try {
     $image = @(ConvertFrom-Json -AsHashtable (Invoke-LinuxHostDocker @('image','inspect',$script:LinuxHostRustImage) 'image-inspect' 180 $Docker))
     if ($image.Count -ne 1 -or $image[0].Id -cne $script:LinuxHostRustImage -or !$image[0].RootFS.Layers) { throw 'actual fixed Rust image differs' }
@@ -231,7 +240,7 @@ function New-LinuxHostBuild([string]$Repository, [string]$Evidence, [string]$Inp
       @{type='volume';source=$Cargo;target='/cargo-cache/cargo/registry';readonly=$true;subpath='cargo/registry'},
       @{type='bind';source=$Inputs;target='/runtime';readonly=$true},
       @{type='bind';source=$receipts;target='/cold-receipts';readonly=$true})
-    $common = @('python3','-B','/repo/scripts/boot/linux_host_freeze.py')
+    $common = @('python3','-B','/repo/scripts/boot/linux_host_freeze.py') + $profileArguments
     [void](Invoke-LinuxHostBuildContainer $context 'storage-probe' $mounts ($common+@('--stage','storage-probe','--root','/prep')))
     [void](Invoke-LinuxHostBuildContainer $context 'storage-reopen' $mounts ($common+@('--stage','storage-reopen','--root','/prep')))
     $prepared = Invoke-LinuxHostBuildContainer $context 'prepare' $mounts ($common+@('--stage','prepare','--root','/prep','--repo','/repo',
@@ -240,8 +249,8 @@ function New-LinuxHostBuild([string]$Repository, [string]$Evidence, [string]$Inp
     [void](Invoke-LinuxHostDocker @('cp',"${prepared}:/prep",(Join-Path $Evidence 'prepared')) 'prepared-export' 180 $Docker)
     if ($Build) {
       $buildMounts = $mounts + @(@{type='volume';source=$volumes.target;target='/target';readonly=$false})
-      [void](Invoke-LinuxHostBuildContainer $context 'build' $buildMounts @('python3','-B','/repo/scripts/boot/linux_host_build.py',
-        '--root','/prep','--repo','/repo','--freeze','/prep/freeze.json','--cargo-home','/cargo-cache/cargo','--target','/target','--packages-root','/packages') $false $true)
+      [void](Invoke-LinuxHostBuildContainer $context 'build' $buildMounts (@('python3','-B','/repo/scripts/boot/linux_host_build.py',
+        '--root','/prep','--repo','/repo','--freeze','/prep/freeze.json','--cargo-home','/cargo-cache/cargo','--target','/target','--packages-root','/packages') + $profileArguments) $false $true)
     }
     Write-LinuxHostJson (Join-Path $Evidence 'orchestration-result.json') @{status='prepared';buildStarted=$Build;containers=$context.containers;volumes=$volumes;formalQualification=$false;finalSystemAccepted=$false}
     Write-Output "Generation evidence: $Evidence"
@@ -255,5 +264,5 @@ function New-LinuxHostBuild([string]$Repository, [string]$Evidence, [string]$Inp
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-  New-LinuxHostBuild $Repo $EvidenceRoot $RuntimeInputs $PackagesVolume $CargoVolume $BackingVhd $StartBuild.IsPresent $DockerExecutable
+  New-LinuxHostBuild $Repo $EvidenceRoot $RuntimeInputs $PackagesVolume $CargoVolume $BackingVhd $StartBuild.IsPresent $DockerExecutable $ColdProfile
 }

@@ -17,6 +17,18 @@ RUST_IMAGE = 'sha256:88624fbbfcb6b7ac6f1207491053cbe6fd435262f0ce547443fb36760c7
 LABELS = ('read-file', 'image-viewer', 'text-entry-demo', 'old', 'new', 'absent-write')
 
 
+def package_paths_for(profile=q.DEFAULT_COLD_PROFILE, package_paths=None):
+    labels = tuple(q.package_contract(profile))
+    paths = {label: label for label in labels} if package_paths is None else dict(package_paths)
+    if (set(paths) != set(labels) or any(not isinstance(path, str) for path in paths.values())
+            or len(set(paths.values())) != len(labels)):
+        raise ValueError('exact distinct profile package paths required')
+    for name in paths.values():
+        if not name or name.startswith('/') or '\\' in name or any(part in ('', '.', '..') for part in name.split('/')):
+            raise ValueError('canonical relative package path required')
+    return {label: paths[label] for label in labels}
+
+
 def capacity_budget():
     gib = 1024 ** 3
     # Additional available capacity required before a cold build. Existing
@@ -96,13 +108,12 @@ def admit_storage(root, reopen=False):
 
 
 def _prepare(root, repo, cargo_home, packages_root, image_receipt, capacity_receipt,
-             node, node_sha256, package_paths=None, toolchain_receipt=None):
+             node, node_sha256, package_paths=None, toolchain_receipt=None, profile=q.DEFAULT_COLD_PROFILE):
+    profile = q.cold_profile(profile)
     root, repo, cargo_home, packages_root = map(q.checked_directory, (root, repo, cargo_home, packages_root))
     environment = q.observe_environment(repo)
     q.validate_environment(environment)
-    paths = package_paths or {label: label for label in LABELS}
-    if set(paths) != set(LABELS) or len(set(paths.values())) != len(LABELS):
-        raise ValueError('six distinct real Kotlin packages required')
+    paths = package_paths_for(profile, package_paths)
     first = q.read_json(root / 'storage-probe.json')
     second = q.read_json(root / 'storage-reopen.json')
     validate_reopen(first, second)
@@ -133,7 +144,7 @@ def _prepare(root, repo, cargo_home, packages_root, image_receipt, capacity_rece
         q.sync_directory(root)
         before = q.source_inventory(repo)
         packages = {}
-        for label in LABELS:
+        for label in paths:
             directory = package_path(packages_root, paths[label])
             files = q.tree_inventory(directory)
             result = q.execute(replay / label,
@@ -145,7 +156,7 @@ def _prepare(root, repo, cargo_home, packages_root, image_receipt, capacity_rece
                 raise ValueError('Kotlin package changed during replay')
             packages[label] = {'path': paths[label], 'files': files}
         q.verify_source(repo, before)
-        freeze = {'schemaVersion': 1, 'profile': 'persistent-update-linux-host',
+        freeze = {'schemaVersion': 1, 'profile': profile,
                   'source': {'files': before}, 'packages': packages,
                   'cargo': {'files': q.tree_inventory(cargo_home / 'registry')},
                   'cargoLock': q.stable_hash(repo / 'Cargo.lock'),
@@ -167,19 +178,20 @@ def _prepare(root, repo, cargo_home, packages_root, image_receipt, capacity_rece
             q.write_json(directory / 'admission.json', {'freezeSha256': digest,
                          'packageReplayFiles': freeze['packageReplayFiles'],
                          'storage': freeze['storage'], 'formalQualification': False})
-            return {'sourceFileCount': len(before), 'realKotlinPackages': list(LABELS),
+            return {'sourceFileCount': len(before), 'realKotlinPackages': list(paths),
                     'buildAccepted': False, 'guestStarted': False}
         q.run_stage(root, 'prepare', digest, seal)
         return freeze
 
 
 def prepare(root, repo, cargo_home, packages_root, image_receipt, capacity_receipt,
-            node, node_sha256, package_paths=None, toolchain_receipt=None):
+            node, node_sha256, package_paths=None, toolchain_receipt=None, profile=q.DEFAULT_COLD_PROFILE):
+    profile = q.cold_profile(profile)
     root = q.checked_directory(root)
     q.write_json(root / 'prepare-attempt.json', {'startedAt': q.now(), 'finalSystemAccepted': False})
     try:
         freeze = _prepare(root, repo, cargo_home, packages_root, image_receipt, capacity_receipt,
-                          node, node_sha256, package_paths, toolchain_receipt)
+                          node, node_sha256, package_paths, toolchain_receipt, profile)
     except Exception as error:
         q.write_json(root / 'prepare-result.json', {'status': 'failed', 'error': str(error),
                      'finishedAt': q.now(), 'finalSystemAccepted': False})
@@ -193,6 +205,7 @@ def prepare(root, repo, cargo_home, packages_root, image_receipt, capacity_recei
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stage', choices=('storage-probe', 'storage-reopen', 'prepare'), required=True)
+    parser.add_argument('--profile', choices=q.COLD_PROFILES, default=q.DEFAULT_COLD_PROFILE)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--repo', type=Path)
     parser.add_argument('--cargo-home', type=Path)
@@ -212,7 +225,7 @@ def main():
             parser.error('prepare requires explicit frozen source, dependency, image, capacity and replay inputs')
         prepare(args.root, args.repo, args.cargo_home, args.packages_root,
                 args.image_receipt, args.capacity_receipt, args.node, args.node_sha256,
-                toolchain_receipt=args.toolchain_receipt)
+                toolchain_receipt=args.toolchain_receipt, profile=args.profile)
 
 
 if __name__ == '__main__':

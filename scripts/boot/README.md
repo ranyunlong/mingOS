@@ -207,3 +207,11 @@ export 创建独立输出卷；verify/replay 仅挂载密封导出为只读与�
 导出自身的 stdlib bootstrap 和 checker。阶段性的 `/prep` 副本不是 portable export。
 公共冷构建把容量收据放在 `receipts/` 目录，运行时协调器保留 `/cold-receipts`
 映射用于独立重放。实现与控制测试通过不表示实际双启动或完整系统已验收。
+
+卸载使用独立入口 `new-linux-host-uninstall-runtime.ps1`，阶段和显式 review 流程相同。
+其冷构建必须由 `new-linux-host-build.ps1 -ColdProfile persistent-uninstall-linux-host`
+产生，包卷包含 `read-file`、`image-viewer`、`text-entry-demo`、`uninstall` 四个目录。
+`uninstall` 必须来自 `persistent-uninstall-demo` 的真实离线编译，身份为
+`dev.ming.install-demo/1.0.0/SDK6`。七条冷构建命令、卸载 helper、七步/一步输入、
+专用 checker 与实际几何执行收据全部独立绑定；update 冷代不能准入卸载运行。
+专用实现与合成回放通过仍不表示已执行真实卸载双启动或保留私有数据的资格。

@@ -172,6 +172,20 @@ try {
   Rejected { New-LinuxHostBuild $repository "$testRoot/evidence" "$testRoot/inputs" 'packages-control' 'cargo-control' "$testRoot/backing.vhdx" } 'existing generation reuse'
   if ($script:CoordinatorCalls.Count -ne $callsBefore) {throw 'existing evidence reached Docker'}
   $count++
+  $callsBefore=$script:CoordinatorCalls.Count
+  New-LinuxHostBuild $repository "$testRoot/uninstall-evidence" "$testRoot/inputs" 'packages-control' 'cargo-control' "$testRoot/backing.vhdx" $true '' 'persistent-uninstall-linux-host'
+  $uninstallState=Get-Content -LiteralPath "$testRoot/uninstall-evidence/generation.json" -Raw | ConvertFrom-Json -AsHashtable
+  if($uninstallState.profile -cne 'persistent-uninstall-linux-host' -or $uninstallState.generation -cnotmatch '^persistent-uninstall-'){throw 'uninstall cold profile identity missing'}
+  $newCalls=@($script:CoordinatorCalls | Select-Object -Skip $callsBefore)
+  foreach($stageName in @('prepare-create','build-create')){
+    $argv=@($newCalls | Where-Object {$_.name -ceq $stageName})[0].argv
+    $profileIndex=[Array]::IndexOf($argv,'--profile')
+    if($profileIndex -lt 0 -or $argv[$profileIndex+1] -cne 'persistent-uninstall-linux-host' -or @($argv|Where-Object {$_ -ceq '--profile'}).Count -ne 1){throw 'explicit uninstall profile not propagated exactly once'}
+  }
+  $count++
+  $callsBefore=$script:CoordinatorCalls.Count
+  Rejected {New-LinuxHostBuild $repository "$testRoot/rejected-evidence" "$testRoot/inputs" 'packages-control' 'cargo-control' "$testRoot/backing.vhdx" $true '' 'unknown'} 'unknown cold profile'
+  if($script:CoordinatorCalls.Count -ne $callsBefore -or (Test-Path "$testRoot/rejected-evidence")){throw 'unknown profile produced resources'}
 } finally {
   Set-Item Function:Invoke-LinuxHostDocker $originalDocker
   Remove-Item Function:Get-FileHash

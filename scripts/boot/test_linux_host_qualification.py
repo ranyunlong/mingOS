@@ -9,6 +9,31 @@ from unittest import mock
 import linux_host_qualification as q
 
 
+class ColdProfileControls(unittest.TestCase):
+    def test_uninstall_has_seven_exact_commands_without_update_recovery(self):
+        plan = q.build_commands('persistent-uninstall-linux-host')
+        self.assertEqual(len(plan), 7)
+        self.assertEqual(plan[4]['command'][-2:], ['--example', 'prepare_persistent_uninstall_fixture'])
+        names = ('ming_desktop::input_backpressure_tests::persistent_uninstall_fixture_writes_private_data_and_closes',
+                 'desktop_native::input_tests::persistent_uninstall_native_real_fixture_ready_close_reap_and_uninstall')
+        for entry, name in zip(plan[5:], names):
+            self.assertEqual(entry['command'], ['cargo', '+1.99.1', 'test', '--offline', '--locked', '--release',
+                '-p', 'ming-app-host', '--lib', name, '-j1', '--', '--exact', '--nocapture', '--ignored'])
+            self.assertEqual(entry['expectedSummary'], (1, 0, 0, 0))
+            self.assertEqual(entry['timeoutSeconds'], 900)
+        self.assertEqual(plan[:4], q.build_commands()[:4])
+
+    def test_profile_selection_is_closed_and_update_default_stays_exact(self):
+        self.assertEqual(q.build_commands(), q.build_commands('persistent-update-linux-host'))
+        self.assertEqual(len(q.build_commands()), 10)
+        self.assertEqual(q.package_contract('persistent-uninstall-linux-host'), {
+            'read-file': ('read-file', None), 'image-viewer': ('image-viewer', None),
+            'text-entry-demo': ('text-entry-demo', None), 'uninstall': ('persistent-uninstall-demo', None)})
+        for profile in ('persistent-uninstall', '', None, 'persistent-install-linux-host'):
+            with self.subTest(profile=profile), self.assertRaises(ValueError):
+                q.build_commands(profile)
+
+
 class QualificationControls(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

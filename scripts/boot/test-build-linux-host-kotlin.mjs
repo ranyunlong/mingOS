@@ -1,6 +1,7 @@
 // Contract tests use synthetic Wasm only; they are not Kotlin compiler evidence.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 import {mkdtemp, mkdir, writeFile, rm, symlink} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -18,6 +19,16 @@ test('actual wrapper command forces offline execution and external caches',()=>{
   assert.ok(args.includes('-PpersistentUpdateFixture=new'));
   assert.ok(args.includes('-Pkotlin.incremental=false'));
   assert.ok(args.includes('-Pkotlin.project.persistent.dir='+join('/work/one','kotlin-persistent')));
+});
+test('uninstall selects its own offline source task without update fixture arguments',()=>{
+  const options=parseOptions(['persistent-uninstall-demo']);
+  assert.equal(options.sample,'persistent-uninstall-demo');assert.equal(options.fixture,null);
+  const args=gradleArguments({...paths,...options});
+  assert.ok(args.includes(':persistent-uninstall-demo:compileProductionExecutableKotlinWasmWasi'));
+  for(const flag of ['--offline','--rerun-tasks','--no-build-cache','--no-configuration-cache'])assert.ok(args.includes(flag));
+  assert.ok(!args.some(arg=>arg.startsWith('-PpersistentUpdateFixture=')));
+  assert.ok(!args.includes(':persistent-update-demo:compileProductionExecutableKotlinWasmWasi'));
+  for(const fixture of ['old','new','absent-write'])assert.throws(()=>parseOptions(['persistent-uninstall-demo',fixture]));
 });
 test('compiler failure and signals cannot reach packaging',()=>{
   requireCompilerSuccess({exitCode:0,signal:null});
@@ -79,6 +90,53 @@ test('viewer, bootstrap and update use real adapter rewrite plus distinct capabi
     assert.throws(()=>validatePackage(wasm(textImports),'persistent-update-demo',fixture,updateManifest));
     validatePackage(wasm([...textImports,['ming_private_files_v2','call',4]]),'persistent-update-demo',fixture,updateManifest);
   }
+});
+const uninstallImports=[['ming_input_v1','poll',2],['ming_input_v1','text_focus',2],['ming_frame_v1','wait',4],['ming_v4','frame_submit',2],['wasi_snapshot_preview1','random_get',2],['ming_private_files_v2','call',4]];
+const uninstallManifest={schemaVersion:1,id:'dev.ming.install-demo',version:'1.0.0',sdkVersion:6,entry:'main.wasm'};
+test('uninstall validates its actual install-demo identity and SDK6 adapter contract',()=>{
+  const result=validatePackage(wasm(uninstallImports),'persistent-uninstall-demo',null,uninstallManifest);
+  assert.deepEqual(result.rewrites,[{from:'wasi_snapshot_preview1.random_get',to:'ming_v2.random_fill'}]);
+  assert.ok(result.imports.some(row=>row.module==='ming_private_files_v2'&&row.name==='call'));
+  for(const change of [{id:'dev.ming.persistent-update-demo'},{id:'dev.ming.persistent-uninstall-demo'},{version:'0.1.0'},{sdkVersion:2}])assert.throws(()=>validatePackage(wasm(uninstallImports),'persistent-uninstall-demo',null,{...uninstallManifest,...change}));
+  assert.throws(()=>validatePackage(wasm(uninstallImports),'persistent-uninstall-demo','old',uninstallManifest));
+});
+test('uninstall cannot package a text-only module without private file capability',()=>{
+  assert.throws(()=>validatePackage(wasm(uninstallImports.slice(0,-1)),'persistent-uninstall-demo',null,uninstallManifest),/Missing SDK capability ming_private_files_v2.call/);
+});
+test('uninstall replay binds its own manifest, compiler bytes and frozen source hashes',async()=>{
+  // Synthetic replay receipt exercises integrity gates, not actual Kotlin execution.
+  const root=await mkdtemp(join(tmpdir(),'mingos-uninstall-replay-')),repo=join(root,'repo'),directory=join(root,'package');
+  const digest=bytes=>createHash('sha256').update(bytes).digest('hex');
+  const save=async(path,value)=>writeFile(path,JSON.stringify(value));
+  try{
+    await mkdir(directory);await mkdir(join(directory,'evidence'));
+    const directories=['samples','samples/persistent-uninstall-demo','samples/persistent-uninstall-demo/src','samples/persistent-uninstall-demo/src/wasmWasiMain','samples/persistent-uninstall-demo/src/wasmWasiMain/kotlin','ming-sdk','ming-compose','probes/compose-wasi/port','probes/compose-frame/coroutines-port','gradle'].sort();
+    for(const name of directories)await mkdir(join(repo,name),{recursive:true});
+    await mkdir(join(repo,'scripts/boot'),{recursive:true});
+    const manifestRaw=Buffer.from(JSON.stringify(uninstallManifest));
+    const sourcePath='samples/persistent-uninstall-demo/src/wasmWasiMain/kotlin/Main.kt';
+    const sources=Object.fromEntries(['settings.gradle.kts','build.gradle.kts','gradle.properties','gradlew','scripts/build-kotlin.mjs','scripts/wasm-sdk-adapter.mjs','scripts/boot/build-linux-host-kotlin.mjs','scripts/boot/linux-host-kotlin.init.gradle'].map(name=>[name,Buffer.from('synthetic input '+name)]));
+    sources['samples/persistent-uninstall-demo/app.json']=manifestRaw;sources[sourcePath]=Buffer.from('synthetic uninstall source');
+    for(const [name,bytes]of Object.entries(sources))await writeFile(join(repo,name),bytes);
+    const before={files:Object.fromEntries(Object.entries(sources).map(([name,bytes])=>[name,digest(bytes)])),directories};
+    const raw=wasm(uninstallImports),result=validatePackage(raw,'persistent-uninstall-demo',null,uninstallManifest);
+    const info={kotlin:'2.3.20',adapterVersion:1,rawPath:join(directory,'compiler.wasm'),compilerOutputPath:'/work/builds/uninstall/compileSync/productionExecutable/uninstall.wasm',rawSha256:digest(raw),packagedSha256:digest(result.bytes),rewrites:result.rewrites,fixture:null,sdkVersion:6,composeRuntimeSource:'1.10.0',coroutinesSource:'1.9.0',sdkSourcePath:'ming-sdk/src/wasmWasiMain/kotlin',inputSha256:before.files,imports:result.imports,exports:result.exports};
+    const command=['/jdk/bin/java',...gradleArguments({...paths,repo,sample:'persistent-uninstall-demo',fixture:null})];
+    const stdout=Buffer.from('> Task :persistent-uninstall-demo:compileProductionExecutableKotlinWasmWasi\nBUILD SUCCESSFUL\n'),stderr=Buffer.alloc(0);
+    const deps={manifestSha256:'a'.repeat(64),files:{'caches/modules-2/files-2.1/synthetic.jar':'b'.repeat(64)},directories:[]};
+    const evidence={
+      'command.json':{argv:command,cwd:repo,environment:{}},'inputs-before.json':before,'inputs-after.json':before,
+      'toolchain.json':{node:'v24.22.1',nodePath:'/node',nodeSha256:'c'.repeat(64),javaPath:'/jdk/bin/java',javaSha256:'d'.repeat(64),gradle:'8.14.5',gradleDistributionSha256:'6f74b601422d6d6fc4e1f9a1ab6522f642c2fdcbc15ae33ebd30ba3d7198e854',dependencyManifestSha256:deps.manifestSha256},
+      'java.stdout.log':'','java.stderr.log':'openjdk version "21.0.13"\n','gradle-version.stdout.log':'Gradle 8.14.5\n','gradle-version.stderr.log':'','build.stdout.log':stdout,'build.stderr.log':stderr,
+      'dependencies-before.json':deps,'dependencies-after.json':deps,'dependencies-comparison.json':{immutableFiles:deps.files,derivedChanges:[]}};
+    const evidenceSha256={};for(const [name,value]of Object.entries(evidence)){const bytes=Buffer.isBuffer(value)?value:Buffer.from(typeof value==='string'?value:JSON.stringify(value));await writeFile(join(directory,'evidence',name),bytes);evidenceSha256['evidence/'+name]=digest(bytes)}
+    const receipt={schemaVersion:1,status:'passed',sample:'persistent-uninstall-demo',fixture:null,kotlin:'2.3.20',composeRuntimeSource:'1.10.0',coroutinesSource:'1.9.0',offline:true,formalQualification:false,finalSystemAccepted:false,cwd:repo,compilerExitCode:0,compilerSignal:null,command,inputSha256:before.files,inputDirectories:before.directories,rawSha256:info.rawSha256,packagedSha256:info.packagedSha256,manifestSha256:digest(manifestRaw),package:info,stdoutSha256:digest(stdout),stderrSha256:digest(stderr),dependencyManifestSha256:deps.manifestSha256,evidenceSha256};
+    await writeFile(join(directory,'compiler.wasm'),raw);await writeFile(join(directory,'main.wasm'),result.bytes);await writeFile(join(directory,'app.json'),manifestRaw);await save(join(directory,'build-info.json'),info);await save(join(directory,'build-receipt.json'),receipt);
+    const verified=await verifyPackage({repo,directory});assert.equal(verified.sample,'persistent-uninstall-demo');assert.equal(verified.fixture,null);assert.equal(verified.packagedSha256,digest(result.bytes));
+    await writeFile(join(directory,'main.wasm'),Buffer.from('substituted package'));await assert.rejects(verifyPackage({repo,directory}),/adapter replay differs/);await writeFile(join(directory,'main.wasm'),result.bytes);
+    await writeFile(join(repo,sourcePath),'changed uninstall source');await assert.rejects(verifyPackage({repo,directory}),/Kotlin source inputs changed/);await writeFile(join(repo,sourcePath),sources[sourcePath]);
+    await writeFile(join(directory,'app.json'),JSON.stringify({...uninstallManifest,id:'dev.ming.persistent-update-demo'}));await assert.rejects(verifyPackage({repo,directory}));
+  }finally{await rm(root,{recursive:true,force:true})}
 });
 test('package replay rejects failed receipts and evidence traversal before trusting bytes',async()=>{
   const directory=await mkdtemp(join(tmpdir(),'mingos-kotlin-replay-'));

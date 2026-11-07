@@ -22,6 +22,26 @@ STAGES = ('source-check', 'storage-admission', 'prepare', 'build', 'bundle',
           'admission', 'pair', 'export', 'verify')
 EXCLUDED = {'.git', '.cache', '.gradle', '.kotlin', '.codegraph', '.superpowers',
             'artifacts', 'node_modules', 'target', 'build', 'builds', '__pycache__', 'dist'}
+DEFAULT_COLD_PROFILE = 'persistent-update-linux-host'
+COLD_PROFILES = (DEFAULT_COLD_PROFILE, 'persistent-uninstall-linux-host')
+
+
+def cold_profile(profile=DEFAULT_COLD_PROFILE):
+    if not isinstance(profile, str) or profile not in COLD_PROFILES:
+        raise ValueError('explicit supported Linux cold profile required')
+    return profile
+
+
+def package_contract(profile=DEFAULT_COLD_PROFILE):
+    profile = cold_profile(profile)
+    packages = {'read-file': ('read-file', None), 'image-viewer': ('image-viewer', None),
+                'text-entry-demo': ('text-entry-demo', None)}
+    if profile == 'persistent-uninstall-linux-host':
+        packages['uninstall'] = ('persistent-uninstall-demo', None)
+    else:
+        packages.update({'old': ('persistent-update-demo', 'old'), 'new': ('persistent-update-demo', 'new'),
+                         'absent-write': ('persistent-update-demo', 'absent-write')})
+    return packages
 
 
 def now():
@@ -370,14 +390,23 @@ def verify_stage(root, stage, freeze_sha256):
     return record
 
 
-def build_commands():
+def build_commands(profile=DEFAULT_COLD_PROFILE):
+    profile = cold_profile(profile)
     prefix = ['cargo', '+1.99.1']
     common = ['--offline', '--locked', '--release', '-p', 'ming-app-host']
     initial = [('test', ['--all-targets']), ('check', ['--all-features', '--all-targets']),
                ('check', ['--no-default-features', '--all-targets']), ('build', ['--bin', 'ming-app-host']),
-               ('build', ['--example', 'prepare_persistent_update_fixture'])]
+               ('build', ['--example', 'prepare_persistent_uninstall_fixture' if profile == 'persistent-uninstall-linux-host'
+                          else 'prepare_persistent_update_fixture'])]
     result = [{'command': prefix + [verb] + common + ['-j1'] + args, 'timeoutSeconds': 1800,
                'expectedSummary': None} for verb, args in initial]
+    if profile == 'persistent-uninstall-linux-host':
+        for name in ('ming_desktop::input_backpressure_tests::persistent_uninstall_fixture_writes_private_data_and_closes',
+                     'desktop_native::input_tests::persistent_uninstall_native_real_fixture_ready_close_reap_and_uninstall'):
+            result.append({'command': prefix + ['test'] + common + ['--lib', name, '-j1',
+                           '--', '--exact', '--nocapture', '--ignored'], 'timeoutSeconds': 900,
+                           'expectedSummary': (1, 0, 0, 0)})
+        return result
     namespace = 'ming_desktop::persistent_update_runtime::'
     for name in ('migrated_and_absent_write_commit_only_after_real_ready_close_reap',
                  'absent_nonempty_runtime_failure_rolls_back_original_missing_namespace',
@@ -397,6 +426,7 @@ def build_commands():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--profile', choices=COLD_PROFILES, default=DEFAULT_COLD_PROFILE)
     parser.add_argument('--stage', choices=STAGES, required=True)
     parser.add_argument('--repo', type=Path, required=True)
     parser.add_argument('--root', type=Path, required=True)

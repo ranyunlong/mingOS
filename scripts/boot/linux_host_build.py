@@ -25,6 +25,13 @@ ARTIFACT_PATHS = ('release/ming-app-host', 'release/examples/prepare_persistent_
 ARTIFACT_LIMIT = 512 * 1024 * 1024
 
 
+def artifact_paths(profile=q.DEFAULT_COLD_PROFILE):
+    profile = q.cold_profile(profile)
+    if profile == 'persistent-uninstall-linux-host':
+        return ('release/ming-app-host', 'release/examples/prepare_persistent_uninstall_fixture')
+    return ARTIFACT_PATHS
+
+
 def relative_path(value):
     if (not isinstance(value, str) or not value or '\\' in value
             or PurePosixPath(value).is_absolute() or any(p in ('', '.', '..') for p in value.split('/'))):
@@ -110,8 +117,11 @@ def validate_cargo_config(repo, cargo_home):
         raise ValueError('release profile must retain optimized non-debug defaults')
 
 
-def verify_package(directory, label, source):
-    sample, fixture = PACKAGES[label]
+def verify_package(directory, label, source, profile=q.DEFAULT_COLD_PROFILE):
+    packages = q.package_contract(profile)
+    if label not in packages:
+        raise ValueError('package label is not in cold profile: ' + str(label))
+    sample, fixture = packages[label]
     receipt = q.read_json(directory / 'build-receipt.json')
     info = q.read_json(directory / 'build-info.json')
     manifest = q.read_json(directory / 'app.json')
@@ -143,29 +153,35 @@ def verify_package(directory, label, source):
     if receipt.get('package') != info:
         raise ValueError('package build-info differs: ' + label)
     sdk = 1 if label == 'read-file' else 2 if label == 'image-viewer' else 6
-    if (manifest.get('schemaVersion') != 1 or manifest.get('id') != 'dev.ming.' + sample
+    expected_id = 'dev.ming.install-demo' if label == 'uninstall' else 'dev.ming.' + sample
+    expected_version = '1.0.0' if label == 'uninstall' else '0.2.0' if fixture in ('new', 'absent-write') else '0.1.0'
+    if (manifest.get('schemaVersion') != 1 or manifest.get('id') != expected_id
             or manifest.get('sdkVersion') != sdk or manifest.get('entry') != 'main.wasm'
-            or manifest.get('version') != ('0.2.0' if fixture in ('new', 'absent-write') else '0.1.0')):
+            or manifest.get('version') != expected_version):
         raise ValueError('package manifest identity differs: ' + label)
 
 
 def input_snapshot(repo, cargo_home, packages_root, value):
     packages = {}
     paths = []
-    if set(value['packages']) != set(PACKAGES):
-        raise ValueError('exact six package labels required')
+    contract = q.package_contract(value['profile'])
+    if set(value['packages']) != set(contract):
+        raise ValueError('exact profile package labels required')
     for label, record in value['packages'].items():
         relative = relative_path(record['path'])
         directory = packages_root / relative
         paths.append(directory)
         packages[label] = q.tree_inventory(directory)
-    if len(set(paths)) != len(PACKAGES) or any(a in b.parents or b in a.parents for n, a in enumerate(paths) for b in paths[n + 1:]):
+    if len(set(paths)) != len(contract) or any(a in b.parents or b in a.parents for n, a in enumerate(paths) for b in paths[n + 1:]):
         raise ValueError('package directories overlap')
     return {'source': q.source_inventory(repo), 'cargoLock': q.stable_hash(repo / 'Cargo.lock'),
             'registry': q.tree_inventory(cargo_home / 'registry'), 'packages': packages}
 
 
 def verify_inputs(snapshot, value):
+    labels = set(q.package_contract(value['profile']))
+    if set(value['packages']) != labels or set(snapshot['packages']) != labels:
+        raise ValueError('frozen profile package set is incomplete or changed')
     if snapshot['source'] != value['source']['files'] or snapshot['cargoLock'] != value['cargoLock']:
         raise ValueError('frozen source files or Cargo.lock changed')
     if not snapshot['registry'] or snapshot['registry'] != value['cargo']['files']:
@@ -174,20 +190,26 @@ def verify_inputs(snapshot, value):
         raise ValueError('frozen package tree or evidence changed')
 
 
-def build_environment(cargo_home, target, stage, packages_root, paths):
+def build_environment(cargo_home, target, stage, packages_root, paths, profile=q.DEFAULT_COLD_PROFILE):
+    profile = q.cold_profile(profile)
+    freezer.package_paths_for(profile, paths)
     # Construct a fresh allowlist: no inherited RUSTFLAGS, Cargo profiles,
     # compiler/linker wrappers, CC/CFLAGS, preload variables or tool search path.
-    return {'PATH': '/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    environment = {'PATH': '/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
             'HOME': str(stage / 'home'), 'TMPDIR': str(stage / 'tmp'), 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
             'RUSTUP_HOME': '/usr/local/rustup', 'RUSTUP_AUTO_INSTALL': '0',
             'CARGO_HOME': str(cargo_home), 'CARGO_TARGET_DIR': str(target),
             'CARGO_BUILD_JOBS': '1', 'CARGO_NET_OFFLINE': 'true',
-            'MING_TEST_PRIVATE_WORKER': str(target / 'release/ming-app-host'),
+            'MING_TEST_PRIVATE_WORKER': str(target / 'release/ming-app-host')}
+    if profile == 'persistent-uninstall-linux-host':
+        environment['MING_UNINSTALL_FIXTURE_WASM'] = str(packages_root / paths['uninstall'] / 'main.wasm')
+        return environment
+    return dict(environment, **{
             'MING_UPDATE_FIXTURE_HELPER': str(target / 'release/examples/prepare_persistent_update_fixture'),
             'MING_UPDATE_BOOTSTRAP_WASM': str(packages_root / paths['text-entry-demo'] / 'main.wasm'),
             'MING_UPDATE_OLD_WASM': str(packages_root / paths['old'] / 'main.wasm'),
             'MING_UPDATE_NEW_WASM': str(packages_root / paths['new'] / 'main.wasm'),
-            'MING_UPDATE_ABSENT_WASM': str(packages_root / paths['absent-write'] / 'main.wasm')}
+            'MING_UPDATE_ABSENT_WASM': str(packages_root / paths['absent-write'] / 'main.wasm')})
 
 
 def summarize(raw, expected):
@@ -229,11 +251,11 @@ def _artifact_fd_hash(fd, expected):
     return {'sha256': digest.hexdigest(), 'bytes': size}
 
 
-def seal_artifacts(target):
+def seal_artifacts(target, profile=q.DEFAULT_COLD_PROFILE):
     """Detach only Cargo's two fixed executable aliases; global hashing stays strict."""
     target = q.checked_directory(Path(target))
     receipts = {}
-    for name in ARTIFACT_PATHS:
+    for name in artifact_paths(profile):
         path = target / name
         parent = q.open_directory(path.parent)
         source, temporary, owned_temporary, temporary_object = None, None, False, None
@@ -316,9 +338,9 @@ def seal_artifacts(target):
     return receipts
 
 
-def built_artifacts(target):
+def built_artifacts(target, profile=q.DEFAULT_COLD_PROFILE):
     result = {}
-    for name in ARTIFACT_PATHS:
+    for name in artifact_paths(profile):
         path = target / name
         result[name] = q.stable_hash(path)
         with path.open('rb') as stream:
@@ -328,8 +350,9 @@ def built_artifacts(target):
     return result
 
 
-def run_build(root, repo, freeze, cargo_home, target, packages_root):
+def run_build(root, repo, freeze, cargo_home, target, packages_root, profile=q.DEFAULT_COLD_PROFILE):
     """Execute one admitted freeze exactly once, retaining every failed attempt."""
+    profile = q.cold_profile(profile)
     root, repo, cargo_home, target, packages_root = map(q.checked_directory, map(Path, (root, repo, cargo_home, target, packages_root)))
     freeze = Path(freeze)
     if not freeze.is_absolute():
@@ -353,7 +376,7 @@ def run_build(root, repo, freeze, cargo_home, target, packages_root):
         frozen_hash = q.stable_hash(freeze)
         value = q.read_json(freeze)
         if (type(value.get('schemaVersion')) is not int or value['schemaVersion'] != 1
-                or value.get('profile') != 'persistent-update-linux-host'):
+                or value.get('profile') != profile):
             raise ValueError('new Linux build freeze schema/profile required')
         q.verify_stage(root, 'prepare', frozen_hash['sha256'])
         prepared_hash = validate_admission(root, value, frozen_hash['sha256'])
@@ -364,7 +387,7 @@ def run_build(root, repo, freeze, cargo_home, target, packages_root):
         snapshot = input_snapshot(repo, cargo_home, packages_root, value)
         verify_inputs(snapshot, value)
         for label, record in value['packages'].items():
-            verify_package(packages_root / record['path'], label, snapshot['source'])
+            verify_package(packages_root / record['path'], label, snapshot['source'], profile)
         for label in ('read-file', 'image-viewer'):
             if q.tree_inventory(repo / 'artifacts' / label) != snapshot['packages'][label]:
                 raise ValueError('Rust host-test package projection differs: ' + label)
@@ -373,14 +396,14 @@ def run_build(root, repo, freeze, cargo_home, target, packages_root):
             q.write_json(directory / 'environment.json', observed)
             q.write_json(directory / 'cold-target.json', {'path': str(target), 'identity': identity, 'entries': [], 'literalEmpty': True})
             env = build_environment(cargo_home, target, directory, packages_root,
-                                    {label: record['path'] for label, record in value['packages'].items()})
+                                    {label: record['path'] for label, record in value['packages'].items()}, profile)
             initial_env = {key: val for key, val in env.items() if not key.startswith('MING_')}
             for name in ('home', 'tmp', 'commands'):
                 (directory / name).mkdir(mode=0o700)
             q.write_json(directory / 'build-environment.json', {'initial': initial_env, 'explicit': env})
             results = []
             try:
-                for number, entry in enumerate(q.build_commands(), 1):
+                for number, entry in enumerate(q.build_commands(profile), 1):
                     session.check_identity()
                     q.verify_source(repo, value['source']['files'])
                     current = target.stat(follow_symlinks=False)
@@ -401,10 +424,10 @@ def run_build(root, repo, freeze, cargo_home, target, packages_root):
                         q.write_json(command_root / 'summary.json', summary)
                     results.append({'number': number, 'result': result})
                     if number == 5:
-                        q.write_json(directory / 'pre-explicit-artifact-seal.json', seal_artifacts(target))
-                        q.write_json(directory / 'pre-explicit-artifacts.json', built_artifacts(target))
-                q.write_json(directory / 'final-artifact-seal.json', seal_artifacts(target))
-                q.write_json(directory / 'artifacts.json', built_artifacts(target))
+                        q.write_json(directory / 'pre-explicit-artifact-seal.json', seal_artifacts(target, profile))
+                        q.write_json(directory / 'pre-explicit-artifacts.json', built_artifacts(target, profile))
+                q.write_json(directory / 'final-artifact-seal.json', seal_artifacts(target, profile))
+                q.write_json(directory / 'artifacts.json', built_artifacts(target, profile))
                 return {'coldBuildCommands': len(results), 'target': str(target),
                         'formalQualification': False, 'finalSystemAccepted': False}
             finally:
@@ -428,10 +451,11 @@ def run_build(root, repo, freeze, cargo_home, target, packages_root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--profile', choices=q.COLD_PROFILES, default=q.DEFAULT_COLD_PROFILE)
     for name in ('root', 'repo', 'freeze', 'cargo-home', 'target', 'packages-root'):
         parser.add_argument('--' + name, required=True, type=Path)
     args = parser.parse_args()
-    run_build(args.root, args.repo, args.freeze, args.cargo_home, args.target, args.packages_root)
+    run_build(args.root, args.repo, args.freeze, args.cargo_home, args.target, args.packages_root, args.profile)
 
 
 if __name__ == '__main__':

@@ -933,6 +933,60 @@ mod input_tests {
             "boot1Points":boot1,"boot2Points":[dock_point,power_point]}));
     }
     #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_uninstall_two_app_input_geometry() {
+        use crate::graphics::desktop_shell::{power_cell,storage_prompt_geometry,dock_storage_cell,StoragePrompt};
+        let (width,height)=(1280,800);
+        let mut model=crate::desktop_model::DesktopModel::new(width,height).unwrap();
+        model.open(1).unwrap();let (window,_)=model.open(2).unwrap();
+        let outer=model.view(window).unwrap().outer;
+        let install=install_cell(width,height);let power=power_cell(width,height);
+        let id="dev.ming.install-demo";let version="1.0.0";
+        let fixture:serde_json::Value=serde_json::from_slice(include_bytes!("../../../samples/persistent-uninstall-demo/app.json")).unwrap();
+        assert_eq!(fixture["id"],id);assert_eq!(fixture["version"],version);assert_eq!(fixture["sdkVersion"],6);
+        let install_prompt=StoragePrompt::install(id,version,&"0".repeat(64),false,false,false).unwrap();
+        let uninstall_prompt=StoragePrompt::uninstall(id,version,&"0".repeat(64),false).unwrap();
+        assert_eq!(install_prompt.state_value()["mode"],16);
+        assert_eq!(uninstall_prompt.state_value()["mode"],10);
+        assert!(install_prompt.has_allow() && uninstall_prompt.has_allow());
+        let install_allow=storage_prompt_geometry(width,height,!install_prompt.has_allow()).unwrap().allow.unwrap();
+        let uninstall_allow=storage_prompt_geometry(width,height,!uninstall_prompt.has_allow()).unwrap().allow.unwrap();
+        let dock=dock_cell(width,height,1,2);
+        let uninstall=dock_uninstall_cell(width,height,1,2);
+        let center=|r:Rect|[r.x+r.width/2,r.y+r.height/2];
+        let install_point=center(install);let install_allow_point=center(install_allow);
+        let uninstall_point=center(uninstall);let uninstall_allow_point=center(uninstall_allow);
+        let power_point=center(power);let dock_point=[dock.x+dock.width/2,dock.y+30];
+        let close_point=[outer.x+16,outer.y+16];
+        assert!(dock.contains(dock_point[0],dock_point[1]));
+        assert!(uninstall.contains(uninstall_point[0],uninstall_point[1]));
+        for control in [dock_purge_cell(width,height,1,2),uninstall,dock_storage_cell(width,height,1,2)] {
+            assert!(!control.contains(dock_point[0],dock_point[1]));
+        }
+        for control in [dock_purge_cell(width,height,1,2),dock_storage_cell(width,height,1,2)] {
+            assert!(!control.contains(uninstall_point[0],uninstall_point[1]));
+        }
+        assert_eq!(model.views().into_iter().rev().find(|v|v.outer.contains(close_point[0],close_point[1])).unwrap().app,2);
+        model.close(window).unwrap();
+        assert!(model.views().iter().all(|v|v.app==1));
+        // Closing the worker window does not remove its catalog Dock cell;
+        // the U target still uses index1/count2 until the uninstall commits.
+        let boot1=[install_point,install_allow_point,dock_point,close_point,uninstall_point,uninstall_allow_point,power_point];
+        let boot2=[power_point];
+        assert_eq!(boot1,[[1148,12],[880,478],[676,766],[96,104],[656,748],[880,478],[1238,12]]);
+        assert_eq!(boot2,[[1238,12]]);
+        let rect=|r:Rect|serde_json::json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height});
+        println!("MING_PERSISTENT_UNINSTALL_GEOMETRY {}",serde_json::json!({"schemaVersion":1,"width":width,"height":height,
+            "target":{"app":2,"packageId":id,"version":version,"sdkVersion":6},
+            "install":{"rect":rect(install),"point":install_point},
+            "installAllow":{"mode":16,"rect":rect(install_allow),"point":install_allow_point},
+            "app2Dock":{"index":1,"count":2,"rect":rect(dock),"point":dock_point},
+            "app2Window":{"outer":rect(outer),"closePoint":close_point},
+            "app2Uninstall":{"index":1,"count":2,"rect":rect(uninstall),"point":uninstall_point},
+            "uninstallAllow":{"mode":10,"rect":rect(uninstall_allow),"point":uninstall_allow_point},
+            "power":{"rect":rect(power),"point":power_point},"boot1Points":boot1,"boot2Points":boot2}));
+    }
+    #[cfg(target_os = "linux")]
     fn uninstall_native_app(qualification: Option<&str>) -> (tempfile::TempDir, NativeDesktop, DesktopShell) {
         uninstall_native_app_with_wasm(qualification, None)
     }

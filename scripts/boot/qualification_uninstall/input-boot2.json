@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "requireApps": [
+    1
+  ],
+  "steps": [
+    {
+      "name": "power-off-reopened",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 1238,
+          "y": 12
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "phase": "stopped"
+      }
+    }
+  ]
+}

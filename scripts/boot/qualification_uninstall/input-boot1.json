@@ -1,0 +1,201 @@
+{
+  "schemaVersion": 1,
+  "requireApps": [
+    1
+  ],
+  "steps": [
+    {
+      "name": "native-install",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 1148,
+          "y": 12
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "storagePrompt": {
+          "mode": 16,
+          "packageId": "dev.ming.install-demo",
+          "version": "1.0.0",
+          "hasAllow": true
+        },
+        "rootAdvance": true,
+        "storagePromptPresented": true
+      }
+    },
+    {
+      "name": "confirm-install",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 880,
+          "y": 478
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "storagePrompt": null,
+        "rootAdvance": true
+      }
+    },
+    {
+      "name": "dock-launch-app2",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 676,
+          "y": 766
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "apps": [
+          {
+            "app": 2,
+            "state": "running",
+            "generation": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "close-app2-after-ready",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 96,
+          "y": 104
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "apps": [
+          {
+            "app": 2,
+            "state": "closed",
+            "generation": 1
+          }
+        ]
+      },
+      "requireApps": [
+        1,
+        2
+      ]
+    },
+    {
+      "name": "native-uninstall-app2",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 656,
+          "y": 748
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "storagePrompt": {
+          "mode": 10,
+          "packageId": "dev.ming.install-demo",
+          "version": "1.0.0",
+          "hasAllow": true
+        },
+        "rootAdvance": true,
+        "storagePromptPresented": true
+      }
+    },
+    {
+      "name": "confirm-uninstall",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 880,
+          "y": 478
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "storagePrompt": null,
+        "rootAdvance": true
+      }
+    },
+    {
+      "name": "power-off-after-uninstall",
+      "events": [
+        {
+          "kind": "pointer",
+          "x": 1238,
+          "y": 12
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": true
+        },
+        {
+          "kind": "button",
+          "button": "left",
+          "down": false
+        }
+      ],
+      "expect": {
+        "phase": "stopped"
+      }
+    }
+  ]
+}
