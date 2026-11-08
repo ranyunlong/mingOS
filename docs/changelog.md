@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-08 — P01 S2全新环境实际验收通过
+
+- 已复核提交`5ac0edd`在全新`f4244bac`正式create退出0；独立standalone前后witness、公共observe和显式Linux argv exec均通过。独立实际审查21项门槛全部通过，仅接受P01-S2。
+- 新distro/VHD/daemon/store、首次空存储、固定三镜像load/inspect、实际专属namespace、私有mount/cgroup/managed-containerd和有效受限smoke均有原始证据。8镜像、613旧容器、224卷完整前后对象严格一致，唯一新增为本代stopped export；DNS等价列表为空，本次未使用例外。
+- 封存365个不可变证据文件及8目录，manifest SHA256`77be28e82cf1380fd7c1c2f3cd78d42a1520a148724d9bccac60b30a090072bf`；明确排除live VHD字节及自引用输出，原始身份/大小观察仍保留。
+- 独立JSON的原报告引用摘要过期被controller拒绝，未写验收packet；原件保留，独立新v2修正引用后全部refs重核通过。新packet-v2的s2-acceptance SHA256`44a5c2a4056288c75400aae012b2970c9994f144cdab8bf6e2e210c7d1e75fda`，供S3按独立复核的格式绑定，不能只看ready/collector状态。
+- S1/S2已验收；S3格式衔接及源码/缓存/真实应用构建继续，S4–S6仍必需。P01未完成，11项目总交付仍0/11；正式资格/最终系统/冷构建/P01完成标志均false。所有历史失败代保持不合格并完整保留。
+
 ## 2026-11-08 — S2实际namespace修复与旧资源DNS表示差异
 
 - CLI修复提交`28a67af`在两全新代`dbdcae92`、`4b1bac35`完成实际专属Containers/Plugins namespace、三个固定镜像的严格load/inspect及有效受限smoke；两代均在外层旧资源保全阶段退出1，仍为NOT ACCEPTED。

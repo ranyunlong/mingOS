@@ -68,7 +68,7 @@ guest-c daemon ID：`81326b10-1096-4e41-a8a0-0303a61dd95e`；driver `overlayfs`�
 
 ## 状态
 
-P01 S1公共严格导入已通过实际大包导入和独立只读重开及独立复核。WSL实验已完成三镜像加载和实际受限容器，但S2公共化及S3–S6源码/缓存消费、真实编译、新包装配和持久化验收继续。全部11项新项目仍为0项完成并发布；原开发VM交付与正式验收标志保持原范围。
+P01 S1公共严格导入已通过实际大包导入和独立只读重开及独立复核；S2公共环境随后在全新f4244bac通过21门实际独立验收，详见本文末尾。S3–S6源码/缓存消费、真实编译、新包装配和持久化验收继续。全部11项新项目仍为0项完成并发布；原开发VM交付与正式验收标志保持原范围。
 
 
 ## S2公共入口与首次正式代的真实阻断（2026-11-08）
@@ -105,3 +105,15 @@ CLI最小修复只修改guest配置和实际dockerd启动两行，host及全部�
 该规则的宿主实现已完成真实RED7项运行/3断言失败、focused GREEN7项和完整Windows host39项通过；冻结Linux公共闭包`artifacts/p01-s2-public-controls-20261108-7467939a/`为146项运行、145通过、1项Windows junction专属跳过、零失败/错误，容器`1325701bc1635a3ab3657db6b8abe4a86ed40895e95f96bcb4f06261a5289dcf`退出0且非OOM。原始对象不改，返回独立`equivalences`数组，每次例外记录固定policy/source及raw值/版本。此为实现与控制证据，源码独立复核和新代实际验收仍单独进行。
 
 独立源码复核现为Spec PASS/Task quality Approved，无Critical/Important/Minor；核对精确版本/key/type门、其他字段和资源严格性、raw不变/证据不别名，以及同一显式transport的endpoint绑定。主执行者另重算全部18个冻结源/测试文件与当前工作树pin一致。接下来须从已复核提交创建全新代，完成独立observe/exec和完整实际复核；源码批准不接受S2。
+
+## S2正式新代f4244bac独立验收通过（2026-11-08）
+
+实现提交`5ac0edd5feb525951e44faffbc935e4b4eee586f`的干净源码在全新`MingOS-P01-20261108-f4244bac`执行一次正式create，退出0；证据根`artifacts/p01-s2-formal-20261108-f4244bac/`。原始receipt14222031字节、SHA256`60a8b23dd0118a6e37f5b6b924f32ee9ef21c2b12b31b0eea3fd36e1d92d0ea6`。随后独立冻结witness前后观察、公共observe及exec全部成功；证据子目录`independent-observe-b9b7080d18a34edd9cdb192527044d60/`。collector保持其原s2Accepted=false，独立审查另给ACCEPTED结论。
+
+独立实际21门全部通过、无未解决项：S1完整来源、固定bundle/rootfs/Tools、全部五模块冻结、首次空store及fsync/顺序、三次严格index/Config/有序RootFS载入、实际专属Containers/Plugins、daemon环境、PID/starttime/exe/ns/socket与managed containerd、O_PATH可见私有tmpfs、外部无owned mount peer、private cgroup及共享祖先未变、有效受限smoke、完整旧资源保全和公共followups。实际daemon`68548c05-9c7f-459e-b6d7-73466f58bd4c`，smoke`e067393473ff9f4e3b7408b1a0c02cdf85f5f0120e31c9d33cc15a55940463b2`退出0且非OOM。8镜像、613旧容器、224卷的完整对象严格相同，唯一新增为本代stopped export`5aed299cd0b395992106e0867d1408bb75e3be14a2a4e61a775625fc9ba2100a`。等价列表为空，本次没有实际使用DNS例外。
+
+`qualification-evidence/manifest.json`62529字节、SHA256`77be28e82cf1380fd7c1c2f3cd78d42a1520a148724d9bccac60b30a090072bf`封存365文件/8目录，独立精确枚举并全部重hash。明确排除live VHD子树和自引用输出；VHD路径/device/inode与增长后的大小已有原始观察，不能声称盘字节不变。
+
+独立Markdown报告14118字节、SHA256`440278c9d358767118adf28119d0e6dc2b1dabdb6493b92a246ab26a89bf6d71`；独立机器verdict v2为7062字节、SHA256`3af53d027f2fbd8f3ec0c858064adad01df9e8bb946137d2b5d5f4f8d1b7497b`，均在`.superpowers/sdd/2026-11-08-p01-wsl-environment/`。原JSON对修改前Markdown的引用被controller拒绝，未写packet；原件保持，独立新v2仅修该ref，controller核对所有refs及两版唯一语义差异。`qualification-evidence/packet-v2/s2-acceptance.json`699字节、SHA256`44a5c2a4056288c75400aae012b2970c9994f144cdab8bf6e2e210c7d1e75fda`及source-closure SHA256`6912751518fa06e67f1779063028878a691236389bd4f02063aae67d3c55b241`将精确环境、源码和独立verdict关联，S3使用前仍需冻结格式复核及当前live admission。
+
+S2只在记录的观察时点接受。WSL共享内核、无publisher signature/外层引擎二进制认证结论，live VHD不在不可变清单内。历史554bde65/8039baf3/dbdcae92/4b1bac35保持失败。S3–S6及S6首次外层Tools载入仍必须实现，P01不关闭，全部11项仍0/11；正式资格/最终系统/冷构建/P01完成标志保持false。

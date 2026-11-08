@@ -2,13 +2,15 @@
 
 更新：2026-11-08。当前 Windows + Docker/Linux 开发环境已可完成真实 Kotlin 来源构建、Rust 冷构建及 kernel VM 资格。原 macOS/APFS 环境与完整备份目前不可访问；历史冻结、失败代和驱动保持原样。
 
-交付记录及发布补记已推送至 `codex/persistent-update`，基线提交为 `ecfe2763454638a4bf2e6808c830c20ac01dd769`；原远程推送授权阻断已解除。本机封存交付目录不变。当前按[未交付项目总表](undelivered-projects.md)推进11项工作：P01的S1公共导入已完成真实封存大包导入和独立只读重开，完整1561文件/406目录源码核对通过；S2新WSL daemon已通过三镜像载入及受限容器实验，公共环境入口继续。S3–S6及P01总体验收尚未完成，仍无新增整项项目交付。阶段证据见[S1验收](p01-strict-import.md)和[环境记录](p01-environment-audit.md)。
+交付记录及发布补记已推送至 `codex/persistent-update`，基线提交为 `ecfe2763454638a4bf2e6808c830c20ac01dd769`；原远程推送授权阻断已解除。本机封存交付目录不变。当前按[未交付项目总表](undelivered-projects.md)推进11项工作：P01的S1公共导入已完成真实封存大包导入和独立只读重开，完整1561文件/406目录源码核对通过；S2公共新WSL环境现已在全新f4244bac通过实际create/observe/exec及21项独立验收。S3–S6及P01总体验收尚未完成，仍无新增整项项目交付。阶段证据见[S1验收](p01-strict-import.md)和[环境记录](p01-environment-audit.md)。
 
 当前范围：`persistentUpdateNormalRebootVerified=true`；`persistentUpdateExplicitRecoveryVerified=true` 仅覆盖下述 Linux 受控进程中断与显式恢复。`formalQualification=false`、`finalSystemAccepted=false`。
 
 S2公共入口create/observe/exec已实现并通过Task4代码复核，提交`f00331c`。首次正式新代`554bde65`的create退出0，但独立实际审计发现插件命名空间实际为`plugins.moby`，与本代专属值不符，因此S2未通过；原代、失败观察和全部资源保留。首轮修复补齐实际命名空间准入/回放检查并通过冻结Linux回归139项运行、138通过、1项Windows junction专属跳过及独立代码复核；但新代`8039baf3`在launch阶段因固定Docker拒绝单数JSON键而失败。已保留停止发行版的离线导出和原始错误；固定二进制`--help/--validate`证实应省略两种plugin JSON键并使用复数CLI选项，受影响修复和另一个全新代实际验收继续，不将配置校验当作实际namespace通过，见[环境记录](p01-environment-audit.md)。
 
-最新：复数CLI修复`28a67af`已在两全新代`dbdcae92`/`4b1bac35`通过实际专属namespace、三镜像载入和有效smoke，但两次均因旧容器Dns从null变为空数组而在outer-preservation退出1。完整原始比较和独立复核确认其余旧对象未变，两代仍失败。固定源码和Desktop日志支持加载期初始化解释；精确版本限定、保留raw且显式记录差异的语义规则已通过独立设计复核，实现/测试/源码复核及另一个新代实际验收继续。S2未接受，S3–S6未完成，全部11项目仍0/11；2026-11-08本轮查询远程为`46af996`，本地`28a67af`有3个未推送提交，工作区随后进入该规则实现。
+历史检查点（已由下段后续正式结果更新）：复数CLI修复`28a67af`已在两全新代`dbdcae92`/`4b1bac35`通过实际专属namespace、三镜像载入和有效smoke，但两次均因旧容器Dns从null变为空数组而在outer-preservation退出1。完整原始比较和独立复核确认其余旧对象未变，两代仍失败。固定源码和Desktop日志支持加载期初始化解释；精确版本限定、保留raw且显式记录差异的语义规则当时已通过独立设计复核。该检查点远程为`46af996`，本地`28a67af`有3个未推送提交；这些值不是后续发布状态。
+
+后续正式结果：已复核/测试提交`5ac0edd`的新代`f4244bac`通过全部实际步骤及独立审查21门，S2现已接受。原始receipt SHA256`60a8b23dd0118a6e37f5b6b924f32ee9ef21c2b12b31b0eea3fd36e1d92d0ea6`；独立前后witness及公共observe/exec通过，365文件证据清单逐项重hash。旧资源完整对象严格相同、equivalences=[]；历史四失败代不改判。接受只针对观察时点，后续S3仍须精确验收记录/源码/验证器链及当前live admission。P01仍未交付、11项仍0/11，S3–S6继续，正式标志保持false。
 
 2026-11-07 开发交付已生成：`artifacts/mingos-vm-dev-20261107-0c9f60f/README.md`。3544954880字节归档（SHA256 `cb8ef776f35584c915ad4b72d322e1973a06ca9b856c8790625e6b23a09dc744`）已在不挂载原checkout的情况下严格导入、恢复完整源码及独立只读重开；原始三阶段 Notes SDK 回放一致。导入 runtime 投影后，以恢复的1561文件源码实际启动 Notes/Motion，新盘空便签，正常桌面POWER及精确exit0通过。该本机交付不包含全新daemon加载或可迁携用户数据恢复结论。具体pins、失败保留和源码快照/最终记录区别见 [本次交付记录](vm-delivery-release-20261107.md)。
 

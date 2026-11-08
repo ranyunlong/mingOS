@@ -31,6 +31,10 @@
 
 ## 阶段边界
 
+当前采用独立WSL distro/VHD/daemon作为完整构建环境。QEMU guest-c已验证独立内核的最小容器可行性，但未证明完整冷构建；不能从其耗时推导编译性能。正式S2公共入口已在全新`MingOS-P01-20261108-f4244bac`通过21项独立实际验收，来源实现提交为`5ac0edd5feb525951e44faffbc935e4b4eee586f`。新daemon首次为空，三固定镜像严格载入，实际namespace、私有mount/cgroup、有效受限smoke及公共observe/exec均通过，完整旧资源对象保持。
+
+S1及S2阶段现已接受。S2只证明记录时点的新存储环境，WSL共用基础设施，不声明独立内核或跨物理主机。原始receipt SHA256为`60a8b23dd0118a6e37f5b6b924f32ee9ef21c2b12b31b0eea3fd36e1d92d0ea6`；独立验收packet-v2 SHA256为`44a5c2a4056288c75400aae012b2970c9994f144cdab8bf6e2e210c7d1e75fda`，绑定精确源码闭包和独立verdict。后续消费者须验证外部固定证明链及当前live admission。四个历史失败代保持失败，S3–S6及P01仍未完成。详见[环境实测](../../p01-environment-audit.md)与[S2计划](../plans/2026-11-08-p01-wsl-environment.md)。
+
 | 阶段 | 交付物 | 必须证明的行为 |
 | --- | --- | --- |
 | S1 | 公共严格 handoff 导入模块 | 三个外部 pin、完整 sibling allowlist、独占源码恢复、完整只读重开，失败留存 |

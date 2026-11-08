@@ -133,9 +133,9 @@ def test_failed_transfer_is_not_reused(self):
 
 Task4实现/控制及独立复核完成于`f00331c`；随后真实Task5发现实际plugins namespace缺陷，不能据此接受运行代。
 
-- [ ] 真实缺陷修复门槛：保留实际两namespace的launch/live/retained/host验证；固定引擎不接受单数JSON键，须省略两种plugin JSON键并以复数CLI设置本代值，真实RED/GREEN、固定二进制parser控制及独立复核均须通过；另用全新代执行Task5，原554bde65及8039baf3保持不合格。
+- [x] 真实缺陷修复门槛：保留实际两namespace的launch/live/retained/host验证；固定引擎不接受单数JSON键，须省略两种plugin JSON键并以复数CLI设置本代值，真实RED/GREEN、固定二进制parser控制及独立复核均须通过；另用全新代执行Task5，原554bde65及8039baf3保持不合格。
 
-最新执行记录：CLI修复`28a67af`及其独立源码复核/受影响Linux40项控制完成；两个全新代dbdcae92/4b1bac35实际namespace/load/smoke通过，但整体均因外层旧容器Dns null→[]而失败。精确版本限定空DNS语义规则已获独立设计复核并写入spec；实现TDD、独立源码复核、测试提交及又一全新代Task5仍为必需门槛，所有原失败代不复用或改判。
+修复历史：CLI修复`28a67af`及其独立源码复核/受影响Linux40项控制完成；两个全新代dbdcae92/4b1bac35实际namespace/load/smoke通过，但整体均因外层旧容器Dns null→[]而失败。随后精确版本限定空DNS语义规则完成独立设计复核、TDD、源码复核及冻结Linux146项控制（145通过、1项Windows专属跳过），提交`5ac0edd`。新代f4244bac已通过Task5；所有原失败代不复用或改判。
 
 ### Task 5: 正式新代实测与独立审查
 
@@ -143,19 +143,27 @@ Task4实现/控制及独立复核完成于`f00331c`；随后真实Task5发现实
 
 **Consumes:** 完整CLI；**Produces:** 独立新代实际成功/失败证据与审查结果。执行前controller指定全新generation/distro，不能沿用8a1c51f2。
 
-- [ ] 记录 `git status --short` 与实现代码hash；核对外层fixedTools前提、三archive来源为S1完整导入，确认bundle固定SHA/bytes。新代名称示例 `mingos-p01-s2-20261108-<随机hex>`，随机值在实际执行时一次生成并写request。
-- [ ] 用PowerShell参数数组/直接Python CLI运行正式create，完整参数模板如下；变量均由该次前置检查实际路径赋值，不使用字符串拼shell：
+- [x] 记录 `git status --short` 与实现代码hash；核对外层fixedTools前提、三archive来源为S1完整导入，确认bundle固定SHA/bytes。新代名称示例 `mingos-p01-s2-20261108-<随机hex>`，随机值在实际执行时一次生成并写request。
+- [x] 用PowerShell参数数组/直接Python CLI运行正式create，完整参数模板如下；变量均由该次前置检查实际路径赋值，不使用字符串拼shell：
 
 ```powershell
 python -B scripts/boot/wsl_environment.py create --generation $generation --distro $distro --output-directory $output --wsl-executable C:/Windows/System32/wsl.exe --outer-docker-executable 'C:/Program Files/Docker/Docker/resources/bin/docker.exe' --outer-docker-endpoint npipe:////./pipe/dockerDesktopLinuxEngine --outer-docker-config $outerConfig --docker-bundle $bundle --archive-root $verifiedArchiveRoot
 ```
 
-- [ ] 验证新VHD、新daemon/containerd store首次空，三index身份保留，smoke有效限制和exit0。每项必须有实际日志，不能用历史实验值填receipt。失败留存，修实现后换全新代，绝不原地重试。
-- [ ] 用另一个独占输出目录执行 `python -B scripts/boot/wsl_environment.py observe --environment-receipt <本次绝对receipt路径> --output-directory <新绝对观察目录>`，核对真实环境及所有冻结来源。调用exec运行 `/usr/bin/python3 -B -c "import os; print(os.getuid())"` 验证Linux argv传输，结果不作为冷构建证据。
-- [ ] 读取外层before/after按旧ID保全核对；本入口新增stopped export container有明确label/ID。并发新增资源必须附任务归属证据；未知差异标记inconclusive并停止S2成功声明。确认shared cgroup control位未变。
-- [ ] fresh reviewer独立审查生产代码、负控、真实证据和环境observations，特别检查daemon实际environ、containerd root/state、PID复用admission、无旧socket、三image Config/RootFS、cpu/memory/pids真实读取。修复后按影响重新跑必要测试；运行环境相关改动需新代实测。
-- [ ] 更新审计文档明确 c62467b2 实验已成功（cpu.max 200000 100000、memory4294967296、pids256，诊断不是正式入口），正式入口结果单列。只将S2标记通过，P01及全部11项目总交付保持未完成。记录本地提交；向用户已授权的 `codex/persistent-update` 推送由controller统一执行，本计划worker不自行改远程。
+- [x] 验证新VHD、新daemon/containerd store首次空，三index身份保留，smoke有效限制和exit0。每项必须有实际日志，不能用历史实验值填receipt。失败留存，修实现后换全新代，绝不原地重试。
+- [x] 用另一个独占输出目录执行 `python -B scripts/boot/wsl_environment.py observe --environment-receipt <本次绝对receipt路径> --output-directory <新绝对观察目录>`，核对真实环境及所有冻结来源。调用exec运行 `/usr/bin/python3 -B -c "import os; print(os.getuid())"` 验证Linux argv传输，结果不作为冷构建证据。
+- [x] 读取外层before/after按旧ID保全核对；本入口新增stopped export container有明确label/ID。并发新增资源必须附任务归属证据；未知差异标记inconclusive并停止S2成功声明。确认shared cgroup control位未变。
+- [x] fresh reviewer独立审查生产代码、负控、真实证据和环境observations，特别检查daemon实际environ、containerd root/state、PID复用admission、无旧socket、三image Config/RootFS、cpu/memory/pids真实读取。修复后按影响重新跑必要测试；运行环境相关改动需新代实测。
+- [x] 更新审计文档明确 c62467b2 实验已成功（cpu.max 200000 100000、memory4294967296、pids256，诊断不是正式入口），正式入口结果单列。只将S2标记通过，P01及全部11项目总交付保持未完成。记录本地提交；向用户已授权的 `codex/persistent-update` 推送由controller统一执行，本计划worker不自行改远程。
 
 ## 自审覆盖与后续边界
 
 Task1覆盖endpoint/环境污染；Task2覆盖输入/路径/冻结/二进制传输；Task3覆盖新distro/VHD/cgroups/daemon/空store；Task4覆盖严格image load、有效限制、失败收据及Linux transport；Task5覆盖实际全新代与独立审查。无任务执行Rust/Kotlin编译、runtime pack重装或保存重开；这些是S3–S6继续独立设计实施的必要门槛。S6另须实现handoff固定三archive提取和外层Tools首次载入，不能因S2通过而省略。
+
+## Task5验收关闭记录（2026-11-08）
+
+正式新代`f4244bac`在已复核提交`5ac0edd`执行一次create并exit0，随后独立冻结witness前后观察及公共observe/exec通过，独立实际21门全部接受。8镜像、613旧容器、224卷完整对象严格一致，唯一新增为本代stopped export；equivalences=[]，本次未使用DNS语义例外。原始receipt SHA256`60a8b23dd0118a6e37f5b6b924f32ee9ef21c2b12b31b0eea3fd36e1d92d0ea6`。
+
+证据根为`artifacts/p01-s2-formal-20261108-f4244bac/`。`qualification-evidence/manifest.json`固定365文件/8目录，SHA256`77be28e82cf1380fd7c1c2f3cd78d42a1520a148724d9bccac60b30a090072bf`，排除live VHD子树和自引用输出。独立verdict为`.superpowers/sdd/2026-11-08-p01-wsl-environment/task-5-f4244bac-independent-actual-review-v2.json`，SHA256`3af53d027f2fbd8f3ec0c858064adad01df9e8bb946137d2b5d5f4f8d1b7497b`。原JSON的过期Markdown引用被拒绝并保留，新v2只修该引用；所有引用重核后生成独占packet-v2，不重跑或改判历史代。
+
+`qualification-evidence/packet-v2/s2-acceptance.json` SHA256`44a5c2a4056288c75400aae012b2970c9994f144cdab8bf6e2e210c7d1e75fda`及source-closure SHA256`6912751518fa06e67f1779063028878a691236389bd4f02063aae67d3c55b241`绑定环境、源码和独立验收。S3消费格式另经独立复核通过，使用前仍须当前live admission；不能复制本代verdict为另一环境发证。S2计划关闭，S3–S6/P01及11项目整体交付保持未完成，正式/最终资格标志保持false。
