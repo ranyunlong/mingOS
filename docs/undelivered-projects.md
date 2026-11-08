@@ -31,6 +31,8 @@
 
 横贯工作 C01：统一根 README、文档索引和总览中的旧阶段表述；每个项目完成后同步其当前状态与历史证据边界。此项不替代或抵扣上述11项，也不篡改已封存文档副本。
 
+P09/P10证据补记：本轮新文档链接检查同时发现文档索引原有`artifacts/framed-kotlin-fix-20261025/closure.json`和`artifacts/animated-framed-fix-20261025/result.json`两处历史引用在当前本机缺失。保留原链接及缺失状态，后续核对原归档/来源；这不是新测试运行结果，也不能用改链或替代字节声称历史证据已恢复。
+
 ## 依赖与执行顺序
 
 按 P01→P11 顺序进入项目的设计、计划和实施；本表保存其余项目的完整范围，不提前将其删减为较容易的子集。每项计划明确自身依赖，项目内部可分任务并行，不同时争用同一源码、磁盘或输出代。
@@ -51,13 +53,19 @@ S2独立环境已有QEMU和WSL实验：新WSL VHD/daemon初始store为空，三�
 
 最新S2：提交`5ac0edd`全新f4244bac正式create、独立witness及公共observe/exec通过，独立实际21门接受。全部旧资源完整对象严格一致，DNS例外未应用；365文件/8目录证据封存，live VHD明确不声称字节不变。S1/S2的阶段完成不关闭P01；S3独立验收格式衔接和实施继续。详见[环境记录](p01-environment-audit.md)。
 
-发布检查点：S2实现/验收已推送并精确核对远程`95970c008ee3bc68538211c4dbcf4e0af8ed2b5b`。S3[正式设计](superpowers/specs/2026-11-08-p01-source-build-design.md)及[七任务计划](superpowers/plans/2026-11-08-p01-source-build.md)已保存，独立验收格式复核通过；Task1开始本地严格证明链校验与执行器冻结。实际S3恢复/编译/导出仍未完成，所有11项目状态保持原范围。
+发布检查点：S2实现/验收已推送并精确核对远程`95970c008ee3bc68538211c4dbcf4e0af8ed2b5b`。S3[正式设计](superpowers/specs/2026-11-08-p01-source-build-design.md)及[七任务计划](superpowers/plans/2026-11-08-p01-source-build.md)已保存，独立验收格式复核通过；Task1本地严格证明链校验与执行器冻结已完成独立审查及修复；冻结Linux29/29、真实原证明链/365项清单/3.54GB归档本地演练通过，修复实现`e02bfb4`，详见[S3记录](p01-source-build.md)。Task2显式spec/完整harness/容量/观察顺序接口已复核，实施继续。实际S3恢复/编译/导出仍未完成，所有11项目状态保持原范围。
 
 S2公共化补充：显式Docker transport完成实现和独立复核；公共输入冻结、rootfs构造与Linux二进制接收模块完成Windows14项控制、Linux17通过/1项Windows专属跳过及独立复核。实际rootfs重写后全部17,278个原成员逐项一致，仅新增8个固定引擎二进制与`wsl.conf`。新distro/私有daemon生命周期、完整CLI及正式新代集成继续，不将这两个子任务计作S2或P01完成。
 
 生命周期初始实现`9f4d0f3`已通过独立复核和完整冻结Linux控制49通过/1项Windows专属跳过（50项含9项transport控制）；初始状态仍为creating，完整load/smoke/observe/exec继续。S1只读恢复卷中的三镜像已复制到独立新目录并严格核验，供正式另一新代验收。全部项目仍0/11完成。
 
 ## 完整 changelog
+
+### 2026-11-08 — P01 S3 Task1本地准入与冻结完成
+
+- 实现及审查修复`6403f8b`/`e02bfb4`：严格固定spec与原S2证明链、本地执行代码闭包冻结、输出分配前的证据/删除记录保全、纯POSIX guest路径校验。
+- 主执行者修复后冻结Linux29/29、零跳过，真实原packet/365项证据/3.54GB归档本地演练exit0，独立Spec PASS/Quality Approved；[S3记录](p01-source-build.md)列出来源、证据与边界。
+- Task2固定spec数据流、完整harness入口、完整输入容量预算和准入观察专用例外已独立复核，实施继续。实际S3、S4–S6及P01未完成，整项仍0/11；正式标志保持false。
 
 ### 2026-11-08 — P01 S2独立实际验收通过
 
