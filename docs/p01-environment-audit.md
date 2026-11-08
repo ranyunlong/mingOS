@@ -69,3 +69,14 @@ guest-c daemon ID：`81326b10-1096-4e41-a8a0-0303a61dd95e`；driver `overlayfs`�
 ## 状态
 
 P01 S1公共严格导入已通过实际大包导入和独立只读重开及独立复核。WSL实验已完成三镜像加载和实际受限容器，但S2公共化及S3–S6源码/缓存消费、真实编译、新包装配和持久化验收继续。全部11项新项目仍为0项完成并发布；原开发VM交付与正式验收标志保持原范围。
+
+
+## S2公共入口与首次正式代的真实阻断（2026-11-08）
+
+Task4公共create/observe/exec已完成实现与独立复核，提交`f00331c`。原完整冻结Linux控制为129项运行、128通过、1项Windows junction专属跳过；attach异常后最终inspect修复的受影响Linux guest控制另为33/33。它们是两次独立执行，不合并成一次完整最终测试。
+
+正式公共create只在全新`MingOS-P01-20261108-554bde65`执行一次，证据目录`artifacts/p01-s2-formal-20261108-554bde65/`。create退出0，新VHD/daemon、首次空store、三固定镜像load/inspect及有效smoke均有原始记录，但独立审计发现first-empty与最终info中的`Containerd.Namespaces.Plugins`实际均为`plugins.moby`，配置/收据意图却为本代`-plugins`。因此本代明确为**S2 NOT ACCEPTED**；不原地改配置、重启或重载后改判。
+
+固定Docker29.8.1官方源码的JSON键为单数`containerd-plugin-namespace`；原实现写成复数且未验证info返回的实际namespace。修复同时校验实际Containers/Plugins两值，覆盖初始launch、每次live handle admission、observe、保留first-empty及宿主ready receipt回放；默认、缺失、异代和格式错误必须拒绝，历史loader保持原字节。真正RED为8项测试17个断言失败；修复后Windows受影响72项运行、67通过、5项Linux专属跳过。冻结完整Linux公共/导入回归在`artifacts/p01-s2-public-controls-20261108-a1b29ded/`运行139项、138通过、1项Windows junction专属跳过、零失败/错误，精确容器`0fe7dac7910f830b27e644abb8235976a57b23695705ad575d5c48ea56b068cc`退出0且非OOM。修复已通过独立spec/quality复核；另一个全新实际环境代仍待通过。
+
+首次独立观察器还发现自身过严的共享mount、覆盖挂载和无标签镜像listing假设；原失败完整保留。修订后的独立证据须真实读取O_PATH/fdinfo可见mount、逐namespace核对内部owned peer无外部传播，并用实际info计数和三个固定index完整inspect核对store，不能用假设fixture填成实际通过。公共observe/exec仍须在修复后新代另取独占证据。S2未关闭，P01及11项目总交付保持0/11；正式标志均false。

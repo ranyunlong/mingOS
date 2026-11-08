@@ -124,12 +124,16 @@ def test_failed_transfer_is_not_reused(self):
 
 **Consumes:** Tasks1–3 APIs；**Produces:** 完整create/observe/exec CLI与environment-result。
 
-- [ ] 写RED：三个archives未全部验证时无load；partial loader失败保留completedLoads且不smoke；inspect字段正确但容器内cpu/memory/pids不符时失败；start attach退出0但State.ExitCode非0/OOMKilled=true仍失败。
-- [ ] 把load_all接至migration_runner，guest调用前校验冻结代码hash和handle。load必须在daemon namespaces中运行，独立result_path，完成列表精确rust/tools/kotlin。禁止修改loader放宽index检查。
-- [ ] run_smoke用固定Tools和spec完整create argv；命令中直接内嵌标准库Python读取/proc/self/status、statvfs、cgroup三个max、/sys/class/net、route。分别记录inspect-before/start/inspect-after/actual-effective；actual JSON的断言在controller再次执行，不只相信容器exit0。
-- [ ] observe_guest只读检查live handle/ns/store/加载image与smoke，不创建容器/卷；exec_environment接收Linux argv、timeout和独立输出目录，进入私有环境并使用冻结helper，禁止自动Windows路径映射。
-- [ ] 完成CLI解析与JSON失败phase，receipt字段对齐spec；新输出目录占用、失败代重用、任一未知receipt状态拒绝。文档给具体create、observe、exec示例，说明S6缺Tools准备层gate、失败保留及独立内核限制。
-- [ ] 运行新三个模块全部unittest，以及现有 `test_development_image_migration.py`、`test_qualification_image_archive.py`、`test_import_handoff.py`适用平台回归；Linux恢复与descriptor检查必须在Linux执行。通过后提交。
+- [x] 写RED：三个archives未全部验证时无load；partial loader失败保留completedLoads且不smoke；inspect字段正确但容器内cpu/memory/pids不符时失败；start attach退出0但State.ExitCode非0/OOMKilled=true仍失败。
+- [x] 把load_all接至migration_runner，guest调用前校验冻结代码hash和handle。load必须在daemon namespaces中运行，独立result_path，完成列表精确rust/tools/kotlin。禁止修改loader放宽index检查。
+- [x] run_smoke用固定Tools和spec完整create argv；命令中直接内嵌标准库Python读取/proc/self/status、statvfs、cgroup三个max、/sys/class/net、route。分别记录inspect-before/start/inspect-after/actual-effective；actual JSON的断言在controller再次执行，不只相信容器exit0。
+- [x] observe_guest只读检查live handle/ns/store/加载image与smoke，不创建容器/卷；exec_environment接收Linux argv、timeout和独立输出目录，进入私有环境并使用冻结helper，禁止自动Windows路径映射。
+- [x] 完成CLI解析与JSON失败phase，receipt字段对齐spec；新输出目录占用、失败代重用、任一未知receipt状态拒绝。文档给具体create、observe、exec示例，说明S6缺Tools准备层gate、失败保留及独立内核限制。
+- [x] 运行新三个模块全部unittest，以及现有 `test_development_image_migration.py`、`test_qualification_image_archive.py`、`test_import_handoff.py`适用平台回归；Linux恢复与descriptor检查必须在Linux执行。通过后提交。
+
+Task4实现/控制及独立复核完成于`f00331c`；随后真实Task5发现实际plugins namespace缺陷，不能据此接受运行代。
+
+- [ ] 真实缺陷修复门槛：修正单数配置键，补实际两namespace的launch/live/retained/host验证，真实RED/GREEN及独立修复复核；另用全新代执行Task5，原554bde65保持不合格。
 
 ### Task 5: 正式新代实测与独立审查
 

@@ -484,12 +484,22 @@ def _finish_create(receipt,output,archive_root,manifest,persist,command,docker,i
     receipt['observation']=_invoke_guest(receipt,output,'guest-observe',{'action':'observe','load':receipt['load'],'smoke':receipt['smoke']},persist)
     from wsl_environment_guest import validate_effective,validate_handle
     validate_handle(receipt['handle'],receipt['observation']['handle']);validate_effective(receipt['observation']['actualEffective'])
+    validate_namespace_observation(receipt['observation'],generation)
     receipt['firstEmpty']=receipt['observation']['firstEmpty']
     receipt['privateEvidence']=receipt['observation']['privateEvidence']
     receipt['phase']='outer-preservation';persist()
     receipt['outerAfter']=_outer_after(docker,inspect_many);persist()
     receipt['oldResources']=compare_outer(receipt['outer'],receipt['outerAfter'],receipt['exportContainerId'])
     receipt['status']='environment-ready';receipt['phase']='environment-ready';persist()
+
+
+def validate_namespace_observation(observation,generation):
+    from wsl_environment_guest import validate_info,validate_live_info
+    try:
+        validate_live_info(observation['info'],generation)
+        validate_info(observation['firstEmpty']['info'],generation)
+    except (KeyError,TypeError) as error:
+        raise ValueError('missing actual containerd namespace observation') from error
 
 
 def _read_ready(path):
@@ -502,6 +512,10 @@ def _read_ready(path):
     if value.get('guestCodeRoot')!='/root/'+value['generation']+'-code':raise ValueError('guest code root differs')
     if value.get('load',{}).get('completedLoads')!=['rust','tools','kotlin']:raise ValueError('incomplete load receipt')
     if value.get('oldResources',{}).get('status')!='preserved':raise ValueError('missing resource preservation')
+    from wsl_environment_guest import validate_info,validate_containerd_namespaces
+    validate_info(value.get('firstEmpty',{}).get('info'),value['generation'])
+    validate_namespace_observation(value.get('observation',{}),value['generation'])
+    validate_containerd_namespaces({'Containerd':{'Namespaces':value.get('handle',{}).get('containerdNamespaces')}},value['generation'])
     validate_smoke_result(value['smoke'])
     return value
 
@@ -528,6 +542,7 @@ def _followup(environment_receipt,output_directory,action,argv=None,timeout=30):
             if action=='observe':
                 from wsl_environment_guest import validate_effective,validate_handle
                 validate_handle(source['handle'],result['handle']);validate_effective(result['actualEffective'])
+                validate_namespace_observation(result,source['generation'])
             receipt['result']=result;receipt['status']='environment-ready';receipt['operationStatus']='observed' if action=='observe' else 'executed';persist();return receipt
         except BaseException as error:
             receipt['status']='failed';receipt['error']=repr(error);persist();raise

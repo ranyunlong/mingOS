@@ -28,17 +28,17 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('TMPDIR=/run/p01-test/tmp',script)
         self.assertNotIn('/sys/fs/cgroup/../',script)
     def test_handle_rejects_all_identity_changes(self):
-        handle={'pid':8,'starttime':'3','exeSha256':'a','namespaces':{'mnt':'m'},'socket':{'inode':4,'uid':0,'gid':0},'daemonId':'d'}
+        handle={'pid':8,'starttime':'3','exeSha256':'a','namespaces':{'mnt':'m'},'socket':{'inode':4,'uid':0,'gid':0},'daemonId':'d','containerdNamespaces':{'Containers':'p01-test','Plugins':'p01-test-plugins'}}
         guest.validate_handle(handle,dict(handle))
         for key,value in [('pid',9),('starttime','4'),('exeSha256','b'),('namespaces',{'mnt':'n'}),('socket',{'inode':5,'uid':0,'gid':0}),('daemonId','e')]:
             observed=dict(handle); observed[key]=value
             with self.subTest(key=key),self.assertRaises(ValueError): guest.validate_handle(handle,observed)
     def test_info_contract_fails_nonempty_and_wrong_driver(self):
-        info={'ID':'id','ServerVersion':'29.8.1','OSType':'linux','Architecture':'x86_64','CgroupVersion':'2','CgroupDriver':'cgroupfs','Driver':'overlayfs','DriverStatus':[['driver-type','io.containerd.snapshotter.v1']],'Images':0,'Containers':0}
-        guest.validate_info(info)
+        info=namespace_info()
+        guest.validate_info(info,'p01-test')
         for key,value in [('Images',1),('Containers',1),('Driver','overlay2'),('ServerVersion','29.0'),('CgroupVersion','1')]:
             changed=dict(info);changed[key]=value
-            with self.subTest(key=key),self.assertRaises(ValueError): guest.validate_info(changed)
+            with self.subTest(key=key),self.assertRaises(ValueError): guest.validate_info(changed,'p01-test')
 try:
     from wsl_environment_guest import receive_file
 except ImportError:
@@ -80,7 +80,7 @@ class ReceiverTests(unittest.TestCase):
 
 class AdmissionTests(unittest.TestCase):
     def setUp(self):
-        self.handle={'generation':'p01-test','pid':8,'starttime':'3','exeSha256':'a','namespaces':{'mnt':'m'},'socket':{'inode':4,'uid':0,'gid':0},'daemonId':'d'}
+        self.handle={'generation':'p01-test','pid':8,'starttime':'3','exeSha256':'a','namespaces':{'mnt':'m'},'socket':{'inode':4,'uid':0,'gid':0},'daemonId':'d','containerdNamespaces':{'Containers':'p01-test','Plugins':'p01-test-plugins'}}
     def test_stale_handle_never_enters_or_restarts(self):
         for key,value in [('pid',9),('starttime','4'),('daemonId','other'),('socket',{'inode':5,'uid':0,'gid':0})]:
             changed=dict(self.handle);changed[key]=value
@@ -106,7 +106,7 @@ class LauncherFailureTests(unittest.TestCase):
     def setUp(self):
         from unittest.mock import MagicMock
         self.path=MagicMock();self.process=MagicMock();self.process.pid=42;self.process.poll.return_value=None
-        self.info={'ID':'id','ServerVersion':'29.8.1','OSType':'linux','Architecture':'x86_64','CgroupVersion':'2','CgroupDriver':'cgroupfs','Driver':'overlayfs','DriverStatus':[['driver-type','io.containerd.snapshotter.v1']],'Images':0,'Containers':0}
+        self.info=namespace_info()
     def launch(self,*,clock=None,info=None,listing=b'',boundary=0,controls=None):
         import json,subprocess
         from contextlib import ExitStack
@@ -324,9 +324,66 @@ class LoadEvidenceTests(unittest.TestCase):
 class LiveObservationTests(unittest.TestCase):
     def test_live_store_and_daemon_configuration_changes_rejected(self):
         self.assertTrue(callable(getattr(guest,'validate_live_info',None)),'validate_live_info API missing')
-        good={'ID':'inner','ServerVersion':'29.8.1','OSType':'linux','Architecture':'x86_64','CgroupVersion':'2','CgroupDriver':'cgroupfs','Driver':'overlayfs','DriverStatus':[['driver-type','io.containerd.snapshotter.v1']],'DockerRootDir':'/var/lib/p01-test/docker','Images':3,'Containers':1}
+        good=namespace_info(images=3,containers=1)
         guest.validate_live_info(good,'p01-test')
         for key,value in [('DockerRootDir','/var/lib/docker'),('Images',0),('Containers',0),('ServerVersion','wrong'),('CgroupDriver','systemd')]:
             with self.subTest(key=key),self.assertRaises(ValueError):guest.validate_live_info({**good,key:value},'p01-test')
+
+def namespace_info(*,images=0,containers=0):
+    return {'ID':'inner','ServerVersion':'29.8.1','OSType':'linux','Architecture':'x86_64',
+            'CgroupVersion':'2','CgroupDriver':'cgroupfs','Driver':'overlayfs',
+            'DriverStatus':[['driver-type','io.containerd.snapshotter.v1']],
+            'DockerRootDir':'/var/lib/p01-test/docker','Images':images,'Containers':containers,
+            'Containerd':{'Namespaces':{'Containers':'p01-test','Plugins':'p01-test-plugins'}}}
+
+
+class NamespaceContractTests(unittest.TestCase):
+    def test_config_uses_official_singular_plugin_namespace_key(self):
+        config=guest.daemon_config('p01-test')
+        self.assertEqual(config.get('containerd-plugin-namespace'),'p01-test-plugins')
+        self.assertNotIn('containerd-plugins-namespace',config)
+    def test_live_info_rejects_missing_default_or_foreign_namespace_pair(self):
+        good=namespace_info(images=3,containers=1);guest.validate_live_info(good,'p01-test')
+        for value in (None,{}, {'Namespaces':None},{'Namespaces':{}},
+                      {'Namespaces':{'Containers':'p01-test','Plugins':'plugins.moby'}},
+                      {'Namespaces':{'Containers':'moby','Plugins':'p01-test-plugins'}},
+                      {'Namespaces':{'Containers':'other','Plugins':'other-plugins'}},
+                      {'Namespaces':{'Containers':'p01-test','Plugins':None}}):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                guest.validate_live_info({**good,'Containerd':value},'p01-test')
+    def test_launcher_rejects_actual_namespace_before_empty_lists(self):
+        for key,value in (('Plugins','plugins.moby'),('Containers','moby')):
+            fixture=LauncherFailureTests('test_nonempty_info_blocks_without_restart');fixture.setUp()
+            info=namespace_info();info['Containerd']['Namespaces'][key]=value
+            fixture.launch(info=info)
+            self.assertEqual(fixture.docker.call_count,1)
+    def test_admission_checks_actual_pair_before_and_after_management_move(self):
+        import json,subprocess,stat
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        identity={'pid':8,'starttime':'3','exeSha256':'hash','namespaces':{'mnt':'m','net':'n','cgroup':'c'}}
+        handle={**identity,'generation':'p01-test','daemonId':'inner',
+                'containerdNamespaces':{'Containers':'p01-test','Plugins':'p01-test-plugins'},
+                'socket':{'device':1,'inode':2,'uid':0,'gid':0}}
+        socket=SimpleNamespace(st_mode=stat.S_IFSOCK,st_uid=0,st_gid=0,st_dev=1,st_ino=2)
+        good=namespace_info();bad=namespace_info();bad['Containerd']['Namespaces']['Plugins']='plugins.moby'
+        for stage,responses in ((1,[bad,bad]),(2,[good,bad])):
+            with self.subTest(check=stage),patch.object(guest,'process_identity',return_value=identity),patch.object(guest.os,'stat',return_value=socket),patch.object(guest,'_docker',side_effect=[subprocess.CompletedProcess([],0,json.dumps(info).encode(),b'') for info in responses]),patch.object(guest,'Path',return_value=MagicMock()),patch.object(guest,'_entered') as entered:
+                with self.assertRaises(ValueError):guest.admit_environment(handle,['/bin/true'])
+                entered.assert_not_called()
+    def test_observe_rejects_actual_live_pair_before_replaying_proofs(self):
+        import json,subprocess
+        info=namespace_info(images=3,containers=1);info['Containerd']['Namespaces']['Plugins']='plugins.moby'
+        handle={'generation':'p01-test','pid':8}
+        with patch.object(guest,'validate_handle'),patch.object(guest,'observe_handle',return_value={}),patch.object(guest,'_entered',return_value=subprocess.CompletedProcess([],0,json.dumps(info).encode(),b'')),patch.object(guest,'Path',side_effect=AssertionError('live namespace not rejected')):
+            with self.assertRaises(ValueError):guest.observe_guest(handle,{}, {})
+    def test_observe_replays_first_empty_namespace_pair(self):
+        import json,subprocess
+        from unittest.mock import MagicMock
+        first=namespace_info();first['Containerd']['Namespaces']['Plugins']='plugins.moby'
+        path=MagicMock();path.read_text.return_value=json.dumps({'info':first,'lists':{k:{'exitCode':0,'stdout':''} for k in ('images','containers','volumes')}})
+        with patch.object(guest,'validate_handle'),patch.object(guest,'observe_handle',return_value={}),patch.object(guest,'_entered',return_value=subprocess.CompletedProcess([],0,json.dumps(namespace_info(images=3,containers=1)).encode(),b'')),patch.object(guest,'Path',return_value=path),patch.object(guest,'shared_controls',side_effect=AssertionError('first-empty namespace not rejected')):
+            with self.assertRaises(ValueError):guest.observe_guest({'generation':'p01-test','pid':8}, {}, {})
+
 
 if __name__ == '__main__': unittest.main()

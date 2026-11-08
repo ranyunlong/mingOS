@@ -28,7 +28,7 @@ def daemon_config(generation):
             'pidfile':p['run']+'/dockerd.pid','hosts':['unix://'+p['run']+'/docker.sock'],
             'group':'root','features':{'containerd-snapshotter':True},
             'exec-opts':['native.cgroupdriver=cgroupfs'],'cgroup-parent':'/workloads',
-            'containerd-namespace':generation,'containerd-plugins-namespace':generation+'-plugins',
+            'containerd-namespace':generation,'containerd-plugin-namespace':generation+'-plugins',
             'default-cgroupns-mode':'private','bridge':'none','iptables':False,
             'ip6tables':False,'ip-forward':False,'ip-masq':False,'userland-proxy':False}
 
@@ -65,7 +65,18 @@ test ! -e /run/containerd/containerd.sock
 exec env -i '''+environment+' /usr/local/bin/dockerd --config-file '+p['base']+'/daemon.json\n'
 
 
-def validate_info(info):
+def validate_containerd_namespaces(info,generation):
+    paths(generation)
+    containerd=info.get('Containerd') if isinstance(info,dict) else None
+    actual=containerd.get('Namespaces') if isinstance(containerd,dict) else None
+    expected={'Containers':generation,'Plugins':generation+'-plugins'}
+    if not isinstance(actual,dict) or actual!=expected:
+        raise ValueError('actual containerd namespaces differ from generation')
+    return dict(actual)
+
+
+def validate_info(info,generation):
+    validate_containerd_namespaces(info,generation)
     expected={'ServerVersion':'29.8.1','OSType':'linux','CgroupVersion':'2',
               'CgroupDriver':'cgroupfs','Driver':'overlayfs','Images':0,'Containers':0}
     if (not info.get('ID') or any(info.get(k)!=v for k,v in expected.items())
@@ -75,7 +86,7 @@ def validate_info(info):
 
 
 def validate_handle(handle,observed):
-    for key in ('pid','starttime','exeSha256','namespaces','socket','daemonId'):
+    for key in ('pid','starttime','exeSha256','namespaces','socket','daemonId','containerdNamespaces'):
         if key not in handle or key not in observed or handle[key]!=observed[key]:
             raise ValueError('stale environment handle: '+key)
 
@@ -134,7 +145,9 @@ def observe_handle(generation,pid):
     result['socket']={'device':value.st_dev,'inode':value.st_ino,'uid':value.st_uid,'gid':value.st_gid}
     response=_docker(generation,pid,['info','--format','{{json .}}'])
     if response.returncode: raise ValueError('daemon info failed')
-    result['daemonId']=json.loads(response.stdout)['ID']
+    info=json.loads(response.stdout)
+    result['containerdNamespaces']=validate_containerd_namespaces(info,generation)
+    result['daemonId']=info['ID']
     return result
 
 
@@ -184,7 +197,7 @@ def launch_environment(generation,*,ready_timeout=30):
             time.sleep(min(.2,max(0,deadline-time.monotonic())))
         else: raise TimeoutError('daemon not ready within 30 seconds')
         if time.monotonic()>deadline: raise TimeoutError('daemon readiness exceeded bound')
-        info=json.loads(response.stdout); validate_info(info)
+        info=json.loads(response.stdout); validate_info(info,generation)
         empty={}
         for name,args in [('images',['image','ls','-q','--no-trunc']),('containers',['ps','-a','-q','--no-trunc']),('volumes',['volume','ls','-q'])]:
             result=_docker(generation,process.pid,args)
@@ -407,7 +420,7 @@ def observe_guest(handle,load,smoke):
     response=_entered(generation,handle['pid'],transport.argv(['info','--format','{{json .}}']))
     if response.returncode:raise ValueError('live daemon info failed')
     live_info=json.loads(response.stdout);validate_live_info(live_info,generation)
-    first=json.loads(Path(p['base'],'first-empty.json').read_text());validate_info(first['info'])
+    first=json.loads(Path(p['base'],'first-empty.json').read_text());validate_info(first['info'],generation)
     if set(first['lists'])!={'images','containers','volumes'} or any(v['exitCode']!=0 or v['stdout']!='' for v in first['lists'].values()):raise ValueError('first-empty proof differs')
     before=json.loads(Path(p['base'],'shared-before.json').read_text())
     if shared_controls()!=before:raise ValueError('shared ancestor controls changed')
@@ -440,7 +453,7 @@ def observe_guest(handle,load,smoke):
 
 def validate_live_info(info,generation):
     # Keep the exact engine/platform/store checks while allowing loaded resource counts.
-    validate_info({**info,'Images':0,'Containers':0})
+    validate_info({**info,'Images':0,'Containers':0},generation)
     if (info.get('DockerRootDir')!=paths(generation)['data']+'/docker'
             or type(info.get('Images')) is not int or info['Images']<3
             or type(info.get('Containers')) is not int or info['Containers']<1):

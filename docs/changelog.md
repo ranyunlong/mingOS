@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-08 — P01 S2公共入口与实际命名空间阻断
+
+- 公共create/observe/exec及有效smoke完成实现与独立代码复核，提交`f00331c`；完整原Linux控制与受影响最终guest控制分别保存，不夸大为同次全量执行。
+- 首次正式新WSL代`554bde65`create退出0，但独立审计发现实际plugins namespace仍为`plugins.moby`，与本代专属合同不符；该代未通过，全部资源与失败观察器证据保留。
+- 修正Docker单数配置键，补实际namespace在launch、live admission、observe、first-empty及宿主回放的检查；8项真实RED出现17个断言失败，修复后Windows受影响72运行/67通过/5Linux跳过；新冻结Linux公共与导入回归139运行/138通过/1Windows跳过，零失败/错误。
+- 修复独立spec/quality复核已通过，另一个全新代实际验收继续；S2/P01未关闭，11项目仍0/11，正式资格标志保持false。
+
+
 ## 2026-11-08 — P01 S2生命周期初始阶段
 
 - 新增新distro/VHD及私有daemon初始编排、全新路径/空store/环境检查、managed-containerd路径观察和PID/starttime/exe/ns/socket/daemon身份准入；提交`9f4d0f3`，独立spec/quality复核通过。

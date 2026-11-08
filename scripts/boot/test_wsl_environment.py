@@ -191,7 +191,7 @@ class LifecycleSequenceTests(unittest.TestCase):
         elif key=='export':(directory/'export.tar').write_bytes(b'export')
         elif key=='wsl-import':
             (directory/'distro').mkdir();(directory/'distro/ext4.vhdx').write_bytes(b'vhd')
-        elif key=='guest-launch':value=b'{"generation":"p01-test","pid":42}'
+        elif key=='guest-launch':value=b'{"generation":"p01-test","pid":42,"containerdNamespaces":{"Containers":"p01-test","Plugins":"p01-test-plugins"}}'
         (directory/(key+'.stdout.log')).write_bytes(value)
         return subprocess.CompletedProcess(argv,0)
     def create(self):
@@ -282,7 +282,7 @@ class FollowupClaimTests(unittest.TestCase):
 class FullCreationFlowTests(unittest.TestCase):
     def exercise(self,fail_load=False):
         import development_image_migration as migration
-        from test_wsl_environment_guest import SmokeBoundaryTests
+        from test_wsl_environment_guest import SmokeBoundaryTests,namespace_info
         fixture=LifecycleSequenceTests('test_sequence_stopped_inspected_id_only_and_no_destructive_calls');fixture.setUp();self.addCleanup(fixture.doCleanups)
         smoke_case=SmokeBoundaryTests();smoke_case.setUp()
         smoke={'id':smoke_case.cid,'inspectBefore':smoke_case.inspection,'inspectAfter':smoke_case.inspection,
@@ -305,7 +305,7 @@ class FullCreationFlowTests(unittest.TestCase):
                     (directory/(key+'.stdout.log')).write_bytes(data);return subprocess.CompletedProcess(argv,1)
                 if key=='guest-load':result=load
                 elif key=='guest-smoke':result=smoke
-                else:result={'handle':{'generation':'p01-test','pid':42},'actualEffective':smoke_case.actual,'firstEmpty':{'proof':True},'privateEvidence':{}}
+                else:result={'handle':{'generation':'p01-test','pid':42,'containerdNamespaces':{'Containers':'p01-test','Plugins':'p01-test-plugins'}},'actualEffective':smoke_case.actual,'firstEmpty':{'info':namespace_info()},'info':namespace_info(images=3,containers=1),'privateEvidence':{}}
                 data=json.dumps({'status':'ok','result':result,'evidence':{}}).encode()
             else:return fixture.capture(directory,key,argv,**kwargs)
             (directory/(key+'.stdout.log')).write_bytes(data);return subprocess.CompletedProcess(argv,0)
@@ -344,5 +344,38 @@ class GuestRequestTransferTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv,0)
             with patch.object(env,'HELPER_NAMES',('module.py',)),patch.object(env,'capture',side_effect=captured):
                 env._invoke_guest(receipt,root,'guest-observe',{'action':'observe','largeEvidence':big},lambda:None)
+
+class HostNamespaceReplayTests(unittest.TestCase):
+    def test_ready_receipt_rejects_actual_default_namespace_before_guest_exec(self):
+        from test_wsl_environment_guest import namespace_info
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            value={'schemaVersion':1,'status':'environment-ready','phase':'environment-ready',
+                   'generation':'p01-test','distro':'MingOS-P01-test','wslExecutable':str(Path(sys.executable).resolve()),
+                   'helpers':{'root':str(root)},'guestCodeRoot':'/root/p01-test-code',
+                   'load':{'completedLoads':['rust','tools','kotlin']},'oldResources':{'status':'preserved'},'smoke':{},
+                   'firstEmpty':{'info':namespace_info()},
+                   'observation':{'info':namespace_info(images=3,containers=1),'firstEmpty':{'info':namespace_info()}},
+                   'handle':{'containerdNamespaces':{'Containers':'p01-test','Plugins':'p01-test-plugins'}}}
+            for section in ('firstEmpty','observation'):
+                value[section]['info']['Containerd']['Namespaces']['Plugins']='plugins.moby'
+                receipt=root/(section+'.json');receipt.write_text(json.dumps(value))
+                with self.subTest(section=section),patch.object(env,'verify_frozen'),patch.object(env,'validate_smoke_result'),patch.object(env.subprocess,'run') as run:
+                    with self.assertRaises(ValueError):env._read_ready(receipt)
+                    run.assert_not_called()
+                value[section]['info']['Containerd']['Namespaces']['Plugins']='p01-test-plugins'
+            valid=root/'valid.json';valid.write_text(json.dumps(value))
+            with patch.object(env,'verify_frozen'),patch.object(env,'validate_smoke_result'):
+                self.assertEqual(env._read_ready(valid)['status'],'environment-ready')
+    def test_host_checks_both_live_and_retained_first_empty_observations(self):
+        self.assertTrue(callable(getattr(env,'validate_namespace_observation',None)),'host namespace observation validator missing')
+        from test_wsl_environment_guest import namespace_info
+        env.validate_namespace_observation({'info':namespace_info(images=3,containers=1),'firstEmpty':{'info':namespace_info()}},'p01-test')
+        for section in ('info','firstEmpty'):
+            observation={'info':namespace_info(images=3,containers=1),'firstEmpty':{'info':namespace_info()}}
+            info=observation['info'] if section=='info' else observation['firstEmpty']['info']
+            info['Containerd']['Namespaces']['Plugins']='plugins.moby'
+            with self.subTest(section=section),self.assertRaises(ValueError):env.validate_namespace_observation(observation,'p01-test')
+
 
 if __name__ == '__main__': unittest.main()
