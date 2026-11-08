@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-08 — P01 设计与独立构建环境实验
+
+- 保存P01完整S1–S6门槛及公共严格导入模块的首个实施计划，独立复核后明确三数据pin、canonical closed receipt及实际回归测试入口；S1开始TDD实施。
+- 使用固定Tools镜像在全新QEMU guest实证独立daemon、containerd image store、空store及最小容器运行和正常关机；首失败与对照代全部保留，未放宽历史driver或改判失败。
+- 单次KVM探测确认观察路径无设备；继续评估独立WSL原生CPU构建路径。调查证据及限制见[环境记录](p01-environment-audit.md)。尚无P01完成结论，总进度仍0/11。
+
 ## 2026-11-08 — 未交付项目连续交付周期启动
 
 - 完整保存11个未交付项目、验收定义、依赖和已知外部条件，见 [项目总表](undelivered-projects.md)。
