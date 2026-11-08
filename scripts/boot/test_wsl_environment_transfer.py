@@ -862,3 +862,190 @@ class BootstrapHistoryWitnessFixTests(unittest.TestCase):
         request={'s2Generation':s2,'generation':'fixture','nonce':'b'*32,'duration':2,'adapter':{'bytes':len(code),'sha256':hashlib.sha256(code).hexdigest()},'hostHistory':[]}
         p=subprocess.run([sys.executable,'-I','-B','-c',transfer._BOOTSTRAP,json.dumps(request)],input=code,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=7)
         self.assertNotEqual(p.returncode,0);self.assertIn(b'prior host success',p.stderr);self.assertFalse(marker.exists())
+
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux full owner sequential retirement controls')
+class SequentialOwnerFix2Tests(unittest.TestCase):
+    def test_full_owner_more_than64_and_receive_shaped_completed_workers(self):
+        if not os.access('/opt',os.W_OK):self.skipTest('writable isolated /opt tmpfs required')
+        for shape in ([80],[11,19,18,1,19,1]):
+            with self.subTest(shape=shape):
+                s2='p01-retire-'+__import__('uuid').uuid4().hex[:12];nonce='a'*32
+                extra=("\ndef _guest_install(r,deadline,directory):\n total=0\n for phase,count in enumerate("+repr(shape)+"):\n  for index in range(count):\n   value=_fork_job(lambda:1,deadline=deadline,evidence_path=Path(directory)/('phase-'+str(phase)+'-worker-'+str(index)+'.json'))\n   if value!=1:raise ValueError('worker result differs')\n   total+=1\n return {'completed':total}\n").encode()
+                code=Path(transfer.__file__).read_bytes()+extra
+                request={'s2Generation':s2,'generation':'fixture','nonce':nonce,'duration':12,'adapter':{'bytes':len(code),'sha256':hashlib.sha256(code).hexdigest()}}
+                p=subprocess.run([sys.executable,'-I','-B','-c',transfer._BOOTSTRAP,json.dumps(request)],input=code,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=18)
+                self.assertEqual(p.returncode,0,p.stderr.decode(errors='replace'))
+                self.assertEqual(json.loads(p.stdout),{'completed':sum(shape)})
+                summaries=[json.loads(line[len(b'P01_OWNER_SUMMARY: '):]) for line in p.stderr.splitlines() if line.startswith(b'P01_OWNER_SUMMARY: ')]
+                self.assertEqual(len(summaries),1);summary=summaries[0]
+                self.assertEqual(summary['registered'],sum(shape)+1);self.assertEqual(summary['retired'],sum(shape));self.assertEqual(summary['activeCount'],1)
+                self.assertLessEqual(summary['peakActive'],3);self.assertNotEqual(summary['historySha256'],'0'*64)
+                directory=Path('/opt')/s2/'s3-admission-observations/fixture'/nonce
+                records=[path for path in directory.glob('phase-*-worker-*.json') if not path.name.endswith('.terminal.json')];self.assertEqual(len(records),sum(shape))
+                for path in records:
+                    identity=json.loads(path.read_text());self.assertNotEqual(transfer._owner_state({key:identity[key] for key in ('pid','starttime','pgid','sid')}),'live')
+                    terminal=json.loads(Path(str(path)+'.terminal.json').read_text());self.assertEqual(terminal['registrationSha256'],hashlib.sha256(path.read_bytes()).hexdigest());self.assertEqual(terminal['ownerRegistration'],identity['ownerRegistration']);self.assertEqual(terminal['status'],'succeeded')
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux native canonical payload and actual guest ledger controls')
+class NativeMemberOrderFix2Tests(unittest.TestCase):
+    def test_native_json_roundtrip_actual_guest_record_metadata_front_and_middle(self):
+        for payload_names in (['scripts/boot/helper.py'],['aaa','zzz']):
+            with self.subTest(payload_names=payload_names),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);pins={name:{'bytes':1,'sha256':hashlib.sha256(b'x').hexdigest(),'mode':0o444} for name in payload_names}
+                pins['manifest.json']={'bytes':2,'sha256':hashlib.sha256(b'{}').hexdigest(),'mode':0o444}
+                # Execute the real native JSON envelope. Only its task body is
+                # replaced by an order echo; actual guest ordinal code follows.
+                worker="import json,sys;p=json.load(sys.stdin);print(json.dumps({'ok':True,'result':list(p['members'])}))"
+                with patch.object(transfer,'_HOST_TRANSACTION',worker):value=_NATIVE_EXECUTE_HOST_TRANSACTION({},'harness',pins,root/'unused',time.monotonic()+3)
+                context={'spec':'a'*64};members={'handoff':{},'harness':pins};nonce='a'*32
+                base=root/'payload';argument={'role':'harness','nonce':nonce,'first':True}
+                transfer._payload_filesystem(base,context,members,['scripts','scripts/boot'] if payload_names[0].startswith('scripts/') else [],'prepare',argument,capacity_root=root)
+                for ordinal,name in enumerate(value['result']):
+                    pin=pins[name];record={'schemaVersion':1,'operationNonce':nonce,'action':'receive','status':'succeeded','child':{'pid':123,'starttime':'1','pgid':123,'sid':123},'bytes':pin['bytes'],'sha256':pin['sha256'],'sealSha256':None,'error':None,'possibleSurvivors':False,'observations':[]}
+                    transfer._payload_filesystem(base,context,members,[],'record',{**argument,'ordinal':ordinal,'name':name,'record':record},capacity_root=root)
+                self.assertEqual(transfer._payload_filesystem(base,context,members,[],'complete',argument,capacity_root=root),{'status':'succeeded'})
+
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux authenticated retirement and dead-leader controls')
+class OwnerRetirementSafetyFix2Tests(unittest.TestCase):
+    def run_guard(self,extra):
+        if not os.access('/opt',os.W_OK):self.skipTest('writable isolated /opt tmpfs required')
+        s2='p01-retire-negative-'+__import__('uuid').uuid4().hex[:10];nonce='a'*32
+        code=Path(transfer.__file__).read_bytes()+extra.encode()
+        request={'s2Generation':s2,'generation':'fixture','nonce':nonce,'duration':3,'adapter':{'bytes':len(code),'sha256':hashlib.sha256(code).hexdigest()}}
+        started=time.monotonic();p=subprocess.run([sys.executable,'-I','-B','-c',transfer._BOOTSTRAP,json.dumps(request)],input=code,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=9)
+        self.assertNotEqual(p.returncode,0,p.stdout);self.assertLess(time.monotonic()-started,8.5)
+        facts=[json.loads(line[len(b'P01_OWNER_FAILURE: '):]) for line in p.stderr.splitlines() if line.startswith(b'P01_OWNER_FAILURE: ')]
+        self.assertTrue(facts,p.stderr);return p,facts[-1],Path('/opt')/s2/'s3-admission-observations/fixture'/nonce
+    def test_wrong_retirement_nonce_and_parent_are_rejected(self):
+        for kind in ('nonce','parent'):
+            with self.subTest(kind=kind):
+                extra=r"""
+def _guest_install(r,deadline,directory):
+ directory=Path(directory)
+ if KIND=='nonce':
+  process,identity,token=_launch(['/usr/bin/python3','-I','-c','import time;time.sleep(4)'],None,directory,deadline)
+  _retire_owner(identity,'f'*32,deadline)
+ else:
+  childcode="import importlib.util,sys,time;from pathlib import Path;p=Path(sys.argv[1]);s=importlib.util.spec_from_file_location('owned_child',p/'adapter.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);m._fork_job(lambda:time.sleep(4),deadline=time.monotonic()+3,evidence_path=p/'foreign-worker.json')"
+  process,identity,token=_launch(['/usr/bin/python3','-I','-c',childcode,str(directory)],None,directory,deadline)
+  target=directory/'foreign-worker.json'
+  while not target.exists():
+   _remaining(deadline);time.sleep(.002)
+  registration=_decode(target.read_bytes());victim={key:registration[key] for key in ('pid','starttime','pgid','sid')}
+  _fork_job(lambda:_retire_owner(victim,registration['ownerRegistration'],deadline),deadline=deadline,evidence_path=directory/'wrong-parent-worker.json')
+ return {'unexpected':'retirement accepted'}
+""".replace('KIND',repr(kind))
+                p,facts,directory=self.run_guard(extra)
+                self.assertIn('unowned retirement parent/identity/nonce',facts['error'])
+                self.assertEqual(facts['ownershipSummary']['retired'],0)
+                self.assertGreaterEqual(len(facts['ownedChildren']),2)
+    def test_reaped_leader_with_group_descendant_is_never_retired_or_signalled(self):
+        extra=r"""
+def _guest_install(r,deadline,directory):
+ def work():
+  if os.fork()==0:
+   os.closerange(3,1024);time.sleep(.7);os._exit(0)
+  return 1
+ try:_fork_job(work,deadline=deadline,evidence_path=Path(directory)/'dead-leader.json')
+ except TransferFailure as error:
+  os.write(1,_encode({'possibleSurvivors':error.possible_survivors,'child':error.facts['child']}))
+  return {'unexpected':'unsafe leader retirement'}
+ raise ValueError('dead-leader descendant was silently forgotten')
+"""
+        p,facts,directory=self.run_guard(extra)
+        child=json.loads((directory/'dead-leader.json').read_text());pid=child['pid']
+        self.assertTrue(facts['possibleSurvivors']);self.assertIn(pid,[v['pid'] for v in facts['survivorIdentities']])
+        self.assertIn(pid,[v['pid'] for v in facts['ownedChildren']]);self.assertFalse([v for v in facts['signals'] if v['child']['pid']==pid])
+        self.assertEqual(facts['ownershipSummary']['retired'],0)
+
+
+class NativeCanonicalEnvelopeFix2Tests(unittest.TestCase):
+    def test_real_native_envelope_preserves_exact_pins_and_canonical_metadata_positions(self):
+        for names in (['scripts/boot/helper.py','manifest.json'],['aaa','zzz','manifest.json']):
+            with self.subTest(names=names):
+                members={name:{'bytes':index,'sha256':hashlib.sha256(name.encode()).hexdigest(),'mode':0o444} for index,name in enumerate(names)}
+                worker="import json,sys;p=json.load(sys.stdin);print(json.dumps({'ok':True,'result':{'names':list(p['members']),'members':p['members']}}))"
+                with patch.object(transfer,'_HOST_TRANSACTION',worker):value=_NATIVE_EXECUTE_HOST_TRANSACTION({},'harness',members,'unused',time.monotonic()+3)
+                self.assertEqual(value['result']['names'],sorted(names));self.assertEqual(value['result']['members'],members)
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux normal native public siblings with actual guest ledger/receiver/finalizer')
+class NativeSiblingMechanicalFix2Tests(unittest.TestCase):
+    def setUp(self):TransferAuthorityTests.setUp(self)
+    def exercise(self,metadata_middle):
+        import importlib.util,stat
+        config=self.root/'mechanical-config.json';module=self.root/'mechanical-adapter.py'
+        guest=self.root/'mechanical-guest';audit=self.root/'mechanical-admissions.log'
+        settings={'ready':{**self.f.env,'wslExecutable':str(Path(sys.executable).absolute())},'guest':str(guest),'audit':str(audit),'observer':digest(self.f.observer_bytes),'witness':digest(self.f.witness_bytes)}
+        config.write_text(json.dumps(settings))
+        # The external WSL/namespace boundary is the one injected seam. Both
+        # public native transactions, canonical payload, actual pinned source
+        # bytes, guest ledger, accepted receiver and rooted finalizer execute.
+        extra=r"""
+import source_build,wsl_environment,wsl_environment_guest
+_mechanical=json.loads(Path(CONFIG).read_text())
+source_build.OBSERVER_CODE_SHA256=_mechanical['observer'];source_build.WITNESS_CODE_SHA256=_mechanical['witness']
+wsl_environment._read_ready=lambda path:_mechanical['ready']
+def _host_call(output,key,argv,incoming,deadline):
+ if key=='admission':
+  request=json.loads(argv[-1])
+  with open(_mechanical['audit'],'ab') as log:log.write(_encode({'nonce':request['nonce'],'role':request['role'],'hostHistory':request['hostHistory']}))
+  value={'status':'admission-succeeded','nonce':request['nonce']}
+ else:
+  request=json.loads(argv[-4]);action=argv[-3];argument=json.loads(argv[-2]);root=Path(_mechanical['guest'])
+  context=_context_identity(request);role=request['role'];members=request['members'];dirs=request['directories']
+  common={'role':role,'nonce':request['nonce']}
+  if action=='receive':
+   _payload_filesystem(root,context,members,dirs,'prepare',{**common,'first':argument['first']},capacity_root=root.parent,eligible_history=request['hostHistory'])
+   pin=members[role][argument['name']]
+   wsl_environment_guest.receive_file(str(root/'inputs'/role/argument['name']),pin['sha256'],pin['bytes'],pin['mode'],incoming)
+   identity=_proc_fields(os.getpid())
+   value={'schemaVersion':1,'operationNonce':request['nonce'],'action':'receive','status':'succeeded','child':identity,'bytes':pin['bytes'],'sha256':pin['sha256'],'sealSha256':None,'error':None,'possibleSurvivors':False,'observations':[]}
+   validate_operation_record(value)
+   _payload_filesystem(root,context,members,dirs,'record',{**common,'ordinal':argument['ordinal'],'name':argument['name'],'record':value},capacity_root=root.parent,eligible_history=request['hostHistory'])
+  elif action=='finalize':
+   completed=subprocess.run([sys.executable,'-I','-B','-c',_FINALIZE,str(root/'inputs'/role),json.dumps(members[role]),json.dumps(dirs if role=='harness' else [])],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=_remaining(deadline))
+   if completed.returncode:raise ValueError('actual rooted finalizer failed: '+completed.stderr.decode(errors='replace'))
+   value=_decode(completed.stdout)
+   _payload_filesystem(root,context,members,dirs,'complete',common,capacity_root=root.parent,eligible_history=request['hostHistory'])
+  elif action=='complete':value={'status':'succeeded','nonce':request['nonce']}
+  else:raise ValueError('unexpected mechanical boundary action')
+ for channel,data in (('stdout',_encode(value)),('stderr',b'')):_host_write(output/(key+'.'+channel+'.log'),data,deadline)
+ return value
+""".replace('CONFIG',repr(str(config)))
+        code=Path(transfer.__file__).read_bytes()+extra.encode();module.write_bytes(code)
+        original_adapter=self.f.harness/transfer.ADAPTER_ROLE;original_adapter.write_bytes(code)
+        self.f.harness_manifest['files'][transfer.ADAPTER_ROLE]={**self.f.pin_path(original_adapter),'hostMode':stat.S_IMODE(original_adapter.stat().st_mode),'transferMode':0o444}
+        if metadata_middle:
+            (self.f.harness/'aaa').write_bytes(b'first')
+            self.f.harness_manifest['files']['aaa']={**self.f.pin_path(self.f.harness/'aaa'),'hostMode':stat.S_IMODE((self.f.harness/'aaa').stat().st_mode),'transferMode':0o444}
+        self.f.refresh();self.kw.update(spec_sha256=digest(self.f.spec_path.read_bytes()),timeout=30)
+        # The injected module also loads in this test process before its real
+        # native children. Contain its external-boundary shim here as well.
+        import wsl_environment
+        original_ready=wsl_environment._read_ready
+        original_constants=(source_build.OBSERVER_CODE_SHA256,source_build.WITNESS_CODE_SHA256)
+        def restored_helpers():
+            self.assertIs(wsl_environment._read_ready,original_ready)
+            self.assertEqual((source_build.OBSERVER_CODE_SHA256,source_build.WITNESS_CODE_SHA256),original_constants)
+        self.addCleanup(restored_helpers)
+        self.enterContext(patch.object(wsl_environment,'_read_ready',original_ready))
+        self.enterContext(patch.object(source_build,'OBSERVER_CODE_SHA256',original_constants[0]))
+        self.enterContext(patch.object(source_build,'WITNESS_CODE_SHA256',original_constants[1]))
+        spec=importlib.util.spec_from_file_location('mechanical_input',module);native=importlib.util.module_from_spec(spec);spec.loader.exec_module(native)
+        context=native._local_context(self.kw['environment_receipt'],self.kw['spec'],self.kw['spec_sha256'],30)
+        frozen=self.root/'native-frozen';source_build.freeze_harness(context['spec'],context['qualification'],output_directory=frozen)
+        first=native.transfer_environment(**self.kw)
+        second=native.transfer_harness(self.kw['environment_receipt'],frozen,spec=self.kw['spec'],spec_sha256=self.kw['spec_sha256'],output_directory=self.root/'native-harness-operation',timeout=30)
+        self.assertEqual(first['status'],'input-transfer-complete');self.assertEqual(second['status'],'input-transfer-complete')
+        admissions=[json.loads(line) for line in audit.read_bytes().splitlines()];self.assertEqual([row['role'] for row in admissions],['handoff','harness'])
+        self.assertNotEqual(admissions[0]['nonce'],admissions[1]['nonce']);self.assertEqual(len(admissions[1]['hostHistory']),1)
+        names=[entry['name'] for entry in second['members']];self.assertEqual(names,sorted(names))
+        self.assertEqual(names.index('manifest.json'),1 if metadata_middle else 0)
+        for ordinal,name in enumerate(names):
+            record=json.loads((guest/'operations/harness'/('member-'+str(ordinal)+'.json')).read_text())
+            self.assertEqual(record['sha256'],hashlib.sha256((guest/'inputs/harness'/name).read_bytes()).hexdigest())
+        self.assertTrue((guest/'operations/handoff/complete.json').exists());self.assertTrue((guest/'operations/harness/complete.json').exists())
+    def test_same_process_real_native_siblings_metadata_first(self):self.exercise(False)
+    def test_same_process_real_native_siblings_metadata_middle(self):self.exercise(True)
