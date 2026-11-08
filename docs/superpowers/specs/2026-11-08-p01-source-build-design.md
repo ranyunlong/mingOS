@@ -284,10 +284,8 @@ Original source/cache, six actual Kotlin compiles, independent RO exported-copy 
 
 S6 public single entry must obtain the fixed outer Tools archive from pinned input when absent, strictly load it and verify exact image identity. Manually preloaded/existing outer Tools cannot close P01. Keep first outer Tools load proof separate from inner daemon empty-store and three-image-load evidence. This is a downstream obligation, not S3 runtime work.
 
+## Task3 implementation acceptance (2026-11-08)
 
+Task3 seal/RO/wrapper implementation `ff6425e` completed independent Spec PASS/Quality Approved with no open findings. Controller verified its complete five-item scope, same-freeze full Linux151run/149pass/2Windows-onlyskips and native Windows151run/117pass/34platformskips, zero failure/error, no shared skipped test, plus independent actualallRO and five writable-input rejection controls. Context/byte inventory and actual RO remain separate gates; preserved identity-mutation and noexec-fixture failures retain original meaning.
 
-
-
-
-
-
+This accepts source/mechanical controls only. The local wrapper generator and no-handle pins create no authority. Future qualified coordinators still require original spec/readiness and fresh admitted live socket/namespace/manager observations before and after phases. Real source/cache restoration and compiler phases are Tasks4/5; guest.run is a reserved staged interface, with no fake successstub. Public orchestration and actualS3 acceptance remain Tasks6/7. External mocked privileged admission and intentionally failed Docker API fixtures do not prove real integration. S4–S6/P01 and every formal false flag remain open. See [stage evidence](../../p01-source-build.md).

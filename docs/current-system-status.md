@@ -6,7 +6,9 @@
 
 当前范围：`persistentUpdateNormalRebootVerified=true`；`persistentUpdateExplicitRecoveryVerified=true` 仅覆盖下述 Linux 受控进程中断与显式恢复。`formalQualification=false`、`finalSystemAccepted=false`。
 
-最新Task2检查点：候选`5e1fdbe`已通过同冻结完整Linux153项/151通过/2明确Windows专属跳过和Windows153项/105通过/48平台跳过，均零失败/错误、exit0；native Job/junction实际执行，无同项双平台跳过。原审查者对R4/F1/F2独立复审为Spec PASS、Quality Approved，主执行者核对全部18项要求映射及原始证据后接受Task2的源码与机械控制验收。active安全退休及canonical成员顺序已修复；全部中间失败代保留。Task3 seal与endpoint wrapper接续，实际S3恢复/六次编译/封存导出以及S4–S6仍未完成，全部11项目仍0/11；详细证据及边界见[S3记录](p01-source-build.md)。
+最新Task3：封存/只读验证与endpoint可执行包装器实现`ff6425e`，新独立审查Spec PASS、Quality Approved、无待修问题，主执行者核对五项要求后接受源码/机械控制。最终同冻结Linux151运行/149通过/2明确Windows专属跳过，Windows151运行/117通过/34平台跳过，均零失败/错误，无同项双平台跳过；真实all-RO与五种独立RW挂载负控通过。原始失败及资源保留。Task4源码/缓存恢复接续；实际S3恢复/六次编译/封存导出和S4–S6仍未验收，全部11项目仍0/11。真实准入和编译义务不能由外部夹具控制代替，详见[S3记录](p01-source-build.md)。
+
+Task2已验收记录：实现`5e1fdbe`已通过同冻结完整Linux153项/151通过/2明确Windows专属跳过和Windows153项/105通过/48平台跳过，均零失败/错误、exit0；native Job/junction实际执行，无同项双平台跳过。原审查者对R4/F1/F2独立复审为Spec PASS、Quality Approved，主执行者核对全部18项要求映射及原始证据后接受Task2的源码与机械控制验收。active安全退休及canonical成员顺序已修复；全部中间失败代保留。该验收已随文档提交`31edb06`发布，详细证据及边界见[S3记录](p01-source-build.md)。
 
 连续交付检查点：S2实际验收文档及其修复已推送，远程精确提交`95970c008ee3bc68538211c4dbcf4e0af8ed2b5b`。S3的[设计](superpowers/specs/2026-11-08-p01-source-build-design.md)和[七任务计划](superpowers/plans/2026-11-08-p01-source-build.md)已落盘，验收格式经独立复核；Task1本地严格spec/证明链校验与执行器冻结已完成独立复核，修复提交`e02bfb4`；主执行者新冻结Linux29/29、真实原证明链/365项清单/3.54GB归档本地演练通过，不启动WSL/Docker。Task2接口/预算/观察顺序已复核，传输实现继续，见[S3记录](p01-source-build.md)。S3实际恢复、六次Kotlin编译、独立只读回放和封存导出均尚未验收。
 

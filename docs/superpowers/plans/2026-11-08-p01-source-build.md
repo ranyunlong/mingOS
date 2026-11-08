@@ -88,15 +88,18 @@ Controller acceptance: `5e1fdbe` passed same-freeze full Linux153/151pass/2Windo
 
 ### Task 3: Seal contract and endpoint wrapper
 
+Task3 complete: implementation `ff6425e`, independent Spec PASS/Quality Approved, controller adopted all five requirements after same-freeze Linux151run/149pass/2Windows-onlyskips and Windows151run/117pass/34platformskips, zero failures/errors, plus actual allRO and five RW rejection controls. No shared platform skips; source pins stable. This accepts seal/wrapper source and mechanical controls only. Real guest.run restoration/compiler phases remain Tasks4/5, public orchestration Task6, actualS3 Task7; see [stage record](../../p01-source-build.md).
+
+
 **Files:** Create `source_build_seal.py`, `test_source_build_seal.py`, `source_build_guest.py`, `test_source_build_guest.py`.
 
 **Interfaces:** `seal(root: Path, *, context: dict, output: Path) -> dict`; `verify(root: Path, seal: Path, seal_sha256: str) -> dict`; guest `run(spec: dict, output: Path) -> dict`.
 
-- [ ] Add seal fixtures with one executable and empty directory. Require exact directory/file sets, modes/size/hash, rejects added file, changed mode/content, symlink, hardlink, special file, unsafe name and changed context. Assert RO root/seal/verifier checks are independent of byte equality.
-- [ ] Add wrapper tests injecting DOCKER_HOST/DOCKER_CONTEXT and hostile CONTAINERD_ADDRESS/CONTAINERD_NAMESPACE/CONTAINERD_SNAPSHOTTER plus lower/mixed-case keys (drop all keys whose uppercase starts CONTAINERD_), and attempting separate/equals --host/--context/--config, -H/-c, attached/combined shorts and every --tls/--tlsverify/--tlscacert/--tlscert/--tlskey override spelling; require sanitization/rejection. Assert argv begins with absolute Docker binary plus accepted endpoint/config, and wrapper produces no extra stdout.
-- [ ] Run targeted unittest modules; implement seal canonical JSON and traversal with a sibling seal to avoid self-reference. Use strict nofollow opens/identity checks and fsync, retaining partial failures.
-- [ ] Generate executable wrapper importing frozen DockerTransport and execing its actual argv with sanitized environment. Before each phase hash wrapper/module/binary; require actual endpoint socket/namespace identity through S2 live admission. Unit tests must call current Kotlin runner with `options['docker']=wrapper`, not a callable, and reject fake-control results in acceptance.
-- [ ] Run existing cache/Kotlin unit tests as regression controls; review/commit own changes.
+- [x] Add seal fixtures with one executable and empty directory. Require exact directory/file sets, modes/size/hash, rejects added file, changed mode/content, symlink, hardlink, special file, unsafe name and changed context. Assert RO root/seal/verifier checks are independent of byte equality.
+- [x] Add wrapper tests injecting DOCKER_HOST/DOCKER_CONTEXT and hostile CONTAINERD_ADDRESS/CONTAINERD_NAMESPACE/CONTAINERD_SNAPSHOTTER plus lower/mixed-case keys (drop all keys whose uppercase starts CONTAINERD_), and attempting separate/equals --host/--context/--config, -H/-c, attached/combined shorts and every --tls/--tlsverify/--tlscacert/--tlscert/--tlskey override spelling; require sanitization/rejection. Assert argv begins with absolute Docker binary plus accepted endpoint/config, and wrapper produces no extra stdout.
+- [x] Run targeted unittest modules; implement seal canonical JSON and traversal with a sibling seal to avoid self-reference. Use strict nofollow opens/identity checks and fsync, retaining partial failures.
+- [x] Generate executable wrapper importing frozen DockerTransport and execing its actual argv with sanitized environment. Before each phase hash wrapper/module/binary; require actual endpoint socket/namespace identity through S2 live admission. Unit tests must call current Kotlin runner with `options['docker']=wrapper`, not a callable, and reject fake-control results in acceptance.
+- [x] Run existing cache/Kotlin unit tests as regression controls; review/commit own changes.
 
 ### Task 4: Descriptor-identical import and cache restoration
 

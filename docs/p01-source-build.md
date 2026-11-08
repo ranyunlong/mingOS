@@ -2,6 +2,18 @@
 
 更新：2026-11-08。S1严格导入、S2独立WSL环境已实际验收；本页记录S3逐任务结果，不能据此关闭S3或P01。完整合同见[设计](superpowers/specs/2026-11-08-p01-source-build-design.md)和[七任务计划](superpowers/plans/2026-11-08-p01-source-build.md)。
 
+## 最新 Task3 检查点：源码与机械控制验收完成
+
+Task2验收及文档已发布至远程`31edb062bf582e28053a5448c2129bc59cb2e195`。Task3新增封存/只读验证和显式endpoint可执行包装器，实现提交为`ff6425e8a2d6994f3ffa98695fc1a76d927ce763`。新独立审查Spec PASS、Quality Approved，无Critical/Important/Minor问题；主执行者核对完整五项要求、双平台证据和真实挂载矩阵后接受本任务。`guest.run`的实际恢复/编译阶段继续由Tasks4/5实现，公开编排由Task6实现，本任务没有成功占位入口。
+
+- 最终冻结Linux `artifacts/p01-s3-task3-controls-20261108-a3365008/`：151运行、149通过、2项明确Windows专属跳过，零失败/错误，4.999秒、exit0。覆盖20项Task3、27项cache、16项Kotlin、9项transport、39项S2 host、40项S2 guest控制。
+- 同冻结Windows `.superpowers/sdd/2026-11-08-p01-source-build/task-3-final-windows-52b47537/`：151运行、117通过、34项平台跳过，零失败/错误，2.950秒、exit0；实际Windows snapshot/junction执行，无同项双平台跳过。145项冻结pin和144项当前源pin重核一致。
+- 独立固定canonical seal、不使用候选代码准备夹具；真实all-RO重开通过。另五个新代分别将payload、seal、verifier目录、payload内嵌目录和verifier单文件设为可写，均在字节未变时拒绝；每项1/1、零跳过。对应控制代为`cadd9ab5`、`597dfa48`、`eec50fc2`、`85ae7656`、`c7e5b13a`，完整证据均保留。
+- 当前Kotlin/cache真实API实际接收绝对包装器路径；外部Docker夹具故意以23退出，验证的是可执行边界、原始二进制通道、退出码及失败收据，不是缓存恢复或编译验收。阶段准入测试有明确的外部S2观察夹具；实际S3仍必须重新完成原证明链及live admission。
+- 初始缺失实现RED、夹具初始化失败、tmpfs默认noexec导致的包装器EACCES、同字节文件身份替换的真实RED均保留。独立mountinfo/执行对照确认noexec原因，只修正测试私有tmpfs的exec属性；身份缺口以跨扫描root/dir/file身份比较修复。原失败代不改判。
+
+独立报告为`.superpowers/sdd/2026-11-08-p01-source-build/task-3-independent-review.md`，逐项重核patch与全部证据pin。审查中的三个CannotVerify项分别属于后续真实S2阶段准入、实际cache/Kotlin完成及完整S3编排；主执行者对照Tasks4–7确认这些依赖保持开放，不将机械控制当作真实集成。控制结果中的`fullTask3Accepted=false`保留生成时语义。接续Task4源码/缓存恢复；实际S3恢复/六次编译/封存导出、S4–S6、P01及全部11项整项交付仍未完成，正式资格标志保持false。
+
 ## Task 1：本地证明链准入与执行代码冻结
 
 实现提交为`6403f8b`及审查修复`e02bfb4472247865321bf70b1e0a837afae0f763`。独立审查修复后Spec PASS、Quality Approved。公开模块`scripts/boot/source_build.py`目前只实现以下本地API：
