@@ -6,6 +6,8 @@
 
 当前范围：`persistentUpdateNormalRebootVerified=true`；`persistentUpdateExplicitRecoveryVerified=true` 仅覆盖下述 Linux 受控进程中断与显式恢复。`formalQualification=false`、`finalSystemAccepted=false`。
 
+最新Task2检查点：候选`5e1fdbe`已通过同冻结完整Linux153项/151通过/2明确Windows专属跳过和Windows153项/105通过/48平台跳过，均零失败/错误、exit0；native Job/junction实际执行，无同项双平台跳过。原审查者对R4/F1/F2独立复审为Spec PASS、Quality Approved，主执行者核对全部18项要求映射及原始证据后接受Task2的源码与机械控制验收。active安全退休及canonical成员顺序已修复；全部中间失败代保留。Task3 seal与endpoint wrapper接续，实际S3恢复/六次编译/封存导出以及S4–S6仍未完成，全部11项目仍0/11；详细证据及边界见[S3记录](p01-source-build.md)。
+
 连续交付检查点：S2实际验收文档及其修复已推送，远程精确提交`95970c008ee3bc68538211c4dbcf4e0af8ed2b5b`。S3的[设计](superpowers/specs/2026-11-08-p01-source-build-design.md)和[七任务计划](superpowers/plans/2026-11-08-p01-source-build.md)已落盘，验收格式经独立复核；Task1本地严格spec/证明链校验与执行器冻结已完成独立复核，修复提交`e02bfb4`；主执行者新冻结Linux29/29、真实原证明链/365项清单/3.54GB归档本地演练通过，不启动WSL/Docker。Task2接口/预算/观察顺序已复核，传输实现继续，见[S3记录](p01-source-build.md)。S3实际恢复、六次Kotlin编译、独立只读回放和封存导出均尚未验收。
 
 S2公共入口create/observe/exec已实现并通过Task4代码复核，提交`f00331c`。首次正式新代`554bde65`的create退出0，但独立实际审计发现插件命名空间实际为`plugins.moby`，与本代专属值不符，因此S2未通过；原代、失败观察和全部资源保留。首轮修复补齐实际命名空间准入/回放检查并通过冻结Linux回归139项运行、138通过、1项Windows junction专属跳过及独立代码复核；但新代`8039baf3`在launch阶段因固定Docker拒绝单数JSON键而失败。已保留停止发行版的离线导出和原始错误；固定二进制`--help/--validate`证实应省略两种plugin JSON键并使用复数CLI选项，受影响修复和另一个全新代实际验收继续，不将配置校验当作实际namespace通过，见[环境记录](p01-environment-audit.md)。
