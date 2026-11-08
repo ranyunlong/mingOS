@@ -464,6 +464,85 @@ class SourceBuildTests(unittest.TestCase):
         f.refresh()
         self.reject(f)
 
+    def test_fix1_freeze_preserves_inventory_and_deleted_path(self):
+        f = self.fixture()
+        q = self.api.qualify_source_build(f.spec_path, f.spec_sha)
+        before = {p.relative_to(f.base).as_posix(): f.pin_path(p) for p in f.base.rglob('*') if p.is_file()}
+        for output in (f.base / 'new-output', f.base / 'environment/new-output',
+                       f.base / 'environment/frozen/new-output', f.harness / 'new-output',
+                       f.checkout / 'deleted.txt'):
+            with self.subTest(output=str(output)):
+                with self.assertRaises(ValueError):
+                    self.api.freeze_harness(f.spec, q, output_directory=output)
+                self.assertFalse(output.exists())
+                self.assertEqual(before, {p.relative_to(f.base).as_posix(): f.pin_path(p)
+                                          for p in f.base.rglob('*') if p.is_file()})
+                self.assertFalse((f.checkout / 'deleted.txt').exists())
+                self.assertEqual(q, self.api.qualify_source_build(f.spec_path, f.spec_sha))
+
+    def test_fix1_all_pinned_external_files_and_ancestors_protected(self):
+        f = self.fixture()
+        protected = self.root / 'external-proofs'; protected.mkdir()
+        original_external = f.external
+        def external(name, data):
+            if name in ('source-review.md', 'controls.json', 'actual-review.md', 'verdict.json', 'closure.json'):
+                path = protected / name; path.write_bytes(data)
+                return {'path': str(path), **f.pin_path(path)}
+            return original_external(name, data)
+        f.external = external; f.refresh()
+        q = self.api.qualify_source_build(f.spec_path, f.spec_sha)
+        before = {p.name: f.pin_path(p) for p in protected.iterdir()}
+        for output in (protected, *(protected / name for name in before), f.checkout / 'changed.txt'):
+            with self.subTest(output=str(output)), self.assertRaises(ValueError):
+                self.api.freeze_harness(f.spec, q, output_directory=output)
+        self.assertEqual(before, {p.name: f.pin_path(p) for p in protected.iterdir()})
+        self.assertEqual(q, self.api.qualify_source_build(f.spec_path, f.spec_sha))
+
+    def test_fix1_exclusions_allow_siblings_but_protect_pinned_files(self):
+        f = self.fixture()
+        pinned_root = f.base / 'qualification-evidence/pinned'; pinned_root.mkdir()
+        original_external = f.external
+        def external(name, data):
+            if name == 'actual-review.md':
+                path = pinned_root / name; path.write_bytes(data)
+                return {'path': str(path), **f.pin_path(path)}
+            return original_external(name, data)
+        f.external = external; f.refresh()
+        q = self.api.qualify_source_build(f.spec_path, f.spec_sha)
+        before = f.pin_path(pinned_root / 'actual-review.md')
+        for output in (pinned_root, pinned_root / 'actual-review.md'):
+            with self.subTest(output=str(output)), self.assertRaises(ValueError):
+                self.api.freeze_harness(f.spec, q, output_directory=output)
+        self.assertEqual(before, f.pin_path(pinned_root / 'actual-review.md'))
+        for output in (f.base / 'qualification-evidence/sibling-output',
+                       f.base / 'environment/distro/sibling-output', f.checkout / 'unrelated-output'):
+            result = self.api.freeze_harness(f.spec, q, output_directory=output)
+            self.assertEqual(result['status'], 'source-build-harness-frozen-local')
+            self.assertEqual(q, self.api.qualify_source_build(f.spec_path, f.spec_sha))
+
+    def test_fix1_guest_path_rejects_resigned_host_and_aliases(self):
+        f = self.fixture()
+        values = ['C:\\guest\\tomllib.py', 'tomllib.py', '/usr//lib/tomllib.py',
+                  '/usr/./lib/tomllib.py', '/usr/../lib/tomllib.py', '/usr/lib/tomllib/', '/']
+        if os.name == 'nt':
+            values.append(str(f.spec_path))
+        for value in values:
+            with self.subTest(value=value):
+                f.controls['interpreter']['tomllib'] = value; f.refresh(); self.reject(f)
+
+    def test_fix1_guest_path_validation_never_reads_host_filesystem(self):
+        self.require_api()
+        with (patch.object(Path, 'lstat', side_effect=AssertionError('host stat forbidden')),
+              patch.object(Path, 'stat', side_effect=AssertionError('host stat forbidden')),
+              patch.object(os, 'stat', side_effect=AssertionError('host stat forbidden')),
+              patch.object(os, 'lstat', side_effect=AssertionError('host stat forbidden')),
+              patch.object(Path, 'open', side_effect=AssertionError('host open forbidden')),
+              patch.object(os, 'open', side_effect=AssertionError('host descriptor forbidden'))):
+            self.api._path_text('/usr/lib/python3.13/tomllib/__init__.py')
+            for value in ('C:\\guest\\tomllib.py', '/usr/lib/tomllib/', 'relative.py'):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    self.api._path_text(value)
+
     def test_forged_qualification_boolean_alias_rejects(self):
         f = self.fixture()
         q = self.api.qualify_source_build(f.spec_path, f.spec_sha)

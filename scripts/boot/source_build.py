@@ -128,14 +128,13 @@ def _path(value):
 
 
 def _path_text(value):
-    """A guest provenance path may not be a local host-readable path."""
+    """Validate guest provenance structurally; never inspect the host filesystem."""
     value = _text(value)
-    if value.startswith('/'):
-        if ('\\' in value or '//' in value or any(p in ('.', '..') for p in value.split('/'))
-                or any(ord(c) < 32 for c in value)):
-            raise ValueError('noncanonical guest path')
-    else:
-        _path(value)
+    if (not value.startswith('/') or value == '/' or value.endswith('/')
+            or '\\' in value or '//' in value
+            or any(p in ('.', '..') for p in value.split('/'))
+            or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+        raise ValueError('canonical absolute POSIX guest file path required')
 
 
 def _stamp(info):
@@ -603,6 +602,11 @@ def _harness(reader, spec):
 
 def qualify_source_build(spec: Path, spec_sha256: str) -> dict:
     """Read-only local proof gate. The supplied spec hash is the trust input."""
+    return _qualify_source_build(spec, spec_sha256)[0]
+
+
+def _qualify_source_build(spec, spec_sha256):
+    """Keep protected-input metadata private to this qualification execution."""
     reader = _Reader()
     spec_ref = {'path': str(_path(spec)), 'sha256': _hex(spec_sha256)}
     value = reader.read(spec_ref, json_value=True, full=False)
@@ -613,7 +617,7 @@ def qualify_source_build(spec: Path, spec_sha256: str) -> dict:
     reader.read(handoff)
     harness = _harness(reader, value['harness'])
     reader.recheck()
-    return {'schemaVersion': 1, 'status': 'source-build-qualified-local',
+    result = {'schemaVersion': 1, 'status': 'source-build-qualified-local',
             'specRef': spec_ref, 'spec': value,
             's2Acceptance': value['s2Acceptance'], 'environment': value['environment'],
             'reviewedSourceClosure': acceptance['reviewedSourceClosure'],
@@ -624,10 +628,30 @@ def qualify_source_build(spec: Path, spec_sha256: str) -> dict:
             'harnessManifestSha256': value['harness']['manifestSha256'], 'checkout': harness['checkout'],
             'formalQualification': False, 'finalSystemAccepted': False,
             'coldBuildExecuted': False, 'guestStarted': False, 'resourcesPreserved': True}
+    protected = {'files': tuple(Path(name) for name in reader.observed),
+                 'inventory': Path(proof['inventory']['pathBase']),
+                 'closures': (Path(proof['environment']['helpers']['root']), Path(value['harness']['path'])),
+                 'dirty': tuple(Path(harness['checkout']['path']) / name
+                                for name in harness['checkout']['dirtyFiles'])}
+    return result, protected
 
 
 def _overlap(a, b):
     return a == b or a in b.parents or b in a.parents
+
+
+def _protect_freeze_output(output, protected):
+    for path in (*protected['files'], *protected['dirty']):
+        if output == path or output in path.parents:
+            raise ValueError('freeze output overlaps protected proof or checkout provenance')
+    if any(_overlap(output, root) for root in protected['closures']):
+        raise ValueError('freeze output changes an exact input closure')
+    root = protected['inventory']
+    if output == root or output in root.parents:
+        raise ValueError('freeze output overlaps evidence root')
+    if root in output.parents and not any(
+            root / name in output.parents for name in _EXCLUSIONS):
+        raise ValueError('freeze output changes immutable evidence membership')
 
 
 def _sync_directory(path):
@@ -649,13 +673,11 @@ def freeze_harness(spec: dict, qualification: dict, *, output_directory: Path) -
     if type(qualification) is not dict or qualification.get('status') != 'source-build-qualified-local':
         raise ValueError('local qualification result required')
     ref = _ref(qualification.get('specRef'), full=False)
-    fresh = qualify_source_build(Path(ref['path']), ref['sha256'])
+    fresh, protected = _qualify_source_build(Path(ref['path']), ref['sha256'])
     if not _same(fresh, qualification) or not _same(fresh['spec'], spec):
         raise ValueError('caller qualification/spec differs from revalidated proof')
+    _protect_freeze_output(output, protected)
     source = _path(spec['harness']['path'])
-    input_files = [Path(ref['path']), Path(spec['handoff']['path']), Path(spec['environment']['path']), Path(spec['s2Acceptance']['path'])]
-    if _overlap(source, output) or any(output == p or output in p.parents for p in input_files):
-        raise ValueError('input and output roots overlap')
     reader = _Reader()
     manifest = _harness(reader, spec['harness'])
     output.mkdir()
