@@ -233,7 +233,7 @@ class SourceCacheBudgetTests(unittest.TestCase):
         self.assertEqual(budget['linuxTotalBytes'], 17448346661)
         self.assertEqual(budget['alreadyRetainedBytes'], 240)
         self.assertEqual(budget['linuxAdditionalBytes'], 17448346421)
-        self.assertEqual(budget['hostRequiredBytes'], 167)
+        self.assertEqual(budget['hostRequiredBytes'], 17448346828)
         self.assertEqual(budget['kotlinPrepareMinimumBytes'], 8 * 1024**3)
 
     def test_budget_rejects_bool_negative_and_missing_values(self):
@@ -254,7 +254,41 @@ class SourceCacheBudgetTests(unittest.TestCase):
             host_reserve=1,linux_reserve=1,export_max=10*1024**3)
         self.assertEqual(budget['items']['kotlinWorkAndOutputs'],20*1024**3)
         self.assertEqual(budget['items']['guestCopyAndCanonicalExport'],20*1024**3)
-        self.assertEqual(budget['hostRequiredBytes'],20*1024**3+1)
+        self.assertEqual(budget['hostRequiredBytes'],budget['linuxTotalBytes']+20*1024**3+1)
+
+    def test_host_budget_covers_full_linux_backing_growth_without_sparse_vhd_assumption(self):
+        function=self.feature('_source_cache_budget')
+        arguments=dict(archive=100,harness=20,delivery=300,source=40,cache_archive=50,
+            cache_payload=60,gradle=30,entries=10,host_reserve=1024**3,
+            linux_reserve=2*1024**3,export_max=1024**3)
+        budget=function(**arguments)
+        self.assertEqual(budget['hostRequiredBytes'],budget['linuxTotalBytes']+3*1024**3)
+        # Every part of the Linux ledger may need new Windows backing, including
+        # retained inputs and reserves; ext4 bavail proves no physical allocation.
+        for key in ('archive','harness','delivery','source','cache_archive','cache_payload',
+                    'gradle','entries','linux_reserve'):
+            larger=function(**{**arguments,key:arguments[key]+12345})
+            with self.subTest(key=key):
+                self.assertEqual(larger['hostRequiredBytes']-budget['hostRequiredBytes'],
+                                 larger['linuxTotalBytes']-budget['linuxTotalBytes'])
+                self.assertGreater(larger['hostRequiredBytes'],budget['hostRequiredBytes'])
+
+    def test_sufficient_ext4_but_export_only_host_free_space_is_rejected(self):
+        budget=self.feature('_source_cache_budget')(archive=100,harness=20,delivery=300,source=40,
+            cache_archive=50,cache_payload=60,gradle=30,entries=10,
+            host_reserve=1024**3,linux_reserve=1024**3,export_max=1024**3)
+        host={'specSha256':'a'*64,'environment':{'path':'C:/environment.json','sha256':'b'*64},
+            's2Generation':'s2','generation':'s3','availableBytes':3*1024**3,
+            'vhd':{'path':'C:/data.vhdx','bytes':200,'device':3,'inode':4}}
+        linux={'filesystemType':0xef53,'device':7,'availableBytes':100*1024**3,
+               'mountinfo':'7 / ext4 rw','path':'/var/lib/s2','inode':9}
+        check=self.feature('_check_source_cache_capacity')
+        context=dict(spec_sha256='a'*64,environment=host['environment'],s2_generation='s2',
+                     generation='s3',expected_device=7)
+        with self.assertRaises(ValueError):check(budget,host,linux,**context)
+        complete=budget['linuxTotalBytes']+3*1024**3
+        with self.assertRaises(ValueError):check(budget,{**host,'availableBytes':complete-1},linux,**context)
+        self.assertEqual(check(budget,{**host,'availableBytes':complete},linux,**context),linux)
 
     def test_fixed_paths_derive_from_both_generations_reject_aliases(self):
         paths = self.feature('_phase_paths')('s2-control', 's3-control')
@@ -278,6 +312,75 @@ class SourceCacheBudgetTests(unittest.TestCase):
         for changed in ({'files': {'LICENSE':'d'*64}, 'directories':['']},
                         {'files':mapping['snapshot']['files'], 'directories':['','src','build']}):
             with self.assertRaises(ValueError): target._check_filtered_snapshot(mapping, changed)
+
+    def test_filtered_snapshot_accepts_original_consumer_mixed_case_recursive_order(self):
+        # Literal sourceTree/snapshotTree output format from unchanged
+        # kotlin_delivery_pipeline.mjs:30-33 and build-linux-host-kotlin.mjs:63-66:
+        # recursive pre-order, each sibling list sorted with JS localeCompare.
+        root='probes/compose-frame/coroutines-port/upstream'
+        directories=['','probes','probes/compose-frame','probes/compose-frame/coroutines-port',root,
+            root+'/commonMain',root+'/commonMain/kotlin',root+'/jsAndWasmSharedMain',
+            root+'/META-INF',root+'/wasmWasiMain']
+        files={root+'/commonMain/kotlin/Main.kt':'a'*64,root+'/META-INF/module.kotlin_module':'b'*64}
+        manifest={'files':{name:{'sha256':digest} for name,digest in files.items()},
+                  'directories':directories[1:]}
+        mapping=self.feature('_filtered_source_mapping')(manifest,'c'*64)
+        self.assertNotEqual(mapping['snapshot']['directories'],directories)
+        consumer={'files':files,'directories':directories}
+        try:observed=self.feature('_check_filtered_snapshot')(mapping,consumer)
+        except ValueError as error:self.fail('valid unchanged consumer mixed-case order rejected: '+str(error))
+        self.assertIs(observed,consumer)
+
+    def test_filtered_snapshot_accepts_original_consumer_nested_prefix_order(self):
+        # Recursive traversal visits a/deep before the sibling a-z, whereas a
+        # global Python path sort puts a-z before a/deep.
+        consumer={'files':{'a/deep/Main.kt':'a'*64,'a-z/Other.kt':'b'*64},
+                  'directories':['','a','a/deep','a-z']}
+        manifest={'files':{name:{'sha256':digest} for name,digest in consumer['files'].items()},
+                  'directories':['a','a/deep','a-z']}
+        mapping=self.feature('_filtered_source_mapping')(manifest,'c'*64)
+        self.assertNotEqual(mapping['snapshot']['directories'],consumer['directories'])
+        try:observed=self.feature('_check_filtered_snapshot')(mapping,consumer)
+        except ValueError as error:self.fail('valid unchanged consumer nested-prefix order rejected: '+str(error))
+        self.assertIs(observed,consumer)
+
+    def test_filtered_snapshot_rejects_duplicate_missing_extra_and_unsafe_directory_collections(self):
+        import copy
+        good={'files':{'a/deep/Main.kt':'a'*64},'directories':['','a','a/deep']}
+        mapping={'sourceDescriptorSha256':'b'*64,'snapshot':copy.deepcopy(good)}
+        check=self.feature('_check_filtered_snapshot')
+        for directories in (['','a','a','a/deep'],['','a'],['','a','a/deep','extra'],
+                ['a','a/deep'],['','a/deep'],['','a','../escape'],['','a','/absolute'],
+                ['','a','a//deep'],['','a','a\\deep'],['','a','a/.'],['','a',1],
+                ('','a','a/deep'),None):
+            with self.subTest(directories=directories),self.assertRaises(ValueError):
+                check(mapping,{**good,'directories':directories})
+        # Both collections need independent validation: matching malformed input
+        # cannot become acceptable merely because normalization compares equal.
+        for directories in (['','a','a','a/deep'],['','a/deep'],['','a','../escape'],
+                            ['','a','/absolute'],['','a','a\\deep'],['','a',1]):
+            invalid={**good,'directories':directories}
+            with self.subTest(identical_invalid=directories),self.assertRaises(ValueError):
+                check({**mapping,'snapshot':copy.deepcopy(invalid)},invalid)
+
+    def test_filtered_snapshot_retains_exact_file_hash_path_and_type_validation(self):
+        import copy
+        good={'files':{'a/Main.kt':'a'*64},'directories':['','a']}
+        mapping={'sourceDescriptorSha256':'b'*64,'snapshot':copy.deepcopy(good)}
+        check=self.feature('_check_filtered_snapshot')
+        for files in ({},{'a/Main.kt':'c'*64},{'a/Main.kt':'a'*64,'a/extra.kt':'b'*64},
+                      {'a/Main.kt':1},{'a/Main.kt':'INVALID'},{'../Main.kt':'a'*64},[],None):
+            with self.subTest(files=files),self.assertRaises(ValueError):
+                check(mapping,{**good,'files':files})
+        for invalid in ({'files':{'a/Main.kt':1},'directories':['','a']},
+                        {'files':{'a/Main.kt':'INVALID'},'directories':['','a']},
+                        {'files':{'a/../Main.kt':'a'*64},'directories':['','a']},
+                        {'files':{'missing/Main.kt':'a'*64},'directories':['']},
+                        {'files':{'a':'a'*64},'directories':['','a']},
+                        {'files':[],'directories':['']},
+                        {**good,'unexpected':True}):
+            with self.subTest(identical_invalid=invalid),self.assertRaises(ValueError):
+                check({**mapping,'snapshot':copy.deepcopy(invalid)},invalid)
 
 
 @unittest.skipUnless(sys.platform == 'linux', 'Linux full-source/cache descriptor controls')

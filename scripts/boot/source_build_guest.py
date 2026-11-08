@@ -244,7 +244,10 @@ def _source_cache_budget(*, archive, harness, delivery, source, cache_archive,
     total = sum(items.values())
     return {'items': items, 'linuxTotalBytes': total, 'alreadyRetainedBytes': 2 * inputs,
             'linuxAdditionalBytes': total - 2 * inputs,
-            'hostRequiredBytes': 2 * export_max + host_reserve,
+            # ext4 bavail does not prove that a growing/sparse VHD already has
+            # Windows backing. Conservatively allow the entire Linux ledger,
+            # plus the host canonical archive/extraction and configured reserve.
+            'hostRequiredBytes': total + 2 * export_max + host_reserve,
             'kotlinPrepareMinimumBytes': 8 * 1024**3}
 
 
@@ -569,8 +572,31 @@ def _filtered_source_mapping(manifest, descriptor_sha256):
 
 
 def _check_filtered_snapshot(mapping, snapshot):
-    _require(_host_contract._same(mapping['snapshot'], snapshot), 'filtered Kotlin snapshot differs from full source mapping')
+    expected = _normalized_filtered_snapshot(mapping['snapshot'])
+    observed = _normalized_filtered_snapshot(snapshot)
+    _require(_host_contract._same(expected, observed), 'filtered Kotlin snapshot differs from full source mapping')
     return snapshot
+
+
+def _normalized_filtered_snapshot(snapshot):
+    """Validate each full collection before ignoring consumer traversal order.
+
+    The unchanged JS consumer recursively visits localeCompare-sorted siblings;
+    a global Python path sort is different. Files still compare by exact path
+    and hash, and directory uniqueness/parents/collisions are checked first.
+    """
+    _host_contract._object(snapshot, ('files', 'directories'))
+    files, directories = snapshot['files'], snapshot['directories']
+    _require(type(files) is dict and type(directories) is list, 'snapshot file/directory collection types differ')
+    for name in directories:
+        _require(type(name) is str, 'snapshot directory must be a string')
+        if name: _host_contract._relative(name)
+    _require(directories.count('') == 1, 'snapshot must declare exactly one root directory')
+    # The original helper rejects duplicate/aliased names, file/directory
+    # collisions, unsafe paths and every missing parent, before any sorting.
+    _host_contract._parents_declared([name for name in directories if name], files)
+    for digest in files.values(): _host_contract._hex(digest)
+    return {'files': files, 'directories': sorted(directories)}
 
 
 def _full_source_mapping(imported, descriptor_sha256):
