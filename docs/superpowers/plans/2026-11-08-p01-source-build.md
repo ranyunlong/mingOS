@@ -118,16 +118,18 @@ Controller acceptance: implementation `2254d24` and fix `731fca9` passed origina
 
 ### Task 5: Six genuine Kotlin compiles and toolchain byte verification
 
+Controller acceptance: implementation `f3a5972` passed fresh independent Spec PASS/Quality Approved with no findings; parent adopted all six original requirements after current same-source Linux245/Windows245 controls, actual manager3/ownership8, Kotlin JS41 and isolated actual final-Node/0700-copy-worker controls. Aggregate matrix has no unexecuted control; 138 protected files/41 accepted functions/58 accepted tests remain intact. Checkboxes below close the source/mechanical implementation gate only. Task7 must still execute the actual admitted six compiles and complete tool/dependency/copy/replay chain. See [stage evidence](../../p01-source-build.md).
+
 **Files:** Extend `source_build_guest.py`, create `source_build_toolchain.py`, `source_build_replay.mjs`, tests `test_source_build_toolchain.py`; extend guest tests.
 
 **Interfaces:** Current `kotlin_delivery.run(options, docker=None) -> dict`; new `observe(image: str, expected: dict, output: Path) -> dict`, `verify(observation: dict, tools_root: Path, expected: dict) -> dict`. Expected tool identities come from admitted image/locked toolchain closure, never from a package's own evidence.
 
-- [ ] Add tests asserting profile order and exact labels developer-workflow=[notes-demo,animated-demo], uninstall=[read-file,image-viewer,text-entry-demo,uninstall]; each gets separate new output/volumes and original restored Gradle cache. Reject synthetic_controls, fake-control, missing compiler log/task, predecessor mismatch or package identity mismatch.
-- [ ] Add fixture where Node/Java version strings are correct but actual binary hash differs from toolchain.json; verification must fail. Cover executable symlink resolution inside fixed image, wrong image, Gradle archive/wrapper mismatch and absent tool bytes. Do not edit imported build-linux-host-kotlin.mjs.
-- [ ] Implement real per-profile runner invocation through wrapper. Require pipeline-completed/actual-docker, six executed compiler chains, forced offline flags, proper package SDK and independently RO verify-all. Collect exact command/raw logs and final inspect including timeout/stop-owned outcome.
-- [ ] Implement new RO-root/no-network tool observation containers hashing actual Node, Java, Gradle distribution and locked compiler dependencies; observe Tools/Rust executables for S4 handoff without compiling Rust. Cross-check every package toolchain.json nodePath/nodeSha256/javaPath/javaSha256 and fixed image identity against independent actual bytes.
-- [ ] Copy output with existing Docker cp, then mount exported copy RO in another verifier container and rerun existing `verifyReplayContracts`/`verifyPackage` through explicit frozen JS glue. Compare exact copy inventory including POSIX modes against original output volume; bind source mapping, dependencies, six package evidence and observations into new seal.
-- [ ] Run focused tests plus existing Kotlin tests once; review/commit own changes.
+- [x] Add tests asserting profile order and exact labels developer-workflow=[notes-demo,animated-demo], uninstall=[read-file,image-viewer,text-entry-demo,uninstall]; each gets separate new output/volumes and original restored Gradle cache. Reject synthetic_controls, fake-control, missing compiler log/task, predecessor mismatch or package identity mismatch.
+- [x] Add fixture where Node/Java version strings are correct but actual binary hash differs from toolchain.json; verification must fail. Cover executable symlink resolution inside fixed image, wrong image, Gradle archive/wrapper mismatch and absent tool bytes. Do not edit imported build-linux-host-kotlin.mjs.
+- [x] Implement real per-profile runner invocation through wrapper. Require pipeline-completed/actual-docker, six executed compiler chains, forced offline flags, proper package SDK and independently RO verify-all. Collect exact command/raw logs and final inspect including timeout/stop-owned outcome.
+- [x] Implement new RO-root/no-network tool observation containers hashing actual Node, Java, Gradle distribution and locked compiler dependencies; observe Tools/Rust executables for S4 handoff without compiling Rust. Cross-check every package toolchain.json nodePath/nodeSha256/javaPath/javaSha256 and fixed image identity against independent actual bytes.
+- [x] Copy output with existing Docker cp, then mount exported copy RO in another verifier container and rerun existing `verifyReplayContracts`/`verifyPackage` through explicit frozen JS glue. Compare exact copy inventory including POSIX modes against original output volume; bind source mapping, dependencies, six package evidence and observations into new seal.
+- [x] Run focused tests plus existing Kotlin tests once; review/commit own changes.
 
 ### Task 6: Sealed host export and independent RO replay
 

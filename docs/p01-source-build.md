@@ -2,7 +2,27 @@
 
 更新：2026-11-08。S1严格导入、S2独立WSL环境已实际验收；本页记录S3逐任务结果，不能据此关闭S3或P01。完整合同见[设计](superpowers/specs/2026-11-08-p01-source-build-design.md)和[七任务计划](superpowers/plans/2026-11-08-p01-source-build.md)。
 
-## 最新 Task4：源码与机械控制验收完成
+## 最新 Task5：源码与机械控制验收完成
+
+源码检查点`f3a59723e967ba30ebec424c35f37ea44e5ae661`实现两profile六次Kotlin编译的私有编排、实际工具字节观察与镜像、复制产物只读回放及封存。新独立审查为Spec PASS、Quality Approved，零Critical/Important/Minor；主执行者核对全部六项原始要求及下表原始证据后接受Task5源码/机械控制。六次真实编译及完整S3仍须Task7实际验收；本地实现与阶段文档的远程发布另行核对。
+
+| 同源验证 | 结果与证据 |
+| --- | --- |
+| 完整Linux九模块 | 245运行、241通过、4明确跳过，零失败/错误；`artifacts/p01-s3-task5-controls-20261108-49ba1072/result.json` |
+| 同冻结原生Windows | 245运行、166通过、79平台跳过，零失败/错误；`.superpowers/sdd/2026-11-08-p01-source-build/task-5-final-windows-dbc6367c/result.json` |
+| 实际root管理器 | 3/3，原能力集合194；`artifacts/p01-s3-task5-manager-controls-20261108-b4ddd5e2/result.json` |
+| 实际CHOWN-only | 8/8，包含既有所有权历史和新增复制树初始化；`artifacts/p01-s3-task5-ownership-controls-20261108-8fce13f1/result.json` |
+| 既有Kotlin JS合同/回放 | 固定Kotlin镜像41/41，零跳过；`artifacts/p01-s3-task5-node-contracts-20261108-bd814597/result.json`，使用synthetic Wasm，不编译Kotlin |
+
+合并矩阵没有未执行测试；148个冻结/当前源码pin、138个受保护文件、41个既有函数和58个既有测试AST均已复核。最终Node胶水的实际固定镜像观察为`artifacts/p01-s3-task5-node-observer-20261108-5d453c1b/result.json`。独立0700/UID65534复制树控制`artifacts/p01-s3-task5-copy-observer-20261108-fd74ba9d/result.json`实际执行普通工作器、全只读挂载和statvfs检查；该控制的原Docker-cp来源仍明确为synthetic，不能赋予S3来源资格。
+
+首轮25项控制中的两处测试缺少`copy`导入、UID65534/0700树被错误派给root工作器的真实RED、Windows两处只读临时文件删除错误及路径分隔符失败均保留。修复不增加DAC能力、不放宽mode或修改既有driver。独立审查包为`.superpowers/sdd/2026-11-08-p01-source-build/task-5-review-f3a5972-9b71cd04.json`及对应diff；独立报告`task-5-independent-review.md`与主执行者逐项接受记录`task-5-controller-acceptance-f3a5972.json`保留规范、报告、源码和证据的精确身份。审查时的规范/计划/brief/report另作固定摘要副本，后续阶段文档不改变其历史含义。
+
+六项要求分别覆盖固定profile及拒绝控制、独立工具字节、原runner/六编译链验证实现、实际观察工作器与聚合预算、复制树所有权/只读回放/封存，以及当前完整控制/独立复核/源码提交。包内Node版本、镜像名称或`pipeline-completed`标签均不能单独赋予资格。原始控制收据中的`fullTask5Accepted=false`保留生成时语义，不回写原件。
+
+Task6接续原Windows证明链/ready和当前live admission、同一存活宿主两次传输、实际VHD首次传输前容量预检、整体期限与封存宿主导出/独立回放。Task7负责真实S3恢复、六次编译及完整工具/依赖/回放链验收。S4–S6和P01保持开放，所有11个完整项目仍0/11，正式标志保持false。
+
+## Task4：源码与机械控制验收完成
 
 实现`2254d24`及首轮修复`731fca907b281d10f40d7cbfef5fa85faf1a30b8`已通过原独立审查者复审：Spec PASS、Quality Approved，两项Important均ADDRESSED，无新增Critical/Important/Minor。主执行者核对原六项要求、完整源码/缓存接口、真实权限控制及同冻结原始证据，接受Task4的实现与机械控制；实际S3仍须Task7验收。
 
