@@ -1,5 +1,6 @@
 """Real executable wrapper boundary; fake Docker is explicitly an external seam."""
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -1082,5 +1083,528 @@ class SourceWorkerConfinementTests(unittest.TestCase):
             engine.container('import-source',[],['-I','-B','/harness/scripts/boot/source_build_guest.py','import'])
         self.assertFalse(any(command[1]=='start' for _,command in evidence.calls))
 
+
+class KotlinTask5ContractTests(unittest.TestCase):
+    """Synthetic boundary records exercise rejection, never compiler integration."""
+    profiles = [('developer-workflow', ['notes-demo', 'animated-demo']),
+                ('uninstall', ['read-file', 'image-viewer', 'text-entry-demo', 'uninstall'])]
+
+    def feature(self, name):
+        self.assertTrue(callable(getattr(target, name, None)), 'Task5 missing ' + name)
+        return getattr(target, name)
+
+    def runner_result(self, profile='developer-workflow'):
+        import kotlin_delivery
+        labels = dict(self.profiles)[profile]
+        return {'schemaVersion': 1, 'status': 'pipeline-completed', 'profile': profile,
+            'labels': labels.copy(), 'generation': 'synthetic-boundary-' + profile,
+            'nonce': 'a' * 32, 'image': kotlin_delivery.IMAGE,
+            'originalCacheVolume': 'original-gradle',
+            'volumes': {role: profile + '-' + role for role in ('source', 'cache', 'work', 'output')},
+            'validationKind': 'actual-docker', 'resourcesPreserved': True,
+            'formalQualification': False, 'finalSystemAccepted': False, 'guestStarted': False,
+            'replay': {'status': 'independent-readonly-replay-verified', 'originalCacheUnchanged': True,
+                'results': [{'sample': 'persistent-uninstall-demo' if label == 'uninstall' else label,
+                    'fixture': None, 'status': 'package-replay-verified', 'rawSha256': 'b' * 64,
+                    'packagedSha256': 'c' * 64, 'formalQualification': False} for label in labels]}}
+
+    def test_fixed_profile_order_new_output_and_original_gradle(self):
+        function = self.feature('_kotlin_profiles')
+        options = {'repo': Path('/fixed/source-repo'), 'output': Path('/fixed/kotlin'),
+            'baseline': Path('/fixed/cache/gradle-baseline.json'),
+            'original_cache': 'original-gradle', 'docker': '/fixed/docker-wrapper'}
+        runs = function(options)
+        self.assertEqual([row['profile'] for row in runs], [row[0] for row in self.profiles])
+        self.assertEqual([row['output'] for row in runs],
+                         [options['output'] / row[0] for row in self.profiles])
+        self.assertEqual(len({str(row['output']) for row in runs}), 2)
+        for row in runs:
+            for key in ('repo', 'baseline', 'original_cache', 'docker'): self.assertEqual(row[key], options[key])
+            self.assertNotIn('synthetic_controls', row)
+        for key, value in [('synthetic_controls', True), ('docker', lambda *args: 'fake'),
+                           ('docker', 'docker'), ('profile', 'update')]:
+            with self.subTest(key=key), self.assertRaises(ValueError): function({**options, key: value})
+
+    def test_pipeline_label_is_insufficient_and_profile_package_identity_is_exact(self):
+        import copy
+        check = self.feature('_kotlin_result')
+        for profile, labels in self.profiles:
+            good = self.runner_result(profile)
+            self.assertEqual(check(good, profile), good)
+            mutations = [('validationKind', 'fake-control'), ('synthetic_controls', True),
+                ('compileExecuted', False), ('status', 'synthetic-input-controls-passed'),
+                ('labels', list(reversed(labels))), ('image', 'sha256:' + '0' * 64)]
+            for key, value in mutations:
+                with self.subTest(profile=profile, field=key), self.assertRaises(ValueError): check({**good, key: value}, profile)
+            bad = copy.deepcopy(good); bad['volumes']['cache'] = bad['volumes']['source']
+            with self.assertRaises(ValueError): check(bad, profile)
+            for key, value in [('sample', 'wrong-package'), ('fixture', 'old'), ('status', 'failed')]:
+                bad = copy.deepcopy(good); bad['replay']['results'][0][key] = value
+                with self.subTest(package_field=key), self.assertRaises(ValueError): check(bad, profile)
+            for key, value in [('originalCacheUnchanged', False), ('results', good['replay']['results'][:-1])]:
+                bad = copy.deepcopy(good); bad['replay'][key] = value
+                with self.assertRaises(ValueError): check(bad, profile)
+
+    def test_actual_private_and_copied_snapshots_and_original_prepare_8gib(self):
+        import copy
+        check = self.feature('_check_kotlin_prepare')
+        snapshot = {'files': {'LICENSE': 'a' * 64}, 'directories': ['']}
+        mapping = {'sourceDescriptorSha256': 'b' * 64, 'snapshot': snapshot}
+        observation = {'privateSnapshot': copy.deepcopy(snapshot), 'privateRepoSnapshot': copy.deepcopy(snapshot),
+            'originalCacheVolume': 'original-gradle', 'baselineManifestSha256': 'c' * 64,
+            'cacheCopy': {'schemaVersion': 1, 'status': 'readonly-original-cache-copied-and-verified',
+                'capacityBytes': 8 * 1024 ** 3, 'originalCacheVolume': 'original-gradle',
+                'baselineManifestSha256': 'c' * 64, 'original': {'files': {'compiler.jar': 'd' * 64}, 'directories': ['']},
+                'formalQualification': False, 'finalSystemAccepted': False}}
+        self.assertEqual(check(mapping, snapshot, observation), observation)
+        for key in ('privateSnapshot', 'privateRepoSnapshot'):
+            bad = copy.deepcopy(observation); bad[key]['files']['LICENSE'] = 'e' * 64
+            with self.subTest(snapshot=key), self.assertRaises(ValueError): check(mapping, snapshot, bad)
+        changed = {'files': {**snapshot['files'], 'extra': 'a' * 64}, 'directories': ['']}
+        with self.assertRaises(ValueError): check(mapping, changed, observation)
+        for key, value in [('capacityBytes', 8 * 1024 ** 3 - 1), ('capacityBytes', True),
+                ('status', 'passed'), ('originalCacheVolume', 'other'), ('baselineManifestSha256', 'f' * 64)]:
+            bad = copy.deepcopy(observation); bad['cacheCopy'][key] = value
+            with self.subTest(field=key), self.assertRaises(ValueError): check(mapping, snapshot, bad)
+
+    def test_copy_replay_requires_exact_files_directories_modes_and_all_six_packages(self):
+        import copy
+        check = self.feature('_check_copy_replay')
+        inventory = {'rootMode': 0o700, 'directories': {'packages': {'mode': 0o700}},
+            'files': {'packages/evidence.json': {'mode': 0o600, 'bytes': 17, 'sha256': 'a' * 64}}}
+        replay = {'status': 'copied-output-readonly-replay-verified', 'statvfsReadOnly': True,
+            'compileExecuted': False, 'profiles': [row[0] for row in self.profiles],
+            'results': [result for profile, _ in self.profiles for result in self.runner_result(profile)['replay']['results']],
+            'formalQualification': False, 'finalSystemAccepted': False}
+        self.assertEqual(check(inventory, copy.deepcopy(inventory), replay), replay)
+        changes = []
+        bad = copy.deepcopy(inventory); bad['files']['extra'] = bad['files']['packages/evidence.json'].copy(); changes.append(bad)
+        bad = copy.deepcopy(inventory); bad['directories']['empty'] = {'mode': 0o700}; changes.append(bad)
+        bad = copy.deepcopy(inventory); bad['files']['packages/evidence.json']['mode'] = 0o644; changes.append(bad)
+        bad = copy.deepcopy(inventory); bad['files']['packages/evidence.json']['sha256'] = 'b' * 64; changes.append(bad)
+        bad = copy.deepcopy(inventory); bad['rootMode'] = 0o755; changes.append(bad)
+        for bad in changes:
+            with self.subTest(inventory=bad), self.assertRaises(ValueError): check(inventory, bad, replay)
+        for key, value in [('statvfsReadOnly', False), ('statvfsReadOnly', 1), ('compileExecuted', True),
+                ('results', replay['results'][:-1]), ('profiles', ['uninstall', 'developer-workflow'])]:
+            with self.subTest(replay=key), self.assertRaises(ValueError): check(inventory, inventory, {**replay, key: value})
+
+
+class KotlinTask5ExecutionTests(unittest.TestCase):
+    """External Docker/RO replay seams are synthetic; no actual compile is claimed."""
+    def feature(self, name):
+        self.assertTrue(callable(getattr(target, name, None)), 'Task5 missing ' + name)
+        return getattr(target, name)
+
+    def test_unchanged_runner_called_twice_under_manager_with_guards_and_independent_replay(self):
+        import contextlib, kotlin_delivery
+        execute = self.feature('_execute_kotlin_profiles')
+        for name in ('_kotlin_checkpoint', '_inspect_kotlin_output', '_observe_kotlin_tools', '_replay_kotlin_copy'):
+            self.feature(name)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); calls = []; inside = [False]
+            cache = {'sourceRepo': str(root / 'imported/source-repo'), 'cache': {'gradleVolume': 'original-gradle',
+                'cargoVolume': 'reserved-cargo'}, 'sourceImport': {'importedDirectory': str(root / 'imported')}}
+            paths = {'output': root / 'phase', 'harness': root / 'harness', 'archive': root / 'handoff.tar'}
+            spec = {'handoff': {'sourceDescriptorSha256': 'b' * 64}, 'limits': {'phaseTimeoutSeconds': 60}}
+            mapping = {'sourceDescriptorSha256': 'b' * 64, 'snapshot': {'files': {}, 'directories': ['']}}
+            wrapper = {'pins': {'wrapper': {'path': '/fixed/docker-wrapper'}}}
+            engine = mock.Mock(); engine.evidence.receipt = {}; engine.containers = []; engine.volumes = {}
+            engine.kotlin_context = {'outputInventories': {}}
+            engine.evidence.root = root / 'kotlin'; engine.evidence.root.mkdir()
+            def registered(name, label):
+                profile = 'uninstall' if name.startswith('uninstall-') else 'developer-workflow'
+                return {'Labels': {'org.mingos.generation': 'synthetic-boundary-' + profile, 'org.mingos.nonce': 'a' * 32}}
+            engine.register.side_effect = registered
+            @contextlib.contextmanager
+            def manager(record):
+                self.assertFalse(inside[0]); inside[0] = True; calls.append(('manager-enter',))
+                try: yield
+                finally: inside[0] = False; calls.append(('manager-exit',))
+            def runner(options, *args, **kwargs):
+                self.assertTrue(inside[0], 'unchanged helper creation needs fsuid/fsgid context')
+                self.assertEqual(args, ()); self.assertEqual(kwargs, {}, 'never inject callable Docker')
+                self.assertEqual(options['docker'], '/fixed/docker-wrapper')
+                self.assertEqual(options['original_cache'], 'original-gradle')
+                self.assertNotIn('synthetic_controls', options)
+                self.assertEqual(Path(options['repo']), Path(cache['sourceRepo']))
+                self.assertEqual(Path(options['baseline']), root / 'imported/delivery/rebuild-inputs/cache/gradle-baseline.json')
+                calls.append(('run', options['profile'], str(options['output'])))
+                return KotlinTask5ContractTests().runner_result(options['profile'])
+            def boundary(name):
+                def invoke(*args, **kwargs):
+                    calls.append((name,))
+                    return {'syntheticExternalBoundary': True, 'inventory': {'rootMode': 0o700, 'directories': {}, 'files': {}}}
+                return invoke
+            with mock.patch.object(kotlin_delivery, 'run', side_effect=runner), \
+                    mock.patch.object(target, '_cache_manager_identity', side_effect=manager), \
+                    mock.patch.object(target, '_kotlin_checkpoint', side_effect=boundary('guard')), \
+                    mock.patch.object(target, '_reverify_consumers', side_effect=boundary('cache-ro')), \
+                    mock.patch.object(target, '_inspect_kotlin_output', side_effect=boundary('private-snapshot-prepare')), \
+                    mock.patch.object(target, '_initialize_profile_copy', side_effect=boundary('new-copy-owner')), \
+                    mock.patch.object(target, '_observe_kotlin_tools', side_effect=boundary('independent-tool-bytes')), \
+                    mock.patch.object(target, '_replay_kotlin_copy', side_effect=boundary('copied-output-ro')):
+                execute(engine, paths, spec, cache, mapping, wrapper, {'generation': 's2-control'})
+            runs = [item for item in calls if item[0] == 'run']
+            self.assertEqual([row[1] for row in runs], ['developer-workflow', 'uninstall'])
+            self.assertEqual(len({row[2] for row in runs}), 2)
+            for boundary in ('private-snapshot-prepare', 'independent-tool-bytes', 'copied-output-ro'):
+                self.assertEqual(sum(row[0] == boundary for row in calls), 2)
+            self.assertGreaterEqual(sum(row[0] == 'cache-ro' for row in calls), 4)
+            # A fresh source/cache/pin/live guard surrounds each runner and
+            # independent observation/replay, rather than a once-only admission.
+            external = {'run', 'private-snapshot-prepare', 'independent-tool-bytes', 'copied-output-ro'}
+            substantive = [row[0] for row in calls if row[0] not in ('manager-enter', 'manager-exit', 'cache-ro')]
+            for index, name in enumerate(substantive):
+                if name in external:
+                    self.assertEqual(substantive[index - 1], 'guard', name)
+                    self.assertEqual(substantive[index + 1], 'guard', name)
+            self.assertFalse(inside[0])
+
+    def test_private_phase_rejects_wrong_ref_path_before_any_runner_or_allocation(self):
+        import kotlin_delivery
+        phase = self.feature('_kotlin_phase')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); original = root / 'phase'; original.mkdir()
+            wrong = root / 'wrong-result.json'; wrong.write_text('{}')
+            ref = {'path': str(wrong), 'bytes': 2, 'sha256': hashlib.sha256(b'{}').hexdigest()}
+            with mock.patch.object(target, '_phase_paths', return_value={'output': original}), \
+                    mock.patch.object(kotlin_delivery, 'run') as runner:
+                with self.assertRaises(ValueError):
+                    phase({'generation': 's3'}, {'generation': 's2'}, {}, spec_sha256='a' * 64,
+                          transfer_context={}, source_cache_ref=ref, output=root / 'kotlin')
+                runner.assert_not_called()
+            self.assertFalse((root / 'kotlin').exists())
+            self.assertEqual(wrong.read_bytes(), b'{}')
+
+    def test_compiler_chain_rejects_missing_logs_skipped_task_predecessor_and_package_mismatch(self):
+        import copy
+        check = self.feature('_check_kotlin_compiler')
+        sample = 'notes-demo'; label = sample
+        command = ['java', '--offline', '--rerun-tasks', '--no-build-cache', '--no-configuration-cache',
+                   ':notes-demo:compileProductionExecutableKotlinWasmWasi']
+        stdout = b'> Task :notes-demo:compileProductionExecutableKotlinWasmWasi\nBUILD SUCCESSFUL\n'
+        stderr = b''
+        package = {'schemaVersion': 1, 'status': 'passed', 'sample': sample, 'fixture': None,
+            'offline': True, 'compilerExitCode': 0, 'compilerSignal': None, 'command': command,
+            'stdoutSha256': hashlib.sha256(stdout).hexdigest(), 'stderrSha256': hashlib.sha256(stderr).hexdigest(),
+            'formalQualification': False, 'finalSystemAccepted': False, 'package': {'sdkVersion': 6}}
+        chain = {'schemaVersion': 1, 'label': label, 'sample': sample, 'fixture': None,
+            'status': 'passed', 'exitCode': 0, 'signal': None, 'previous': None}
+        self.assertEqual(check(package, chain, stdout, stderr, label=label, previous=None), package)
+        for changed in (None, b'', stdout.replace(b'\nBUILD', b' UP-TO-DATE\nBUILD'),
+                        stdout.replace(b'\nBUILD', b' FROM-CACHE\nBUILD')):
+            # Keep the candidate's digest internally consistent: a skipped task
+            # must fail for not executing, not merely for a stale log hash.
+            candidate = {**package, 'stdoutSha256': hashlib.sha256(changed or b'').hexdigest()}
+            with self.subTest(log=changed), self.assertRaises(ValueError):
+                check(candidate, chain, changed, stderr, label=label, previous=None)
+        with self.assertRaises(ValueError): check(package, chain, stdout, None, label=label, previous=None)
+        for key, value in [('sample', 'animated-demo'), ('compilerExitCode', 7), ('offline', False),
+                ('command', command[1:3]), ('package', {'sdkVersion': 5})]:
+            with self.subTest(package=key), self.assertRaises(ValueError):
+                check({**package, key: value}, chain, stdout, stderr, label=label, previous=None)
+        bad = copy.deepcopy(chain); bad['previous'] = {'label': 'foreign', 'sha256': 'f' * 64}
+        with self.assertRaises(ValueError): check(package, bad, stdout, stderr, label=label, previous=None)
+        with self.assertRaises(ValueError): check(package, {**chain, 'status': 'failed'}, stdout, stderr, label=label, previous=None)
+
+    def test_motion_sdk5_and_uninstall_actual_sample_are_required(self):
+        check = self.feature('_check_kotlin_compiler')
+        for label, sample, sdk in [('animated-demo', 'animated-demo', 5),
+                                   ('uninstall', 'persistent-uninstall-demo', 6)]:
+            stdout = ('> Task :' + sample + ':compileProductionExecutableKotlinWasmWasi\n').encode()
+            package = {'schemaVersion': 1, 'status': 'passed', 'sample': sample, 'fixture': None,
+                'offline': True, 'compilerExitCode': 0, 'compilerSignal': None,
+                'command': ['java', '--offline', '--rerun-tasks', '--no-build-cache', '--no-configuration-cache',
+                            ':' + sample + ':compileProductionExecutableKotlinWasmWasi'],
+                'stdoutSha256': hashlib.sha256(stdout).hexdigest(), 'stderrSha256': hashlib.sha256(b'').hexdigest(),
+                'formalQualification': False, 'finalSystemAccepted': False, 'package': {'sdkVersion': sdk}}
+            previous = {'label': 'text-entry-demo', 'sha256': 'd' * 64} if label == 'uninstall' else None
+            chain = {'schemaVersion': 1, 'label': label, 'sample': sample, 'fixture': None,
+                'status': 'passed', 'exitCode': 0, 'signal': None, 'previous': previous}
+            self.assertEqual(check(package, chain, stdout, b'', label=label, previous=previous), package)
+            with self.assertRaises(ValueError):
+                check({**package, 'package': {'sdkVersion': 6 if sdk == 5 else 5}}, chain, stdout, b'', label=label, previous=previous)
+
+    def test_exported_copy_worker_invokes_frozen_glue_with_original_source_cache_and_copy_readonly(self):
+        function = self.feature('_replay_kotlin_copy')
+        self.feature('_node_worker')
+        engine = mock.Mock(); engine.evidence.root = Path('/fixed/kotlin')
+        result = KotlinTask5ContractTests().runner_result()
+        result['outputDirectory'] = '/fixed/kotlin/payload/developer-workflow'
+        inventory = {'rootMode': 0o700, 'directories': {}, 'files': {}}
+        engine.kotlin_context = {'outputInventories': {result['profile']: inventory}}
+        observation = {'inventory': inventory, 'copiedInventory': inventory, 'results': result['replay']['results'],
+            'status': 'profile-copy-readonly-replay-verified', 'statvfsReadOnly': True, 'compileExecuted': False}
+        with mock.patch.object(target, '_node_worker', return_value=observation) as worker:
+            function(engine, {'harness': Path('/fixed/frozen-harness')}, result,
+                {'sourceDescriptorSha256': 'b' * 64, 'snapshot': {'files': {}, 'directories': ['']}},
+                {'executables': {}, 'lockedFiles': {}})
+        args = worker.call_args.args
+        self.assertEqual(args[3], 'replay-copy')
+        mounts = args[2]
+        self.assertTrue(mounts and all(row['readonly'] for row in mounts))
+        mounted = {row['target']: row for row in mounts}
+        # Host Path separators vary; preserve exact logical fixed-tree spelling
+        # and normalize separators only, without case-folding or resolving '..'.
+        self.assertEqual(mounted['/out']['source'].replace('\\', '/'), result['outputDirectory'] + '/packages-and-evidence')
+        self.assertEqual(mounted['/repo']['source'], result['volumes']['source'])
+        self.assertEqual(mounted['/repo']['subpath'], 'repo')
+        self.assertEqual(mounted['/deps/gradle']['source'], result['volumes']['cache'])
+        self.assertEqual(mounted['/original-cache']['source'], result['originalCacheVolume'])
+        self.assertEqual(mounted['/harness']['source'].replace('\\', '/'), '/fixed/frozen-harness')
+        self.assertFalse(any('work' == row['target'].strip('/') or not row['readonly'] for row in mounts))
+
+    @unittest.skipUnless(os.name == 'posix', 'actual Linux statvfs writable-copy rejection')
+    def test_peer_inventory_rejects_real_writable_copy_even_with_equal_bytes(self):
+        function = self.feature('_readonly_inventory_pair')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); original = root / 'original'; copied = root / 'copy'
+            original.mkdir(); copied.mkdir()
+            for directory in (original, copied): (directory / 'same').write_bytes(b'synthetic identical bytes')
+            self.assertFalse(os.statvfs(copied).f_flag & os.ST_RDONLY)
+            with self.assertRaisesRegex(ValueError, 'read-only'): function(original, copied)
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'Linux original Task4 phase-ref controls; external admission mocked')
+class KotlinTask5PhaseRefTests(unittest.TestCase):
+    """Consume real retained Task4 result bytes with synthetic external admission.
+
+    These controls do not qualify S2 or demonstrate a compiler/image integration.
+    """
+    def setUp(self):
+        self.assertTrue(callable(getattr(target, '_kotlin_phase', None)), 'Task5 missing _kotlin_phase')
+        self.fixture = SourceCachePhaseTests(); self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.fixture.invoke()
+        self.result = self.fixture.paths['output'] / 'result.json'
+        self.original = self.result.read_bytes()
+
+    def invoke(self, ref=None):
+        import kotlin_delivery
+        data = self.result.read_bytes()
+        ref = ref or {'path': str(self.result), 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        fixture = self.fixture
+        with mock.patch.object(target, '_phase_paths', return_value=fixture.paths), \
+                mock.patch.object(target, 'wrapper_pins', return_value={'admission': {'controlOnly': True}}), \
+                mock.patch.object(target, '_completed_transfers', return_value={'isolatedControl': True}), \
+                mock.patch.object(kotlin_delivery, 'run', side_effect=AssertionError('invalid Ref must never compile')):
+            return target._kotlin_phase(fixture.spec, fixture.handle, fixture.wrapper, spec_sha256='a' * 64,
+                transfer_context={'isolatedControl': True}, source_cache_ref=ref,
+                output=fixture.paths['output'].parent / 'kotlin')
+
+    def test_changed_raw_pin_and_failed_or_context_mismatched_result_fail_closed(self):
+        original_ref = {'path': str(self.result), 'bytes': len(self.original),
+                        'sha256': hashlib.sha256(self.original).hexdigest()}
+        self.result.write_bytes(self.original + b' ')
+        with self.assertRaises(ValueError): self.invoke(original_ref)
+        for key, value in [('status', 'failed'), ('specSha256', 'f' * 64),
+                ('generation', 'other-s3'), ('s2Generation', 'other-s2'),
+                ('endpoint', 'unix:///foreign.sock'), ('formalQualification', True),
+                ('transferClosure', {'foreign': True})]:
+            record = json.loads(self.original); record[key] = value
+            self.result.write_text(json.dumps(record))
+            with self.subTest(field=key), self.assertRaises(ValueError): self.invoke()
+            self.assertFalse((self.fixture.base / 'kotlin').exists())
+        self.result.write_bytes(self.original)
+        for key, value in [('bytes', True), ('bytes', len(self.original) - 1), ('sha256', 'e' * 64)]:
+            with self.subTest(ref=key), self.assertRaises(ValueError): self.invoke({**original_ref, key: value})
+        self.assertEqual(self.result.read_bytes(), self.original)
+
+
+
+
+class KotlinNewCopyOwnershipTests(unittest.TestCase):
+    """Synthetic copy provenance controls; actual Docker cp remains Task7."""
+    def feature(self, name):
+        value = getattr(target, name, None)
+        self.assertTrue(callable(value), 'Task5 missing ' + name)
+        return value
+
+    def fixture(self):
+        inventory = {'root': {'uid': 0, 'gid': 0, 'mode': 0o700},
+            'directories': {'chain': {'uid': 0, 'gid': 0, 'mode': 0o755}},
+            'files': {'chain/receipt.json': {'uid': 0, 'gid': 0, 'mode': 0o444,
+                'bytes': 2, 'sha256': hashlib.sha256(b'{}').hexdigest(), 'nlink': 1}}}
+        proof = {'path': '/fixed/kotlin/payload/uninstall/packages-and-evidence',
+            'endpoint': 'unix:///var/run/docker.sock', 'copierCID': 'a' * 64,
+            'command': ['cp', 'a' * 64 + ':/out', '/fixed/kotlin/payload/uninstall/packages-and-evidence'],
+            'exitCode': 0, 'freshCopy': True, 'exclusive': True, 'writersStopped': True}
+        return proof, inventory
+
+    def test_exact_successful_exclusive_copy_and_uniform_owner_are_required(self):
+        check = self.feature('_check_new_copy')
+        proof, inventory = self.fixture()
+        self.assertEqual(check(proof, inventory, path=proof['path'], endpoint=proof['endpoint']), 0)
+        for key, value in [('path', '/foreign'), ('endpoint', 'unix:///foreign.sock'),
+                           ('copierCID', 'b' * 64), ('exitCode', 1), ('freshCopy', False),
+                           ('exclusive', False), ('writersStopped', False)]:
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                check({**proof, key: value}, inventory, path=proof['path'], endpoint=proof['endpoint'])
+        for owner in [(123, 123), (0, 65534), (65534, 0)]:
+            changed = copy.deepcopy(inventory)
+            changed['files']['chain/receipt.json'].update(uid=owner[0], gid=owner[1])
+            with self.subTest(owner=owner), self.assertRaises(ValueError):
+                check(proof, changed, path=proof['path'], endpoint=proof['endpoint'])
+        owned = copy.deepcopy(inventory)
+        for row in [owned['root'], *owned['directories'].values(), *owned['files'].values()]:
+            row.update(uid=65534, gid=65534)
+        self.assertEqual(check(proof, owned, path=proof['path'], endpoint=proof['endpoint']), 65534)
+
+    def test_links_and_unbounded_or_escaping_members_are_rejected(self):
+        check = self.feature('_check_new_copy')
+        proof, inventory = self.fixture()
+        for key, value in [('nlink', 2), ('kind', 'symlink'), ('mode', 0o120777)]:
+            changed = copy.deepcopy(inventory); changed['files']['chain/receipt.json'][key] = value
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                check(proof, changed, path=proof['path'], endpoint=proof['endpoint'])
+        changed = copy.deepcopy(inventory)
+        changed['files']['../foreign'] = changed['files'].pop('chain/receipt.json')
+        with self.assertRaises(ValueError): check(proof, changed, path=proof['path'], endpoint=proof['endpoint'])
+
+    @unittest.skipUnless(sys.platform == 'linux', 'actual Linux UID65534 nofollow copied-tree dispatch control')
+    def test_actual_worker_owned_mode0700_copy_selects_unprivileged_readonly_observation(self):
+        """Real filesystem input; Docker/inspection/effective policy is a synthetic seam."""
+        function = self.feature('_initialize_profile_copy')
+        self.assertEqual((os.getuid(), os.getgid()), (65534, 65534), 'ordinary Linux controller must run this real ownership control as UID/GID65534')
+        with tempfile.TemporaryDirectory() as temp:
+            phase = Path(temp) / 'kotlin'; phase.mkdir()
+            output = phase / 'payload' / 'uninstall'; output.mkdir(parents=True)
+            copied = output / 'packages-and-evidence'; copied.mkdir(mode=0o700)
+            nested = copied / 'chain'; nested.mkdir(mode=0o700)
+            member = nested / 'receipt.json'; member.write_bytes(b'{}'); member.chmod(0o444)
+            before_root = os.lstat(copied)
+            self.assertEqual((before_root.st_uid, before_root.st_gid, before_root.st_mode & 0o7777), (65534, 65534, 0o700))
+            self.assertFalse(copied.is_symlink())
+            cid = 'a' * 64; wrapper = '/fixed/synthetic-docker-boundary'
+            def write(name, value): (output / name).write_text(json.dumps(value))
+            write('output-copy.command.json', {'argv': [wrapper, 'cp', cid + ':/out', str(copied)]})
+            write('output-copy.exit.json', {'exitCode': 0})
+            write('verify-all-create.command.json', {'argv': [wrapper, 'create', 'synthetic-inspect-boundary']})
+            write('result.json', {'syntheticExternalBoundary': True})
+            result = {'profile': 'uninstall', 'outputDirectory': str(output),
+                'containers': [{'label': 'verify-all', 'cid': cid, 'mounts': []}]}
+            engine = mock.Mock(); engine.evidence.root = phase; engine.docker = wrapper
+            engine.kotlin_context = {'endpoint': 'unix:///synthetic-boundary.sock'}
+            actual_inspection = {'Id': cid, 'syntheticExternalBoundary': True, 'State': {'Running': False, 'ExitCode': 0}}
+            engine.inspect.return_value = actual_inspection
+            expected_inventory = {'root': {'uid': 65534, 'gid': 65534, 'mode': 0o700},
+                'directories': {'chain': {'uid': 65534, 'gid': 65534, 'mode': 0o700}},
+                'files': {'chain/receipt.json': {'uid': 65534, 'gid': 65534, 'mode': 0o444,
+                    'bytes': 2, 'sha256': hashlib.sha256(b'{}').hexdigest(), 'nlink': 1}}}
+            observed_requests = []
+            def worker(label, mounts, command, **kwargs):
+                self.assertIs(kwargs.get('root', False), False,
+                    'already UID65534-owned mode0700 copy must select unprivileged observer; CHOWN-only root cannot reopen it')
+                mapped = {row['target']: row for row in mounts}
+                self.assertEqual(mapped['/new-copy']['source'], str(copied))
+                self.assertTrue(all(row['readonly'] is True for row in mounts), 'already-owned observation must mount every input RO')
+                request = json.loads(Path(mapped['/request/request.json']['source']).read_text())
+                observed_requests.append(request)
+                # The external worker seam actually reopens this real tree with
+                # O_NOFOLLOW and reads all owners/modes/bytes, then runs the
+                # production complete-owner policy. No caller owner flag suffices.
+                rootfd = os.open(copied, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                childfd = os.open('chain', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=rootfd)
+                filefd = os.open('receipt.json', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=childfd)
+                try:
+                    def owner(fd):
+                        st = os.fstat(fd); return {'uid': st.st_uid, 'gid': st.st_gid, 'mode': st.st_mode & 0o7777}
+                    st = os.fstat(filefd); raw = os.pread(filefd, st.st_size + 1, 0)
+                    inventory = {'root': owner(rootfd), 'directories': {'chain': owner(childfd)},
+                        'files': {'chain/receipt.json': {**owner(filefd), 'bytes': len(raw),
+                            'sha256': hashlib.sha256(raw).hexdigest(), 'nlink': st.st_nlink}}}
+                    self.assertEqual(inventory, expected_inventory)
+                    self.assertEqual(target._check_new_copy(request['proof'], inventory,
+                        path=str(copied), endpoint=engine.kotlin_context['endpoint']), 65534)
+                finally:
+                    os.close(filefd); os.close(childfd); os.close(rootfd)
+                observed = {'syntheticExternalBoundary': True}
+                receipt = {'result': {'status': 'new-copy-ownership-already-owned', 'before': inventory,
+                    'after': copy.deepcopy(inventory), 'proof': request['proof'], 'effective': observed},
+                    'effective': observed, 'effectiveAfter': observed}
+                return 'b' * 64, json.dumps(receipt).encode()
+            engine.container.side_effect = worker
+            with mock.patch.object(target._kotlin, 'expected_inspection', return_value={'syntheticExternalBoundary': True}), \
+                    mock.patch.object(target._kotlin, 'check_inspection') as inspection, \
+                    mock.patch.object(target, '_check_effective_worker', side_effect=lambda observed, *args, **kwargs: observed):
+                value = function(engine, {'harness': Path('/fixed/synthetic-harness')}, result)
+            inspection.assert_called_once_with(actual_inspection, {'syntheticExternalBoundary': True}, finished=True)
+            self.assertEqual(len(observed_requests), 1)
+            self.assertEqual(value['result']['status'], 'new-copy-ownership-already-owned')
+            self.assertEqual(value['result']['before'], expected_inventory)
+            self.assertEqual(value['result']['after'], expected_inventory)
+            self.assertEqual((os.lstat(copied).st_uid, os.lstat(copied).st_gid,
+                              os.lstat(copied).st_mode & 0o7777), (65534, 65534, 0o700))
+            self.assertEqual(member.read_bytes(), b'{}')
+            member.chmod(0o600)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'actual Linux owned-copy descriptor observation control')
+    def test_owned_copy_observer_checks_real_full_inventory_and_rejects_links(self):
+        """Real UID/files/descriptor inventory; only RO mount flags are a synthetic boundary."""
+        observe = self.feature('_observe_owned_copy')
+        self.assertEqual((os.getuid(), os.getgid()), (65534, 65534))
+        actual_inventory = target._seal._inventory
+        ro_calls = []
+        def synthetic_ro_mount(root, *, read_only=False):
+            self.assertIs(read_only, True, 'production observer must request actual statvfs RO verification')
+            ro_calls.append(str(root))
+            # No runtime mount is created by this unit test. Every traversal,
+            # nofollow open, full byte hash, mode and owner comes from real files.
+            return actual_inventory(root, read_only=False)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'packages-and-evidence'; root.mkdir(mode=0o700)
+            child = root / 'nested'; child.mkdir(mode=0o700)
+            member = child / 'receipt.json'; member.write_bytes(b'{}'); member.chmod(0o444)
+            proof, _ = self.fixture(); proof['path'] = str(root); proof['command'][-1] = str(root)
+            initial = target._seal._stamp(os.lstat(root)); proof['copyRootIdentity'] = list(initial)
+            with mock.patch.object(target._seal, '_inventory', side_effect=synthetic_ro_mount):
+                value = observe(root, proof=proof, endpoint=proof['endpoint'])
+                self.assertEqual(value['status'], 'new-copy-ownership-already-owned')
+                self.assertIs(value['statvfsReadOnly'], True)
+                self.assertEqual(value['before'], value['after'])
+                self.assertEqual(value['before']['root'], {'uid': 65534, 'gid': 65534, 'mode': 0o700})
+                self.assertEqual(value['before']['directories'], {'nested': {'uid': 65534, 'gid': 65534, 'mode': 0o700}})
+                self.assertEqual(value['before']['files'], {'nested/receipt.json': {'uid': 65534, 'gid': 65534,
+                    'mode': 0o444, 'bytes': 2, 'sha256': hashlib.sha256(b'{}').hexdigest(), 'nlink': 1}})
+                self.assertEqual(value['rootIdentityBefore'], list(initial)); self.assertEqual(value['rootIdentityAfter'], list(initial))
+                self.assertEqual(ro_calls, [str(root), str(root)])
+                foreign_root = {**proof, 'copyRootIdentity': [*initial[:1], initial[1] + 1, *initial[2:]]}
+                with self.assertRaises(ValueError): observe(root, proof=foreign_root, endpoint=proof['endpoint'])
+                alias = child / 'alias.json'; os.link(member, alias)
+                try:
+                    with self.assertRaises(ValueError): observe(root, proof=proof, endpoint=proof['endpoint'])
+                finally: alias.unlink()
+                alias.symlink_to('receipt.json')
+                try:
+                    with self.assertRaises((ValueError, OSError)): observe(root, proof=proof, endpoint=proof['endpoint'])
+                finally: alias.unlink()
+            self.assertEqual(member.read_bytes(), b'{}'); self.assertEqual(os.lstat(member).st_mode & 0o7777, 0o444)
+            self.assertEqual((os.lstat(root).st_uid, os.lstat(root).st_gid), (65534, 65534))
+            member.chmod(0o600)
+
+    @unittest.skipUnless(sys.platform == 'linux' and getattr(os, 'geteuid', lambda: -1)() == 0, 'actual new-copy descriptor fchown requires Linux CHOWN-only root controller')
+    def test_actual_owned_copy_skips_chown_and_preserves_modes_bytes(self):
+        initialize = self.feature('_initialize_new_copy')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'packages-and-evidence'; root.mkdir(mode=0o700)
+            item = root / 'receipt.json'; item.write_bytes(b'{}'); item.chmod(0o444)
+            proof, _ = self.fixture(); proof['path'] = str(root); proof['command'][-1] = str(root)
+            effective = {'uid': 0, 'gid': 0, 'capEff': 1, 'capBnd': 1, 'noNewPrivs': 1}
+            before = item.read_bytes(); mode = item.stat().st_mode & 0o7777
+            rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            itemfd = os.open(item, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                result = initialize(root, proof=proof, endpoint=proof['endpoint'], effective=effective)
+                self.assertEqual(result['status'], 'new-copy-ownership-initialized')
+                self.assertEqual(os.pread(itemfd, len(before), 0), before); self.assertEqual(os.fstat(itemfd).st_mode & 0o7777, mode)
+                self.assertEqual((os.fstat(rootfd).st_uid, os.fstat(rootfd).st_gid, os.fstat(itemfd).st_uid, os.fstat(itemfd).st_gid), (65534,) * 4)
+                for key, value in [('uid', 65534), ('capEff', 3), ('capBnd', 3), ('noNewPrivs', 0)]:
+                    with self.subTest(policy=key), self.assertRaises(ValueError):
+                        initialize(root, proof=proof, endpoint=proof['endpoint'], effective={**effective, key: value})
+            finally:
+                os.fchown(itemfd, 0, 0); os.fchown(rootfd, 0, 0)
+                os.close(itemfd); os.close(rootfd)
+                item.chmod(0o600)
 
 if __name__ == '__main__': unittest.main()

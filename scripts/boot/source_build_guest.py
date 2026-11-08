@@ -1001,3 +1001,702 @@ def _source_cache_phase(spec, handle, wrapper_record, *, spec_sha256, transfer_c
         _cache.original._write_exclusive(Path(output) / 'result.json', _cache.content.encoded(state))
         evidence.snapshot('failed')
         raise
+
+
+# Task5 is private and precondition-bearing. Task6 still owns the original
+# qualification/readiness, same-live-host transfer witnesses and outer deadline.
+import kotlin_delivery as _kotlin
+import source_build_toolchain as _toolchain
+
+_KOTLIN_PROFILES = [('developer-workflow', ['notes-demo', 'animated-demo']),
+                    ('uninstall', ['read-file', 'image-viewer', 'text-entry-demo', 'uninstall'])]
+_KOTLIN_SDK = {'notes-demo': 6, 'animated-demo': 5, 'read-file': 1,
+               'image-viewer': 2, 'text-entry-demo': 6, 'uninstall': 6}
+
+
+def _kotlin_profiles(options):
+    _require(type(options) is dict and not options.get('synthetic_controls') and 'profile' not in options,
+             'fixed nonsynthetic Kotlin profiles required')
+    docker = options.get('docker')
+    _require(type(docker) is str and docker.startswith('/') and not any(c in docker for c in ',\r\n\0'),
+             'single absolute executable wrapper required')
+    return [{**options, 'profile': profile, 'output': Path(options['output']) / profile}
+            for profile, _ in _KOTLIN_PROFILES]
+
+
+def _kotlin_result(result, profile):
+    require_actual_runner_result(result)
+    labels = dict(_KOTLIN_PROFILES).get(profile)
+    _require(labels is not None and result.get('profile') == profile and result.get('labels') == labels
+             and result.get('image') == _kotlin.IMAGE and result.get('resourcesPreserved') is True,
+             'exact actual profile/image/labels required')
+    volumes = result.get('volumes')
+    _require(type(volumes) is dict and set(volumes) == {'source', 'cache', 'work', 'output'}
+             and all(type(name) is str and _cache.NAME.fullmatch(name) for name in volumes.values())
+             and len(set(volumes.values())) == 4 and result.get('originalCacheVolume') not in volumes.values(),
+             'distinct fresh profile volumes required')
+    replay = result.get('replay', {})
+    _require(replay.get('status') == 'independent-readonly-replay-verified'
+             and replay.get('originalCacheUnchanged') is True, 'original independently RO verify-all required')
+    results = replay.get('results')
+    _require(type(results) is list and len(results) == len(labels), 'complete profile package replay required')
+    for label, package in zip(labels, results):
+        _require(package.get('status') == 'package-replay-verified'
+                 and package.get('sample') == ('persistent-uninstall-demo' if label == 'uninstall' else label)
+                 and package.get('fixture') is None and package.get('formalQualification') is False,
+                 'profile package identity differs')
+        for key in ('rawSha256', 'packagedSha256'): _host_contract._hex(package.get(key))
+    return result
+
+
+def _check_kotlin_prepare(mapping, snapshot, observation):
+    _check_filtered_snapshot(mapping, snapshot)
+    for key in ('privateSnapshot', 'privateRepoSnapshot'): _check_filtered_snapshot(mapping, observation[key])
+    copied = observation.get('cacheCopy', {})
+    _require(type(copied.get('schemaVersion')) is int and copied['schemaVersion'] == 1
+             and copied.get('status') == 'readonly-original-cache-copied-and-verified'
+             and type(copied.get('capacityBytes')) is int and copied['capacityBytes'] >= 8 * 1024**3
+             and copied.get('originalCacheVolume') == observation.get('originalCacheVolume')
+             and copied.get('baselineManifestSha256') == observation.get('baselineManifestSha256')
+             and copied.get('formalQualification') is False and copied.get('finalSystemAccepted') is False,
+             'original prepare/cache-copy/8GiB evidence differs')
+    _normalized_filtered_snapshot(copied['original'])
+    return observation
+
+
+def _check_copy_replay(original, copied, replay):
+    for inventory in (original, copied):
+        _seal._schema({'schemaVersion': 1, 'kind': 'p01-s3-payload-seal', 'context': {}, **inventory})
+    _require(_host_contract._same(original, copied), 'copied output full POSIX inventory differs')
+    _require(replay.get('status') == 'copied-output-readonly-replay-verified'
+             and replay.get('statvfsReadOnly') is True and replay.get('compileExecuted') is False
+             and replay.get('profiles') == [profile for profile, _ in _KOTLIN_PROFILES]
+             and replay.get('formalQualification') is False and replay.get('finalSystemAccepted') is False,
+             'independent exported-copy RO replay required')
+    results = replay.get('results'); labels = [label for _, group in _KOTLIN_PROFILES for label in group]
+    _require(type(results) is list and len(results) == 6, 'six genuine package replay results required')
+    for label, package in zip(labels, results):
+        _require(package.get('status') == 'package-replay-verified'
+                 and package.get('sample') == ('persistent-uninstall-demo' if label == 'uninstall' else label)
+                 and package.get('fixture') is None, 'exported package identity/order differs')
+    return replay
+
+
+def _check_kotlin_compiler(package, chain, stdout, stderr, *, label, previous):
+    _require(label in _KOTLIN_SDK and type(package) is dict and type(chain) is dict, 'known compiler package/chain required')
+    sample = 'persistent-uninstall-demo' if label == 'uninstall' else label
+    for record in (package, chain):
+        _require(record.get('schemaVersion') == 1 and type(record.get('schemaVersion')) is int
+                 and record.get('status') == 'passed' and record.get('sample') == sample
+                 and record.get('fixture') is None, 'successful exact compiler identity required')
+    _require(chain.get('label') == label and chain.get('exitCode') == 0 and type(chain.get('exitCode')) is int
+             and chain.get('signal') is None and _host_contract._same(chain.get('previous'), previous), 'compiler predecessor/exit/signal differs')
+    _require(package.get('offline') is True and package.get('compilerExitCode') == 0
+             and type(package.get('compilerExitCode')) is int and not package.get('compilerSignal')
+             and package.get('formalQualification') is False and package.get('finalSystemAccepted') is False,
+             'successful offline actual compiler receipt required')
+    command = package.get('command'); task = ':' + sample + ':compileProductionExecutableKotlinWasmWasi'
+    _require(type(command) is list and all(type(arg) is str for arg in command)
+             and all(flag in command for flag in ('--offline', '--rerun-tasks', '--no-build-cache', '--no-configuration-cache', task)),
+             'forced offline executed compiler command required')
+    _require(type(stdout) is bytes and type(stderr) is bytes and bool(stdout), 'both raw compiler logs required')
+    _require(package.get('stdoutSha256') == hashlib.sha256(stdout).hexdigest()
+             and package.get('stderrSha256') == hashlib.sha256(stderr).hexdigest(), 'compiler log hashes differ')
+    lines = [line for line in stdout.decode('utf8').splitlines() if line.startswith('> Task ' + task)
+             and (len(line) == len('> Task ' + task) or line[len('> Task ' + task)] == ' ')]
+    _require(lines == ['> Task ' + task], 'target compiler task was not uniquely executed')
+    _require(package.get('package', {}).get('sdkVersion') == _KOTLIN_SDK[label], 'package SDK differs from original sample')
+    return package
+
+
+def _kotlin_checkpoint(engine, paths, spec, source_cache, mapping, wrapper_record, handle, label):
+    """Repeat live admission and original immutable input checks, never qualify."""
+    context = engine.kotlin_context
+    state = engine.evidence.receipt; state['phase'] = label
+    state.setdefault('wrapperObservations', []).append(wrapper_pins(wrapper_record, handle=handle))
+    _require(_completed_transfers(spec, handle, context['specSha256'], context['transferContext'], paths)
+             == source_cache['transferClosure'], 'original completed transfer closure changed')
+    context['reader'].read(context['sourceCacheRef'], json_value=True)
+    context['reader'].recheck()
+    _require(_source_cache_inputs(spec, paths['archive']) == context['inputs'], 'original source/cache inputs changed')
+    _require(_guest_harness(paths['harness'], spec['harness']['manifestSha256']) == context['harness'], 'frozen harness changed')
+    imported = Path(source_cache['sourceRepo']).parent
+    _require(_full_source_mapping(imported, spec['handoff']['sourceDescriptorSha256']) == mapping, 'full original source/filtered mapping changed')
+    _verified_cache_inputs(imported / 'delivery/rebuild-inputs/cache', spec['cacheDescriptorSha256'])
+    for name in tuple(engine.volumes): engine.register(name, label + '-volume-recheck-' + name)
+    storage = _linux_space(engine.evidence.root)
+    _require(storage['filesystemType'] == 0xef53 and storage['device'] == context['device']
+             and storage['availableBytes'] >= spec['limits']['linuxReserveBytes'], 'Kotlin output backing/reserve differs')
+    state['linuxObservation'] = storage; engine.evidence.snapshot(label)
+
+
+def _execute_kotlin_profiles(engine, paths, spec, source_cache, mapping, wrapper_record, handle):
+    """Run unchanged real coordinator twice, retaining each independent closure."""
+    imported = Path(source_cache['sourceRepo']).parent
+    payload = engine.evidence.root / 'payload'
+    payload.mkdir(mode=0o700)
+    options = {'repo': Path(source_cache['sourceRepo']), 'baseline': imported / 'delivery/rebuild-inputs/cache/gradle-baseline.json',
+               'original_cache': source_cache['cache']['gradleVolume'], 'output': payload,
+               'docker': wrapper_record['pins']['wrapper']['path']}
+    completed = []; seen_volumes = set(); seen_generations = set()
+    inputs = imported / 'delivery/rebuild-inputs/cache'
+    for options in _kotlin_profiles(options):
+        profile = options['profile']
+        def guard(label): _kotlin_checkpoint(engine, paths, spec, source_cache, mapping, wrapper_record, handle, profile + '-' + label)
+        guard('before-run'); _reverify_consumers(engine, paths, inputs, source_cache['cache'])
+        identity = {}
+        try:
+            with _cache_manager_identity(identity): result = _kotlin.run(options)
+        finally:
+            engine.evidence.receipt.setdefault('kotlinManagerIdentities', []).append(identity)
+            guard('after-run'); _reverify_consumers(engine, paths, inputs, source_cache['cache'])
+        _kotlin_result(result, profile)
+        _require(result['originalCacheVolume'] == source_cache['cache']['gradleVolume']
+                 and not seen_volumes.intersection(result['volumes'].values())
+                 and result['generation'] not in seen_generations, 'profile reused cache/output/generation identity')
+        seen_volumes.update(result['volumes'].values()); seen_generations.add(result['generation'])
+        result = {**result, 'outputDirectory': str(options['output'])}
+        engine.evidence.receipt.setdefault('profileResults', []).append(result)
+        for role, name in result['volumes'].items():
+            info = engine.register(name, profile + '-register-' + role)
+            _require((info.get('Labels') or {}).get('org.mingos.generation') == result['generation']
+                     and (info.get('Labels') or {}).get('org.mingos.nonce') == result['nonce'], 'actual profile volume ownership differs')
+        guard('before-inspect'); inspected = _inspect_kotlin_output(engine, paths, result, mapping)
+        engine.kotlin_context['outputInventories'][profile] = inspected['inventory']
+        guard('after-inspect')
+        guard('before-copy-ownership')
+        ownership = _initialize_profile_copy(engine, paths, result)
+        guard('after-copy-ownership')
+        guard('before-tool-observation'); tools = _observe_kotlin_tools(engine, paths, spec, result, inspected)
+        guard('after-tool-observation')
+        guard('before-copy-replay'); replay = _replay_kotlin_copy(engine, paths, result, mapping, tools)
+        guard('after-copy-replay')
+        completed.append({'runner': result, 'privateOutput': inspected, 'copyOwnership': ownership, 'tools': tools, 'copiedReplay': replay})
+        engine.evidence.snapshot(profile + '-completed')
+    return completed
+
+
+def _readonly_inventory_pair(original, copied):
+    """Real statvfs and full regular-file POSIX inventory on both RO mounts."""
+    before = _seal._inventory(original, read_only=True)
+    exported = _seal._inventory(copied, read_only=True)
+    _require(_host_contract._same(before, exported), 'original/copied full POSIX inventories differ')
+    _require(_seal._inventory(original, read_only=True) == before and _seal._inventory(copied, read_only=True) == exported,
+             'RO output inventory changed during verification')
+    return {'inventory': before, 'copiedInventory': exported, 'statvfsReadOnly': True}
+
+
+def _kotlin_inventory_worker(argv):
+    _require(argv == ['/request/request.json'], 'fixed RO peer request path required')
+    request, _ = _bounded_phase_json(Path(argv[0]))
+    effective = _effective_worker(['/', *request['readonly']])
+    if request['mode'] == 'replay-copy': result = _readonly_inventory_pair(Path('/original-output'), Path('/out'))
+    else: result = {'inventory': _seal._inventory(Path('/out'), read_only=True), 'statvfsReadOnly': True}
+    print(json.dumps({'effective': effective, **result}, sort_keys=True))
+
+
+_KOTLIN_PEER_LOADER = "import sys;sys.path.insert(0,'/harness/scripts/boot');import source_build_guest as g;g._kotlin_inventory_worker(sys.argv[1:])"
+
+
+def _node_worker(engine, label, mounts, mode, request):
+    """Peer real-statvfs observation followed by a distinct Kotlin Node worker."""
+    _require(mode in ('inspect-output', 'replay-copy') and all(m.get('readonly') is True for m in mounts), 'fixed RO-only Node mode required')
+    for index, name in enumerate(sorted({m['source'] for m in mounts if m['type'] == 'volume'})):
+        engine.register(name, label + '-volume-' + str(index))
+    request = {**request, 'mode': mode, 'readonly': [m['target'] for m in mounts] + ['/request/request.json']}
+    raw_request = _cache.content.encoded(request)
+    _require(len(raw_request) <= 8 * 1024**2, 'complete Node replay request exceeds bounded control size')
+    path = engine.evidence.root / (label + '-request.json')
+    _cache.original._write_exclusive(path, raw_request); path.chmod(0o444)
+    pinned = _seal.file_pin(path)
+    mounts = [*mounts, _cache.mount('bind', path, '/request/request.json', True)]
+    _, peer_raw = engine.container(label + '-statvfs-peer', mounts,
+        ['-I', '-B', '-c', _KOTLIN_PEER_LOADER, '/request/request.json'])
+    peer = _cache.worker._strict_receipt(peer_raw)
+    _check_effective_worker(peer['effective'], ['/', *request['readonly']])
+    _require(peer.get('statvfsReadOnly') is True, 'actual peer statvfs RO observation missing')
+    if mode == 'replay-copy':
+        _require(peer['inventory'] == request['originalInventory'] and peer['copiedInventory'] == peer['inventory'], 'copied output peer inventory differs')
+    worker = _toolchain._ImageEngine(engine.evidence, engine.nonce, engine.docker, _kotlin.IMAGE, 'node', timeout=engine.timeout)
+    for index, name in enumerate(sorted({m['source'] for m in mounts if m['type'] == 'volume'})):
+        engine.register(name, label + '-node-volume-before-' + str(index))
+    _, raw = worker.container(label + '-node', mounts,
+                             ['/harness/scripts/boot/source_build_replay.mjs', mode, '/request/request.json'])
+    result = _cache.worker._strict_receipt(raw)
+    _check_effective_worker(result['effective'], ['/', *request['readonly']])
+    _require(result['effective'].get('readOnlyEvidenceKind') == 'opened-fd-mountinfo-not-statvfs', 'Node RO evidence kind differs')
+    _require(result.get('inventory') == peer['inventory'] and _seal.file_pin(path) == pinned, 'Node/peer inventory or request identity differs')
+    result['statvfsReadOnly'] = True; result['statvfsPeer'] = peer
+    return result
+
+
+def _profile_mounts(paths, result, *, copied=False):
+    output = Path(result['outputDirectory'])
+    mounts = [_cache.mount('bind', paths['harness'], '/harness', True),
+        _cache.mount('bind', output, '/profile', True),
+        _cache.mount('volume', result['volumes']['source'], '/repo', True, 'repo'),
+        _cache.mount('volume', result['volumes']['source'], '/snapshot', True),
+        _cache.mount('volume', result['volumes']['cache'], '/deps/gradle', True),
+        _cache.mount('volume', result['originalCacheVolume'], '/original-cache', True)]
+    if copied:
+        mounts += [_cache.mount('bind', output / 'packages-and-evidence', '/out', True),
+                   _cache.mount('volume', result['volumes']['output'], '/original-output', True)]
+    else: mounts += [_cache.mount('volume', result['volumes']['output'], '/out', True)]
+    return mounts
+
+
+def _inspect_kotlin_output(engine, paths, result, mapping):
+    # The unchanged coordinator already checked source before/after each compile.
+    # This independent worker reads both actual snapshots and actual private repo.
+    observed = _node_worker(engine, result['profile'] + '-private-output', _profile_mounts(paths, result),
+                            'inspect-output', {'meta': result, 'mapping': mapping})
+    _require(observed.get('status') == 'private-output-readonly-observed', 'independent private output observation missing')
+    _check_kotlin_prepare(mapping, observed['sourceSnapshot'], observed)
+    _require(observed['originalCacheVolume'] == result['originalCacheVolume']
+             and observed['baselineManifestSha256'] == result['baselineManifestSha256'], 'actual prepare generation/baseline binding differs')
+    # Retain original command/raw logs/final inspect as exact file evidence, not
+    # reconstructed commands or an actual-docker classification alone.
+    output = Path(result['outputDirectory'])
+    for label in ['prepare', *('build-' + name for name in result['labels']), 'verify-all']:
+        for suffix in ('.command.json', '.stdout.log', '.stderr.log', '.exit.json'):
+            _seal.file_pin(output / (label + '-run' + suffix))
+        inspection, _ = _bounded_phase_json(output / (label + '-inspect-after.stdout.log'))
+        _require(type(inspection) is list and len(inspection) == 1, 'exact final compiler inspection required')
+        containers = [row for row in result['containers'] if row['label'] == label]
+        _require(len(containers) == 1 and inspection[0].get('Id') == containers[0]['cid']
+                 and inspection[0].get('Image') == _kotlin.IMAGE, 'compiler final identity differs')
+        state = inspection[0].get('State', {})
+        _require(state.get('Running') is False and state.get('ExitCode') == 0 and state.get('OOMKilled') is False, 'compiler final state differs')
+    return observed
+
+
+def _payload_usage(root):
+    inventory = _seal._inventory(root)
+    return {'bytes': sum(row['bytes'] for row in inventory['files'].values()),
+            'files': len(inventory['files']), 'directories': len(inventory['directories']), 'inventory': inventory}
+
+
+def _observe_kotlin_tools(engine, paths, spec, result, inspected):
+    import development_image_migration as migration
+    context = engine.kotlin_context; source_cache = context['sourceCache']; repo = Path(source_cache['sourceRepo'])
+    baseline_path = repo.parent / 'delivery/rebuild-inputs/cache/gradle-baseline.json'
+    baseline, _ = _bounded_phase_json(baseline_path); baseline_pin = _seal.file_pin(baseline_path)
+    _require(baseline_pin['sha256'] == result['baselineManifestSha256'], 'original baseline bytes differ')
+    locks = {'/repo/gradle/wrapper/' + name: {key: value for key, value in _seal.file_pin(repo / 'gradle/wrapper' / name).items() if key != 'path'}
+             for name in ('gradle-wrapper.jar', 'gradle-wrapper.properties')}
+    selected = {name: digest for name, digest in baseline['files'].items()
+                if name.startswith('caches/modules-2/files-2.1/') or name == 'mingos-verified-gradle-8.14.5-bin.zip'
+                or (name.startswith('wrapper/dists/') and not re.search(r'\.(lck|ok|part)$', name))}
+    _require(any(name.startswith('caches/modules-2/files-2.1/') for name in selected)
+             and selected.get('mingos-verified-gradle-8.14.5-bin.zip') == '6f74b601422d6d6fc4e1f9a1ab6522f642c2fdcbc15ae33ebd30ba3d7198e854',
+             'complete locked compiler dependency/archive closure required')
+    locks.update({'/deps/gradle/' + name: {'sha256': digest} for name, digest in selected.items()})
+    props = (repo / 'gradle/wrapper/gradle-wrapper.properties').read_text()
+    _require('gradle-8.14.5-bin.zip' in props and 'distributionSha256Sum=6f74b601422d6d6fc4e1f9a1ab6522f642c2fdcbc15ae33ebd30ba3d7198e854' in props.splitlines(), 'original wrapper lock differs')
+    aggregate = {}
+    configurations = [('kotlin', {'node': {'versionPattern': r'^v24\.22\.1$'}, 'java': {'versionPattern': r'version "21\.'}}, locks),
+                      ('rust', {'rustc': {}, 'cargo': {}}, {}),
+                      ('tools', {'python3': {'versionPattern': r'^Python 3\.'}, 'tar': {}, 'sha256sum': {}}, {})]
+    for role, executables, locked in configurations:
+        usage = _payload_usage(engine.evidence.root / 'payload')
+        _require(usage['bytes'] < spec['limits']['exportMaxBytes'], 'aggregate retained output exhausted export ceiling')
+        remaining = spec['limits']['exportMaxBytes'] - usage['bytes']
+        expected = {'imageRole': role, 'image': migration.FIXED[role]['imageId'], 'executables': executables,
+            'lockedFiles': locked, 'docker': engine.docker, 'mounts': _profile_mounts(paths, result) if role == 'kotlin'
+                    else [_cache.mount('bind', paths['harness'], '/harness', True)],
+            'optional': ['python3', 'rustc', 'cargo'] if role == 'kotlin' else ['node', 'rustc', 'cargo'],
+            'timeoutSeconds': engine.timeout,
+            'mirrorBudget': {'maxBytes': remaining, 'aggregateMaxBytes': spec['limits']['exportMaxBytes'],
+                'aggregateRoot': str(engine.evidence.root / 'payload'),
+                'maxEntries': context['inputs']['entries'] + (256 * 1024**2 // 4096),
+                'reserveBytes': spec['limits']['linuxReserveBytes'], 'device': context['device']}}
+        directory = Path(result['outputDirectory']) / ('independent-' + role + '-tools')
+        identity = {}
+        with _cache_manager_identity(identity): observation = _toolchain.observe(expected['image'], expected, directory)
+        _require(observation.get('status') == 'independent-image-toolchain-bytes-observed', 'independent image tool observation missing')
+        aggregate[role] = {'resultRef': _seal.file_pin(directory / 'result.json'), 'managerIdentity': identity, **observation}
+        usage = _payload_usage(engine.evidence.root / 'payload')
+        _require(usage['bytes'] <= spec['limits']['exportMaxBytes'], 'aggregate image mirrors exceed pinned export ceiling')
+        engine.evidence.receipt['retainedOutputUsage'] = {key: value for key, value in usage.items() if key != 'inventory'}
+        engine.evidence.snapshot(result['profile'] + '-' + role + '-tools-observed')
+    return aggregate
+
+
+def _replay_kotlin_copy(engine, paths, result, mapping, tools):
+    observation = tools.get('kotlin', {}).get('actualBytes', tools)
+    # Metadata from independent image observations, never toolchain.json itself.
+    request = {'meta': result, 'mapping': mapping, 'tools': observation}
+    original = engine.kotlin_context['outputInventories'].get(result['profile'])
+    _require(original is not None, 'original independently RO output inventory missing')
+    request['originalInventory'] = original
+    observed = _node_worker(engine, result['profile'] + '-copy-replay', _profile_mounts(paths, result, copied=True), 'replay-copy', request)
+    _require(observed.get('status') == 'profile-copy-readonly-replay-verified' and observed.get('statvfsReadOnly') is True
+             and observed.get('compileExecuted') is False and observed.get('inventory') == observed.get('copiedInventory'), 'actual copied-output RO replay missing')
+    return observed
+
+
+def _check_new_copy(proof, inventory, *, path, endpoint):
+    """Validate independently retained cp provenance and a complete owner scan."""
+    _require(type(proof) is dict and proof.get('path') == path and proof.get('endpoint') == endpoint,
+             'exact new-copy path and original endpoint required')
+    cid = proof.get('copierCID')
+    _require(type(cid) is str and _cache.plan.HEX64.fullmatch(cid)
+             and proof.get('command') == ['cp', cid + ':/out', path]
+             and type(proof.get('exitCode')) is int and proof['exitCode'] == 0
+             and all(proof.get(key) is True for key in ('freshCopy', 'exclusive', 'writersStopped')),
+             'successful exact exclusive new Docker cp required')
+    _require(type(inventory) is dict and set(inventory) == {'root', 'directories', 'files'}, 'full new-copy ownership inventory required')
+    owners = set()
+    _seal._schema({'schemaVersion': 1, 'kind': 'p01-s3-payload-seal', 'context': {},
+        'rootMode': inventory['root']['mode'],
+        'directories': {name: {'mode': row['mode']} for name, row in inventory['directories'].items()},
+        'files': {name: {key: row[key] for key in ('mode', 'bytes', 'sha256')} for name, row in inventory['files'].items()}})
+    for name, row in [('', inventory['root']), *inventory['directories'].items(), *inventory['files'].items()]:
+        _require(type(name) is str and (name == '' or (not name.startswith('/') and all(part not in ('', '.', '..') for part in name.split('/')))), 'canonical copied member required')
+        _require(type(row) is dict and type(row.get('mode')) is int and 0 <= row['mode'] <= 0o7777
+                 and row.get('kind') not in ('symlink', 'special'), 'regular copied members and permission modes required')
+        _require(type(row.get('uid')) is int and type(row.get('gid')) is int, 'actual owner IDs required')
+        owners.add((row['uid'], row['gid']))
+        if name in inventory['files']:
+            _require(type(row.get('nlink')) is int and row['nlink'] == 1
+                     and type(row.get('bytes')) is int and row['bytes'] >= 0
+                     and type(row.get('sha256')) is str and _SHA.fullmatch(row['sha256']), 'single-link copied regular byte pin required')
+    _require(len(owners) == 1 and next(iter(owners)) in ((0, 0), (65534, 65534)), 'mixed/foreign copied ownership forbidden')
+    return next(iter(owners))[0]
+
+
+def _initialize_new_copy(root, *, proof, endpoint, effective, expected_path=None):
+    """First ownership initialization of one proven new cp, never general repair.
+
+    Retain open descriptors across CHOWN: root without DAC_OVERRIDE cannot
+    reopen directories after transferring their mode0700 ownership.
+    """
+    import stat
+    _require(sys.platform == 'linux' and os.geteuid() == 0, 'actual Linux root new-copy initializer required')
+    _require(effective.get('uid') == effective.get('gid') == 0 and effective.get('capEff') == effective.get('capBnd') == 1
+             and effective.get('noNewPrivs') == 1, 'CHOWN-only actual initializer policy required')
+    status = Path('/proc/self/status').read_text()
+    for key in ('CapEff', 'CapBnd'):
+        found = re.search(r'^' + key + r':\s*([0-9a-fA-F]+)\s*$', status, re.M)
+        _require(found is not None and int(found[1], 16) == 1, 'actual CHOWN-only capabilities required')
+    _require(os.getgid() == 0 and re.search(r'^NoNewPrivs:\s*1\s*$', status, re.M), 'actual root GID/NNP required')
+    descriptors = []; before = {'root': None, 'directories': {}, 'files': {}}
+    def record(fd, isdir):
+        info = os.fstat(fd)
+        _require(stat.S_ISDIR(info.st_mode) if isdir else stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'nofollow single-link regular copy required')
+        row = {'uid': info.st_uid, 'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode)}
+        if not isdir:
+            digest = hashlib.sha256(); offset = 0
+            while True:
+                block = os.pread(fd, 1024**2, offset)
+                if not block: break
+                offset += len(block); _require(offset <= info.st_size, 'copied file grew'); digest.update(block)
+            _require(offset == info.st_size and _seal._stamp(os.fstat(fd)) == _seal._stamp(info), 'copied bytes changed during inventory')
+            row.update(bytes=offset, sha256=digest.hexdigest(), nlink=info.st_nlink)
+        return row
+    def visit(fd, prefix):
+        names = sorted(os.listdir(fd))
+        for name in names:
+            _require(name not in ('.', '..') and '/' not in name, 'literal copied member required')
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            isdir = stat.S_ISDIR(info.st_mode)
+            _require(isdir or stat.S_ISREG(info.st_mode), 'copied symlink/special member forbidden')
+            child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | (os.O_DIRECTORY if isdir else 0), dir_fd=fd)
+            descriptors.append((child, prefix + name, isdir))
+            _require(len(descriptors) <= 100000, 'bounded copied entry inventory exceeded')
+            row = record(child, isdir)
+            before['directories' if isdir else 'files'][prefix + name] = row
+            if isdir: visit(child, prefix + name + '/')
+        _require(sorted(os.listdir(fd)) == names, 'copied directory membership changed')
+    try:
+        fd = _seal._open_absolute(root, directory=True); descriptors.append((fd, '', True))
+        before['root'] = record(fd, True); visit(fd, '')
+        owner = _check_new_copy(proof, before, path=expected_path or str(root), endpoint=endpoint)
+        after = copy.deepcopy(before)
+        for descriptor, name, isdir in reversed(descriptors):
+            original = before['root'] if not name else before['directories' if isdir else 'files'][name]
+            _require(record(descriptor, isdir) == original, 'new-copy changed before ownership transfer')
+            if owner == 0: os.fchown(descriptor, 65534, 65534)
+            changed = record(descriptor, isdir)
+            _require(changed == {**original, 'uid': 65534, 'gid': 65534}, 'ownership initialization changed modes/bytes')
+            if not name: after['root'] = changed
+            else: after['directories' if isdir else 'files'][name] = changed
+        return {'status': 'new-copy-ownership-initialized' if owner == 0 else 'new-copy-ownership-already-owned',
+                'before': before, 'after': after, 'proof': proof, 'effective': effective}
+    finally:
+        for descriptor, _, _ in reversed(descriptors): os.close(descriptor)
+
+
+def _observe_owned_copy(root, *, proof, endpoint):
+    """Observe an already worker-owned copy through actual RO descriptors."""
+    import stat
+    _require(sys.platform == 'linux' and os.geteuid() == os.getegid() == 65534, 'actual UID/GID65534 copy observer required')
+    first = _seal._inventory(root, read_only=True)
+    inventory = {'root': None, 'directories': {}, 'files': {}}
+    def owner(fd):
+        item = os.fstat(fd)
+        return {'uid': item.st_uid, 'gid': item.st_gid, 'mode': stat.S_IMODE(item.st_mode)}
+    def visit(fd, prefix):
+        stamp = _seal._stamp(os.fstat(fd)); names = sorted(os.listdir(fd))
+        for name in names:
+            _host_contract._relative(name)
+            path = prefix + name; info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            directory = stat.S_ISDIR(info.st_mode)
+            _require(directory or stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'nofollow single-link regular copied member required')
+            child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | (os.O_DIRECTORY if directory else 0), dir_fd=fd)
+            try:
+                identity = _seal._stamp(os.fstat(child))
+                _require(identity == _seal._stamp(info), 'owned-copy descriptor identity differs')
+                row = owner(child)
+                if directory:
+                    _require(first['directories'].get(path) == {'mode': row['mode']}, 'owned-copy directory inventory differs')
+                    inventory['directories'][path] = row; visit(child, path + '/')
+                else:
+                    pin = first['files'].get(path)
+                    _require(pin is not None and pin['bytes'] == info.st_size and pin['mode'] == row['mode'], 'owned-copy file inventory differs')
+                    inventory['files'][path] = {**row, 'bytes': pin['bytes'], 'sha256': pin['sha256'], 'nlink': info.st_nlink}
+                _require(_seal._stamp(os.fstat(child)) == identity
+                         and _seal._stamp(os.stat(name, dir_fd=fd, follow_symlinks=False)) == identity, 'owned-copy member changed')
+            finally: os.close(child)
+        _require(sorted(os.listdir(fd)) == names and _seal._stamp(os.fstat(fd)) == stamp, 'owned-copy directory changed')
+    fd = _seal._open_absolute(root, directory=True)
+    try:
+        initial = _seal._stamp(os.fstat(fd))
+        _require(proof.get('copyRootIdentity') == list(initial), 'owned-copy root identity differs from coordinator')
+        inventory['root'] = owner(fd); visit(fd, '')
+        _require(set(inventory['directories']) == set(first['directories']) and set(inventory['files']) == set(first['files'])
+                 and inventory['root']['mode'] == first['rootMode'], 'complete owned-copy membership required')
+        _require(_check_new_copy(proof, inventory, path=proof['path'], endpoint=endpoint) == 65534, 'uniform worker-owned copy required')
+        _require(_seal._inventory(root, read_only=True) == first and _seal._stamp(os.fstat(fd)) == initial
+                 and _seal._stamp(Path(root).lstat()) == initial, 'already-owned copy changed during RO observation')
+        return {'status': 'new-copy-ownership-already-owned', 'before': inventory, 'after': copy.deepcopy(inventory),
+                'proof': proof, 'statvfsReadOnly': True, 'rootIdentityBefore': list(initial), 'rootIdentityAfter': list(initial)}
+    finally: os.close(fd)
+
+
+def _new_copy_worker(argv):
+    _require(argv == ['/request/request.json'], 'fixed new-copy ownership request required')
+    request, _ = _bounded_phase_json(Path(argv[0]))
+    _require(request.get('action') in ('observe-owned', 'initialize-new'), 'fixed copied-output ownership action required')
+    if request['action'] == 'observe-owned':
+        readonly = ['/', '/harness', '/request/request.json', '/new-copy']
+        observed = _effective_worker(readonly)
+        result = _observe_owned_copy(Path('/new-copy'), proof=request['proof'], endpoint=request['endpoint'])
+        after = _effective_worker(readonly)
+        print(json.dumps({'result': result, 'effective': observed, 'effectiveAfter': after}, sort_keys=True))
+        return
+    observed = _effective_worker(['/', '/harness', '/request/request.json'], root=True)
+    status = observed['status']
+    policy = {'uid': observed['uid'], 'gid': observed['gid'], 'capEff': int(re.search(r'^CapEff:\s*([0-9a-f]+)', status, re.M)[1], 16),
+              'capBnd': int(re.search(r'^CapBnd:\s*([0-9a-f]+)', status, re.M)[1], 16), 'noNewPrivs': 1}
+    result = _initialize_new_copy(Path('/new-copy'), proof=request['proof'], endpoint=request['endpoint'],
+                                  expected_path=request['proof']['path'], effective=policy)
+    after = _effective_worker(['/', '/harness', '/request/request.json'], root=True)
+    print(json.dumps({'result': result, 'effective': observed, 'effectiveAfter': after}, sort_keys=True))
+
+
+_NEW_COPY_LOADER = "import sys;sys.path.insert(0,'/harness/scripts/boot');import source_build_guest as g;g._new_copy_worker(sys.argv[1:])"
+
+
+def _initialize_profile_copy(engine, paths, result):
+    """Reconstruct new-copy authority from the unchanged coordinator's raw files."""
+    output = Path(result['outputDirectory']); copied = output / 'packages-and-evidence'
+    _require(output == engine.evidence.root / 'payload' / result['profile'], 'fixed exclusive profile output required')
+    command, _ = _bounded_phase_json(output / 'output-copy.command.json')
+    outcome, _ = _bounded_phase_json(output / 'output-copy.exit.json')
+    rows = [row for row in result['containers'] if row['label'] == 'verify-all']
+    _require(len(rows) == 1 and type(outcome.get('exitCode')) is int and outcome['exitCode'] == 0, 'original successful cp required')
+    cid = rows[0]['cid']; expected = [engine.docker, 'cp', cid + ':/out', str(copied)]
+    _require(command.get('argv') == expected, 'original cp command/path/CID differs')
+    observations = []
+    for index, row in enumerate(result['containers']):
+        create, _ = _bounded_phase_json(output / (row['label'] + '-create.command.json'))
+        argv = create['argv']; _require(argv[0] == engine.docker and argv[1] == 'create', 'original compiler wrapper create differs')
+        actual = engine.inspect(row['cid'], result['profile'] + '-copy-writer-' + str(index))
+        _kotlin.check_inspection(actual, _kotlin.expected_inspection(argv[1:], row['cid']), finished=True)
+        observations.append(actual)
+    # The cp target is absent before the sole original cp: the coordinator owns
+    # a freshly mkdir(exist_ok=False) profile and never mounts this bind RW.
+    # Its retained create mount records plus current exact stopped inspections
+    # bind that exclusive extraction to the already completed original run.
+    _require(all(all('source=' + str(copied) + ',' not in m + ',' for m in row['mounts']) for row in result['containers']), 'copied tree had a compiler writer mount')
+    proof = {'path': str(copied), 'endpoint': engine.kotlin_context['endpoint'], 'copierCID': cid,
+             'command': expected[1:], 'exitCode': outcome['exitCode'], 'freshCopy': True, 'exclusive': True,
+             'writersStopped': True, 'writerObservations': observations,
+             'originalResultRef': _seal.file_pin(output / 'result.json'),
+             'copyCommandRef': _seal.file_pin(output / 'output-copy.command.json'),
+             'copyExitRef': _seal.file_pin(output / 'output-copy.exit.json')}
+    rootfd = _seal._open_absolute(copied, directory=True)
+    try:
+        before = _seal._stamp(os.fstat(rootfd))
+        _require(_seal._stamp(copied.lstat()) == before and (before[4], before[5]) in ((0, 0), (65534, 65534)), 'unknown/changed copied root owner or identity')
+    finally: os.close(rootfd)
+    root_worker = before[4] == 0
+    proof['copyRootIdentity'] = list(before)
+    request = engine.evidence.root / (result['profile'] + '-copy-owner-request.json')
+    _seal._write_exclusive(request, _cache.content.encoded({'proof': proof, 'endpoint': proof['endpoint'],
+        'action': 'initialize-new' if root_worker else 'observe-owned'}), 0o444)
+    pin = _seal.file_pin(request)
+    mounts = [_cache.mount('bind', paths['harness'], '/harness', True), _cache.mount('bind', request, '/request/request.json', True),
+              _cache.mount('bind', copied, '/new-copy', not root_worker)]
+    _, raw = engine.container(result['profile'] + '-new-copy-owner', mounts,
+        ['-I', '-B', '-c', _NEW_COPY_LOADER, '/request/request.json'], root=root_worker)
+    value = _cache.worker._strict_receipt(raw)
+    readonly = ['/', '/harness', '/request/request.json'] + ([] if root_worker else ['/new-copy'])
+    for key in ('effective', 'effectiveAfter'): _check_effective_worker(value[key], readonly, root=root_worker)
+    _require(_seal.file_pin(request) == pin and value['result']['proof'] == proof, 'ownership request/provenance changed')
+    ownership = value['result']
+    _require(_check_new_copy(proof, ownership['before'], path=str(copied), endpoint=proof['endpoint']) == before[4]
+             and _check_new_copy(proof, ownership['after'], path=str(copied), endpoint=proof['endpoint']) == 65534, 'actual complete ownership inventories differ')
+    changed = copy.deepcopy(ownership['before'])
+    for row in [changed['root'], *changed['directories'].values(), *changed['files'].values()]: row.update(uid=65534, gid=65534)
+    _require(ownership['after'] == changed and ownership.get('status') == ('new-copy-ownership-initialized' if root_worker else 'new-copy-ownership-already-owned'), 'ownership observation changed modes/bytes or status')
+    rootfd = _seal._open_absolute(copied, directory=True)
+    try:
+        after = _seal._stamp(os.fstat(rootfd))
+        _require(_seal._stamp(copied.lstat()) == after and after[4:6] == (65534, 65534)
+                 and all(after[index] == before[index] for index in (0, 1, 2, 3, 6, 7)), 'copied root path/identity/mode changed')
+        if not root_worker: _require(after == before, 'already-owned root identity changed')
+    finally: os.close(rootfd)
+    value['rootIdentityBefore'] = list(before); value['rootIdentityAfter'] = list(after)
+    return value
+
+
+def _kotlin_phase(spec, handle, wrapper_record, *, spec_sha256, transfer_context, source_cache_ref, output):
+    """Private admitted-manager Kotlin closure; Task6 supplies live authority."""
+    paths = _phase_paths(handle['generation'], spec['generation'])
+    _require(_absolute(output) == paths['output'].parent / 'kotlin' and not os.path.lexists(output), 'fixed new exclusive Kotlin phase required')
+    _require(type(source_cache_ref) is dict and source_cache_ref.get('path') == str(paths['output'] / 'result.json'), 'exact original Task4 full Ref required')
+    reader = _host_contract._Reader(); source_cache = reader.read(source_cache_ref, json_value=True); reader.recheck()
+    transfers = _completed_transfers(spec, handle, spec_sha256, transfer_context, paths)
+    initial_wrapper = wrapper_pins(wrapper_record, handle=handle)
+    expected = {'schemaVersion': 1, 'status': 'source-cache-phase-completed', 'specSha256': spec_sha256,
+                'environment': spec['environment'], 'generation': spec['generation'], 's2Generation': handle['generation'],
+                'endpoint': wrapper_record['identity']['endpoint'], 'transferClosure': transfers,
+                'formalQualification': False, 'finalSystemAccepted': False, 'coldBuildExecuted': False, 'guestStarted': False}
+    _require(type(source_cache) is dict and all(type(source_cache.get(key)) is type(value) and source_cache[key] == value for key, value in expected.items()), 'original completed Task4 context differs')
+    _require(source_cache.get('resourcesPreserved') is True and type(source_cache.get('nonce')) is str
+             and re.fullmatch(r'[0-9a-f]{32}', source_cache['nonce']), 'original preserved Task4 generation required')
+    _require({key: value for key, value in source_cache['initialWrapperObservation'].items() if key != 'admission'}
+             == {key: value for key, value in initial_wrapper.items() if key != 'admission'}, 'original Task4 wrapper byte pins differ')
+    _cache_result(source_cache['cache'], spec['cacheDescriptorSha256'])
+    inputs = _source_cache_inputs(spec, paths['archive'])
+    harness = _guest_harness(paths['harness'], spec['harness']['manifestSha256'])
+    imported = _absolute(source_cache['sourceRepo']).parent
+    mapping = _full_source_mapping(imported, spec['handoff']['sourceDescriptorSha256'])
+    _require(mapping == source_cache['sourceMapping'], 'original full-source mapping differs')
+    _verified_cache_inputs(imported / 'delivery/rebuild-inputs/cache', spec['cacheDescriptorSha256'])
+    linux = _linux_space(paths['output'].parent)
+    _require(linux['filesystemType'] == 0xef53 and linux['device'] == source_cache['sourceVolumeStorageBefore']['device']
+             and linux['availableBytes'] >= spec['limits']['linuxReserveBytes'], 'original ext4 backing/reserve required')
+    state = {'schemaVersion': 1, 'status': 'started', 'phase': 'admission', 'nonce': secrets.token_hex(16),
+             **{key: value for key, value in expected.items() if key not in ('status', 'schemaVersion')},
+             'sourceCacheRef': source_cache_ref, 'sourceMapping': mapping, 'inputs': inputs,
+             'harness': harness, 'initialWrapperObservation': initial_wrapper, 'linuxBefore': linux,
+             'operations': [], 'containers': [], 'ownedVolumes': [], 'resourcesPreserved': True, 'cargoReservedFor': 'S4'}
+    evidence = _cache.original.Evidence(output, state)
+    engine = _PhaseEngine(evidence, state['nonce'], wrapper_record['pins']['wrapper']['path'], timeout=spec['limits']['phaseTimeoutSeconds'])
+    engine.kotlin_context = {'reader': reader, 'sourceCacheRef': source_cache_ref, 'sourceCache': source_cache,
+        'specSha256': spec_sha256, 'transferContext': transfer_context, 'inputs': inputs, 'harness': harness,
+        'device': linux['device'], 'endpoint': expected['endpoint'], 'outputInventories': {}}
+    try:
+        names = source_cache.get('ownedVolumes')
+        _require(type(names) is list and len(names) == len(set(names)), 'original exact owned volumes required')
+        cache_names = {source_cache['cache'][key] for key in ('volumeName', 'cargoVolume', 'gradleVolume')}
+        source_names = set(names) - cache_names
+        _require(cache_names <= set(names) and len(source_names) == 1, 'original source/cache volume closure differs')
+        cache_creator = engine.inspect(source_cache['cache']['creatorId'], 'original-cache-creator')
+        allocation = _cache.plan.validate_creator_inspection(cache_creator, source_cache['cache']['creatorId'], source_cache['cache']['nonce'])
+        _require(all(source_cache['cache'].get(key) == value for key, value in allocation.items()), 'actual restored-cache creator allocation differs')
+        for index, name in enumerate(names):
+            info = engine.register(name, 'original-volume-' + str(index))
+            if name in source_names:
+                _require((info.get('Labels') or {}).get('org.mingos.developer.nonce') == source_cache['nonce']
+                         and imported == _absolute(info['Mountpoint']) / 'imported', 'actual original source volume/path differs')
+            elif name != source_cache['cache']['volumeName']:
+                _require((info.get('Labels') or {}).get('org.mingos.developer.nonce') == source_cache['cache']['nonce'], 'actual original cache volume ownership differs')
+            else:
+                _require(info.get('Labels') in (None, {}), 'original anonymous restored-cache labels differ')
+        state['ownedVolumes'] = sorted(engine.volumes)
+        engine.fixed_image()
+        _kotlin_checkpoint(engine, paths, spec, source_cache, mapping, wrapper_record, handle, 'before-profiles')
+        profiles = _execute_kotlin_profiles(engine, paths, spec, source_cache, mapping, wrapper_record, handle)
+        all_results = [value for profile in profiles for value in profile['copiedReplay']['results']]
+        aggregate = {'status': 'copied-output-readonly-replay-verified', 'statvfsReadOnly': True, 'compileExecuted': False,
+                     'profiles': [name for name, _ in _KOTLIN_PROFILES], 'results': all_results,
+                     'formalQualification': False, 'finalSystemAccepted': False}
+        for profile in profiles:
+            replay = profile['copiedReplay']
+            _check_copy_replay(replay['inventory'], replay['copiedInventory'], aggregate)
+            _verify_actual_compiler_receipts(profile['runner'])
+        state['profiles'] = profiles; state['copiedReplay'] = aggregate
+        state['cacheReverifyAfterKotlin'] = _reverify_consumers(engine, paths, imported / 'delivery/rebuild-inputs/cache', source_cache['cache'])
+        _kotlin_checkpoint(engine, paths, spec, source_cache, mapping, wrapper_record, handle, 'before-seal')
+        state['ownedVolumes'] = sorted(engine.volumes)
+        payload = evidence.root / 'payload'
+        _retain_kotlin_evidence(engine, spec)
+        context = {'schemaVersion': 1, 'kind': 'private-kotlin-source-build-evidence', 'sourceCacheRef': source_cache_ref,
+                   'specSha256': spec_sha256, 'generation': spec['generation'], 's2Generation': handle['generation'],
+                   'endpoint': expected['endpoint'], 'sourceMapping': mapping, 'inputs': inputs,
+                   'harness': harness, 'profiles': profiles, 'copiedReplay': aggregate,
+                   'formalQualification': False, 'finalSystemAccepted': False, 'coldBuildExecuted': False, 'guestStarted': False}
+        seal_path = evidence.root / 'export-seal.json'
+        state['seal'] = _seal.seal(payload, context=context, output=seal_path)
+        state['sealRef'] = _seal.file_pin(seal_path)
+        reader.recheck(); _require(_full_source_mapping(imported, spec['handoff']['sourceDescriptorSha256']) == mapping, 'source changed while sealing')
+        state['status'] = 'kotlin-phase-completed'
+        _cache.original._write_exclusive(evidence.root / 'result.json', _cache.content.encoded(state)); evidence.snapshot('completed')
+        return state
+    except BaseException as error:
+        state.update(status='failed', error=repr(error), ownedVolumes=sorted(engine.volumes))
+        state['retainedProfileFailures'] = []
+        for profile, _ in _KOTLIN_PROFILES:
+            directory = evidence.root / 'payload' / profile
+            if os.path.lexists(directory / 'result.json'):
+                try:
+                    retained, _ = _bounded_phase_json(directory / 'result.json')
+                    state['retainedProfileFailures'].append({'profile': profile, 'result': retained, 'resultRef': _seal.file_pin(directory / 'result.json')})
+                except BaseException as failure: state['retainedProfileFailures'].append({'profile': profile, 'observationError': repr(failure)})
+        _cache.original._write_exclusive(evidence.root / 'result.json', _cache.content.encoded(state)); evidence.snapshot('failed')
+        raise
+
+
+def _verify_actual_compiler_receipts(result):
+    root = Path(result['outputDirectory']) / 'packages-and-evidence'; previous = None; verified = []
+    for label in result['labels']:
+        package, _ = _bounded_phase_json(root / 'packages' / label / 'build-receipt.json')
+        chain_path = root / 'chain' / (label + '.receipt.json'); chain, _ = _bounded_phase_json(chain_path)
+        logs = []
+        for name in ('build.stdout.log', 'build.stderr.log'):
+            path = root / 'packages' / label / 'evidence' / name; pin = _seal.file_pin(path)
+            _require(pin['bytes'] <= 32 * 1024**2, 'raw actual compiler log exceeds retained validation bound')
+            with _host_contract._open(path) as stream: raw = stream.read(32 * 1024**2 + 1)
+            _require(len(raw) == pin['bytes'] and hashlib.sha256(raw).hexdigest() == pin['sha256'] and _seal.file_pin(path) == pin, 'actual raw compiler log changed')
+            logs.append(raw)
+        _check_kotlin_compiler(package, chain, *logs, label=label, previous=previous)
+        previous = {'label': label, 'sha256': _seal.file_pin(chain_path)['sha256']}
+        verified.append(label)
+    return verified
+
+
+def _retain_kotlin_evidence(engine, spec):
+    """Bounded exact snapshots of completed coordinator raw evidence in payload."""
+    root = engine.evidence.root; target = root / 'payload' / 'coordinator-evidence'; target.mkdir(mode=0o700)
+    members = sorted(path for path in root.iterdir() if path.is_file())
+    for path in members:
+        pin = _seal.file_pin(path); usage = _payload_usage(root / 'payload')
+        _require(usage['bytes'] + pin['bytes'] <= spec['limits']['exportMaxBytes'], 'aggregate coordinator evidence exceeds pinned export ceiling')
+        space = _linux_space(root)
+        _require(space['device'] == engine.kotlin_context['device'] and space['availableBytes'] >= pin['bytes'] + spec['limits']['linuxReserveBytes'], 'coordinator evidence would consume ext4 reserve')
+        with _host_contract._open(path) as source:
+            destination = target / path.name
+            with destination.open('xb') as output:
+                while True:
+                    block = source.read(1024**2)
+                    if not block: break
+                    output.write(block)
+                output.flush(); os.fsync(output.fileno())
+        _require(_seal.file_pin(path) == pin and {k: v for k, v in _seal.file_pin(destination).items() if k not in ('path', 'mode')} == {k: v for k, v in pin.items() if k not in ('path', 'mode')}, 'coordinator raw evidence changed during retention')
+    usage = _payload_usage(root / 'payload')
+    _require(usage['bytes'] <= spec['limits']['exportMaxBytes'], 'complete retained evidence exceeds pinned export ceiling')
+    engine.evidence.receipt['retainedOutputUsage'] = {k: v for k, v in usage.items() if k != 'inventory'}
