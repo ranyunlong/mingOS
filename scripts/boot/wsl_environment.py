@@ -436,13 +436,39 @@ def _outer_after(docker,inspect_many):
 def compare_outer(before,after,export_id):
     if before['info'].get('ID')!=after['info'].get('ID') or before['context']!=after['context']:
         raise ValueError('outer daemon/context changed')
-    changes={}
+    changes={};equivalences=[]
+    dns_policy_version=(before['info'].get('ServerVersion')=='29.8.1'
+                        and after['info'].get('ServerVersion')=='29.8.1')
     for kind,key,fields in [('images','Id',('Id','Descriptor','Architecture','Os','RootFS','Config')),
                             ('containers','Id',('Id','Image','Config','HostConfig','Mounts','State')),
                             ('volumes','Name',('Name','CreatedAt','Driver','Options','Labels'))]:
         old={v[key]:v for v in before[kind]};new={v[key]:v for v in after[kind]}
         for identifier,value in old.items():
-            if identifier not in new or any(value.get(k)!=new[identifier].get(k) for k in fields):
+            if identifier not in new:
+                raise ValueError('old outer resource changed: '+kind+'/'+identifier)
+            for field in fields:
+                left=value.get(field);right=new[identifier].get(field)
+                if left==right:continue
+                if (kind=='containers' and field=='HostConfig' and dns_policy_version
+                        and isinstance(left,dict) and isinstance(right,dict)
+                        and 'Dns' in left and 'Dns' in right
+                        and ((left['Dns'] is None and type(right['Dns']) is list and right['Dns']==[])
+                             or (right['Dns'] is None and type(left['Dns']) is list and left['Dns']==[]))):
+                    # Compare copies only; raw inspections remain preservation evidence.
+                    left_rest=dict(left);right_rest=dict(right)
+                    del left_rest['Dns'];del right_rest['Dns']
+                    if left_rest==right_rest:
+                        equivalences.append({
+                            'policyId':'moby-29.8.1-hostconfig-dns-null-empty-v1',
+                            'containerId':identifier,'jsonPath':'/containers/'+identifier+'/HostConfig/Dns',
+                            'before':None if left['Dns'] is None else [],
+                            'after':None if right['Dns'] is None else [],
+                            'beforeServerVersion':before['info']['ServerVersion'],
+                            'afterServerVersion':after['info']['ServerVersion'],
+                            'semanticSource':{
+                                'archiveSha256':'94be9d6940b613676335fc494e617b4acf98676435b3744f32649ed72114bd58',
+                                'reference':'official Moby docker-v29.8.1; daemon/container/container.go readHostConfig/InitDNSHostConfig; daemon/container_operations.go positive-length DNS override'}})
+                        continue
                 raise ValueError('old outer resource changed: '+kind+'/'+identifier)
         added=set(new)-set(old);changes[kind]=sorted(added)
         if added!=({export_id} if kind=='containers' else set()):
@@ -452,7 +478,8 @@ def compare_outer(before,after,export_id):
             if (export.get('State',{}).get('Running') is not False or export.get('Mounts')!=[]
                     or export.get('Config',{}).get('Labels',{}).get('mingos.p01.generation') is None):
                 raise ValueError('owned export container changed')
-    return {'status':'preserved','additions':changes,'unknownConcurrentChanges':False}
+    return {'status':'preserved','additions':changes,'unknownConcurrentChanges':False,
+            'equivalences':equivalences}
 
 
 def _finish_create(receipt,output,archive_root,manifest,persist,command,docker,inspect_many):

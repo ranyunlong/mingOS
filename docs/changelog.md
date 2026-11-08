@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-08 — S2实际namespace修复与旧资源DNS表示差异
+
+- CLI修复提交`28a67af`在两全新代`dbdcae92`、`4b1bac35`完成实际专属Containers/Plugins namespace、三个固定镜像的严格load/inspect及有效受限smoke；两代均在外层旧资源保全阶段退出1，仍为NOT ACCEPTED。
+- 全量原始对象独立比较确认差异仅为旧容器`HostConfig.Dns`从null变为空数组；其他旧容器字段、镜像和卷未变。两代、全部VHD/容器/日志及原始失败收据保留，不重试或改判。
+- 留存固定官方Moby源码及独立摘要核对、Desktop idle启动和daemon容器加载日志；停止事件在运行前，启动/加载在运行区间内。支持加载期初始化解释，不声称已确定触发API/行为者或inspect自行归一化。
+- 精确版本限定的空DNS语义规则已通过独立设计复核并写入绑定设计；仅双方实际版本29.8.1、双方存在的Dns键null与实际空数组可等价，比较副本并记录原始差异/源码pin，其他保护严格保留。实现、负控、独立源码复核和全新代验收继续。
+- 宿主规则实现保留真实RED7运行/3断言失败；focused GREEN7项、完整Windows host39项通过。新的冻结Linux公共回归146运行/145通过/1Windows专属跳过、零失败/错误，全部冻结源码pin一致；独立源码复核及新代实际验收仍为独立门槛。
+- 独立源码Spec PASS/Task quality Approved，无阻断项；18个冻结源码/测试pin由主执行者重核一致。批准范围只限实现，须提交后在全新代取得实际create/observe/exec及独立复核。
+- 本轮重新计算原3.54GB交付包SHA256与封存pin一致；远程分支精确查询为`46af996`，`f00331c`/`d71b79d`/`28a67af`为本地未推送检查点。S2/P01未通过，仍0/11，正式资格标志均false。
+
 ## 2026-11-08 — S2固定Docker解析差异的实际诊断
 
 - 首轮实际namespace修复提交`d71b79d`保持真实值准入和回放检查；全新8039baf3在daemon launch阶段失败，固定版本拒绝单数JSON键，未load/smoke，未改判通过。

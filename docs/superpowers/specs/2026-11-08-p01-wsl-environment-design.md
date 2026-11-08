@@ -62,4 +62,8 @@ guest内部生命周期接口为`launch_environment(generation: str, *, ready_ti
 
 外层基线用 immutable IDs（镜像 index digest、container ID、volume name+CreatedAt+Driver+Options+Labels）及容器配置/挂载/状态保全；忽略 RunningFor 等时钟文案。未知旧资源删除、配置/挂载/状态变化阻断成功，新增资源逐一记录调用者 labels/ID；本入口仅允许自己的 stopped export container。并发已授权任务新增资源记录归属与证据，无法归属为 inconclusive。context名称/endpoint、daemon ID、旧镜像集合必须保持。共享 cgroup root 控制位前后逐字相同。
 
+2026-11-08独立设计复核批准一条精确的配置语义比较规则：仅在前后实际外层`ServerVersion`均严格等于字符串`29.8.1`、绑定endpoint/context/daemon身份不变时，两个字典`HostConfig`中均存在的精确`Dns`键可将`null`与实际空数组视作等价，双向均适用。只比较副本，保留完整原始对象、命令日志和收据；不得写旧资源API或磁盘以归一化。每次实际等价必须记录policy ID、container ID、JSON path、原始before/after、两次版本及固定语义源码引用；完全相等时等价列表为空。缺键、错误类型、非空或重排DNS、缺失/变更/不支持版本、`DnsSearch`/`DnsOptions`及所有其他HostConfig键的存在和值、Config/Mounts/State、身份、镜像/卷、成员集合、新增资源和共享cgroup仍按原合同严格比较。
+
+语义依据为固定官方Moby v29.8.1源码归档SHA256`94be9d6940b613676335fc494e617b4acf98676435b3744f32649ed72114bd58`：`daemon/container/container.go`的`readHostConfig`调用`InitDNSHostConfig`，将nil DNS初始化为空切片；`daemon/container_operations.go`仅在长度大于0时设置容器DNS覆盖。版本门是兼容性限制，不是外层引擎二进制认证。实际日志支持两次失败区间内VM唤醒和daemon容器加载，未确定精确触发API/行为者；不声称inspect自身执行归一化。该规则不改判任何历史失败代。必须经实现负控、独立源码复核、提交和另一个全新代实际create/observe/exec及独立验收，才能关闭S2。
+
 任何失败都保存 partial outputs/WSL/VHD/容器/卷/日志，不 delete/prune/reset/unregister、不原地重试。超时后观察到进程还在运行时记录 `processMayRemain=true`；不能根据外层命令退出0判定 guest成功。只有正式 create 入口在另一个新代完成全部步骤、单元负控及独立只读 observe 才能关闭 S2。该成功不关闭 S3–S6、不把11项目进度提升、不声明冷构建/持久化端到端完成。

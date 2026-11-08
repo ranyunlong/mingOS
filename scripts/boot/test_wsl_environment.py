@@ -266,6 +266,116 @@ class OuterPreservationTests(unittest.TestCase):
             changed=copy.deepcopy(after);mutate(changed)
             with self.assertRaises(ValueError):env.compare_outer(old,changed,'export')
 
+class OuterDnsPreservationTests(unittest.TestCase):
+    def snapshots(self, before_dns=None, after_dns=None):
+        import copy
+        before={'info':{'ID':'outer','ServerVersion':'29.8.1'},'context':'desktop',
+                'images':[{'Id':'image','Config':{'User':'root'}}],
+                'containers':[{'Id':'old','Image':'image','Config':{'User':'root'},
+                               'HostConfig':{'Dns':before_dns,'DnsSearch':[],'DnsOptions':[],
+                                             'NetworkMode':'none'},'Mounts':[],
+                               'State':{'Running':False}}],
+                'volumes':[{'Name':'vol','CreatedAt':'time','Driver':'local','Options':{},'Labels':{}}]}
+        after=copy.deepcopy(before);after['containers'][0]['HostConfig']['Dns']=after_dns
+        after['containers'].append({'Id':'export','State':{'Running':False},'Mounts':[],
+                                    'Config':{'Labels':{'mingos.p01.generation':'p01-test'}}})
+        return before,after
+
+    def test_empty_dns_equivalence_records_raw_values_and_never_mutates_inputs(self):
+        import copy
+        # Removing the exact DNS exception must reject these otherwise preserved resources.
+        for before_dns,after_dns in ((None,[]),([],None)):
+            with self.subTest(before=before_dns,after=after_dns):
+                before,after=self.snapshots(before_dns,after_dns)
+                original=copy.deepcopy((before,after))
+                try:result=env.compare_outer(before,after,'export')
+                except ValueError as error:self.fail('reviewed DNS equivalence was rejected: '+str(error))
+                self.assertEqual(result,{'status':'preserved','additions':{'images':[],
+                    'containers':['export'],'volumes':[]},'unknownConcurrentChanges':False,
+                    'equivalences':[{'policyId':'moby-29.8.1-hostconfig-dns-null-empty-v1',
+                        'containerId':'old','jsonPath':'/containers/old/HostConfig/Dns',
+                        'before':before_dns,'after':after_dns,
+                        'beforeServerVersion':'29.8.1','afterServerVersion':'29.8.1',
+                        'semanticSource':{'archiveSha256':'94be9d6940b613676335fc494e617b4acf98676435b3744f32649ed72114bd58',
+                            'reference':'official Moby docker-v29.8.1; daemon/container/container.go readHostConfig/InitDNSHostConfig; daemon/container_operations.go positive-length DNS override'}}]})
+                self.assertEqual((before,after),original)
+                # Editing returned evidence must not edit the raw snapshots either.
+                entry=result['equivalences'][0]
+                entry['after' if after_dns==[] else 'before'].append('evidence-only')
+                self.assertEqual((before,after),original)
+
+    def test_exact_equality_needs_no_version_or_equivalence(self):
+        for dns in (None,[],['1.1.1.1']):
+            before,after=self.snapshots(dns,dns)
+            del before['info']['ServerVersion'];del after['info']['ServerVersion']
+            self.assertEqual(env.compare_outer(before,after,'export').get('equivalences'),[])
+
+    def test_missing_dns_key_never_equals_null_or_empty(self):
+        for missing in (0,1):
+            for dns in (None,[]):
+                before,after=self.snapshots(dns,dns)
+                del (before,after)[missing]['containers'][0]['HostConfig']['Dns']
+                with self.subTest(missing=missing,dns=dns),self.assertRaises(ValueError):
+                    env.compare_outer(before,after,'export')
+
+    def test_wrong_types_and_nonempty_dns_never_qualify(self):
+        pairs=[(None,''),(None,{}),(None,False),(None,0),(None,()),
+               ([],''),([],{}),([],False),([],0),([],()),
+               (None,['1.1.1.1']),([],['1.1.1.1']),
+               (['1.1.1.1'],['8.8.8.8']),
+               (['1.1.1.1','8.8.8.8'],['8.8.8.8','1.1.1.1'])]
+        for left,right in pairs:
+            for a,b in ((left,right),(right,left)):
+                with self.subTest(before=a,after=b),self.assertRaises(ValueError):
+                    env.compare_outer(*self.snapshots(a,b),'export')
+        for malformed in (None,[],{'DNS':None}):
+            before,after=self.snapshots(None,[])
+            before['containers'][0]['HostConfig']=malformed
+            with self.subTest(hostconfig=malformed),self.assertRaises(ValueError):
+                env.compare_outer(before,after,'export')
+
+    def test_dns_exception_requires_both_exact_observed_versions(self):
+        for versions in ((None,'29.8.1'),('29.8.1',None),('29.8.0','29.8.0'),
+                         ('29.8.1','29.8.2'),('29.8.2','29.8.1'),
+                         ('v29.8.1','29.8.1'),(29.8,'29.8.1')):
+            before,after=self.snapshots(None,[])
+            for snapshot,version in zip((before,after),versions):
+                if version is None:del snapshot['info']['ServerVersion']
+                else:snapshot['info']['ServerVersion']=version
+            with self.subTest(versions=versions),self.assertRaises(ValueError):
+                env.compare_outer(before,after,'export')
+
+    def test_dns_equivalence_does_not_hide_neighbor_changes_or_resource_changes(self):
+        import copy
+        # Each mutation must still block even when a valid DNS pair is present.
+        mutations=[
+            lambda v:v['containers'][0]['HostConfig'].update(NetworkMode='host'),
+            lambda v:v['containers'][0]['HostConfig'].update(DnsSearch=None),
+            lambda v:v['containers'][0]['HostConfig'].update(DnsOptions=None),
+            lambda v:v['containers'][0]['HostConfig'].update(NewKey=None),
+            lambda v:v['containers'][0]['HostConfig'].pop('DnsSearch'),
+            lambda v:v['containers'][0]['Config'].update(User='nobody'),
+            lambda v:v['containers'][0]['State'].update(Running=True),
+            lambda v:v['containers'][0]['Mounts'].append({'Source':'/old'}),
+            lambda v:v['containers'][0].update(Image='other'),
+            lambda v:v['images'][0]['Config'].update(User='nobody'),
+            lambda v:v['volumes'][0].update(Options={'x':'y'}),
+            lambda v:v['images'].append({'Id':'unknown'}),
+            lambda v:v['volumes'].append({'Name':'unknown'}),
+            lambda v:v['containers'].append({'Id':'unknown'}),
+            lambda v:v['images'].clear(),lambda v:v['volumes'].clear(),
+            lambda v:v['containers'].pop(0),lambda v:v['info'].update(ID='other'),
+            lambda v:v.update(context='other'),
+            lambda v:v['containers'][1]['State'].update(Running=True),
+            lambda v:v['containers'][1]['Mounts'].append({'Source':'/bad'}),
+            lambda v:v['containers'][1]['Config']['Labels'].clear()]
+        for index,mutate in enumerate(mutations):
+            before,after=self.snapshots(None,[]);mutate(after)
+            original=copy.deepcopy((before,after))
+            with self.subTest(mutation=index),self.assertRaises(ValueError):
+                env.compare_outer(before,after,'export')
+            self.assertEqual((before,after),original)
+
 class FollowupClaimTests(unittest.TestCase):
     def test_existing_output_claim_precedes_receipt_or_process(self):
         with tempfile.TemporaryDirectory() as tmp,patch.object(env.subprocess,'run') as run:

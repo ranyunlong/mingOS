@@ -91,3 +91,17 @@ Task4公共create/observe/exec已完成实现与独立复核，提交`f00331c`�
 使用同一固定bundle的dockerd二进制，在独立受限容器仅执行`--help`和`--validate`：复数JSON退出0、单数JSON退出1并复现原错误；省略plugin JSON键、在CLI传`--containerd-plugins-namespace <generation>-plugins`退出0。证据`artifacts/p01-engine-config-controls-20261108-7f603208/`，精确容器`0421e333c7766bdd082f7dd04636a385fa1df5fa3587cd20c6d1f7cfd297dc31`保留，`daemonStarted=false`、`actualNamespaceAcceptance=false`。下一实现采用已确认的CLI路径，仍保留全部实际namespace验证；独立复核和另一全新运行代必须继续通过。两个原代均未接受，S2/P01仍未完成。
 
 CLI最小修复只修改guest配置和实际dockerd启动两行，host及全部实际namespace验证不变。新RED两项测试出现三个断言失败；Windows guest40项运行、35通过、5项Linux控制跳过，focused namespace7/7。最终受影响冻结Linux控制`artifacts/p01-s2-guest-controls-20261108-004c3929/`为40/40、零跳过/失败/错误，精确保留容器`7773e58857f03a42dcd7c78d8fed6620f61545d7c070971935b44c57ffcee956`退出0且非OOM。此前完整139项和本次受影响40项是不同快照执行；独立CLI修复spec/quality复核已通过，新的实际代仍为后续门槛。
+
+## 两次新代的实际namespace通过与保全失败（2026-11-08）
+
+提交`28a67af`的正式新代`dbdcae92`及随后`4b1bac35`均实际完成精确generation Containers/Plugins namespace、rust/tools/kotlin三次严格载入及inspect、有效受限smoke并exit0；整体create却均在outer-preservation退出1，不能算S2成功。两次无timeout/processMayRemain。完整证据分别在`artifacts/p01-s2-formal-20261108-dbdcae92/`和`artifacts/p01-s2-formal-20261108-4b1bac35/`。
+
+独立原始全对象比较：dbdcae92为8镜像/610→611容器/224卷，旧0421和7773两容器仅`/HostConfig/Dns`从null变为[]；4b1bac35为8镜像/611→612容器/224卷，仅上一代export9160的相同字段变化。其余所有旧对象完整字段均相同，唯一新增各为该代owned stopped export。两代仍NOT ACCEPTED，不能因其余步骤成功而覆盖失败。两次间另有完整只读稳定快照；它未保证后续唤醒期间字段保持，故不再重复无改动试跑。
+
+`artifacts/p01-desktop-idle-evidence-20261108-b5833be7/`保留Desktop idle及VM日志。两次stoppingVM均在各自create前；startingVM分别03:02:04.801Z/03:11:31.092Z，dockerd启动和容器加载分别03:02:08–09Z/03:11:34–35Z，发生在各自before容器inspect之后、运行区间内。固定官方Moby29.8.1源码归档22153906字节、SHA256`94be9d6940b613676335fc494e617b4acf98676435b3744f32649ed72114bd58`显示磁盘加载调用readHostConfig/InitDNSHostConfig，nil DNS初始化为空切片；DNS覆盖仅在长度大于0时设置。证据支持加载期初始化解释，未确定精确触发API/行为者，不证明inspect自行归一化或外层二进制与源码加密等同。
+
+独立设计复核批准[绑定设计](superpowers/specs/2026-11-08-p01-wsl-environment-design.md)中的精确规则：只有双方实际ServerVersion均为29.8.1、身份不变、两字典均有精确Dns键时允许null/实际空数组双向语义等价。只比较副本，原始证据不改，每个例外显式记录container/path/raw值/版本/源码pin；所有其他字段、资源、namespace和共享控制仍严格保护。实现、负控、源码复核及新代实际验收仍须完成，历史四失败代永不改判。
+
+该规则的宿主实现已完成真实RED7项运行/3断言失败、focused GREEN7项和完整Windows host39项通过；冻结Linux公共闭包`artifacts/p01-s2-public-controls-20261108-7467939a/`为146项运行、145通过、1项Windows junction专属跳过、零失败/错误，容器`1325701bc1635a3ab3657db6b8abe4a86ed40895e95f96bcb4f06261a5289dcf`退出0且非OOM。原始对象不改，返回独立`equivalences`数组，每次例外记录固定policy/source及raw值/版本。此为实现与控制证据，源码独立复核和新代实际验收仍单独进行。
+
+独立源码复核现为Spec PASS/Task quality Approved，无Critical/Important/Minor；核对精确版本/key/type门、其他字段和资源严格性、raw不变/证据不别名，以及同一显式transport的endpoint绑定。主执行者另重算全部18个冻结源/测试文件与当前工作树pin一致。接下来须从已复核提交创建全新代，完成独立observe/exec和完整实际复核；源码批准不接受S2。

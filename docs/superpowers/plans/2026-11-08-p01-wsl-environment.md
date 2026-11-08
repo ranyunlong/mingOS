@@ -135,6 +135,8 @@ Task4实现/控制及独立复核完成于`f00331c`；随后真实Task5发现实
 
 - [ ] 真实缺陷修复门槛：保留实际两namespace的launch/live/retained/host验证；固定引擎不接受单数JSON键，须省略两种plugin JSON键并以复数CLI设置本代值，真实RED/GREEN、固定二进制parser控制及独立复核均须通过；另用全新代执行Task5，原554bde65及8039baf3保持不合格。
 
+最新执行记录：CLI修复`28a67af`及其独立源码复核/受影响Linux40项控制完成；两个全新代dbdcae92/4b1bac35实际namespace/load/smoke通过，但整体均因外层旧容器Dns null→[]而失败。精确版本限定空DNS语义规则已获独立设计复核并写入spec；实现TDD、独立源码复核、测试提交及又一全新代Task5仍为必需门槛，所有原失败代不复用或改判。
+
 ### Task 5: 正式新代实测与独立审查
 
 **Files:** Modify `docs/p01-environment-audit.md`, P01总设计环境选择段、操作文档；新增本次 `artifacts/p01-wsl-environment-20261108-<unique>/` 证据，不覆盖历史目录。
