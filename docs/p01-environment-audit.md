@@ -58,7 +58,13 @@ guest-c daemon ID：`81326b10-1096-4e41-a8a0-0303a61dd95e`；driver `overlayfs`�
 
 实际公开`prepare_rootfs`消费原保留export及固定Docker bundle，独立tar遍历比较全部17,278个原成员的内容、模式、属主与链接语义，精确新增8个二进制及`wsl.conf`，输出17,287成员。输出1,460,418,560字节、SHA256为`74b938e0c30b07f14103ed138cfd5d2fe87e37365bd7719e5f65c10471b597b0`，来源输入前后摘要不变；结果与原实验字节一致，但验收按独立成员比较完成，没有采信历史结果替代本次执行。完整证据为`artifacts/p01-s2-actual-rootfs-20261108-e5a18d06/`。
 
-这些结果只关闭S2计划的transport及输入任务。新distro/daemon公共生命周期、完整create/observe/exec、真实全新代集成验收仍须完成，不构成S2或P01整体验收。
+这些结果关闭S2计划的transport及输入任务。生命周期初始阶段随后新增`create_empty_environment`、`launch_environment`及`admit_environment`：固定endpoint与完整Tools核对、新distro/VHD导入、私有namespace/cgroup配置、首次空store留存、实际daemon环境及managed-containerd路径检查、PID/starttime/exe/ns/socket/daemon身份复核。初始阶段成功仍为`creating/empty-daemon-observed`，不返回最终ready状态。
+
+生命周期提交`9f4d0f3`已完成独立spec/quality复核。Windows控制41项运行、37通过、4项Linux接收器明确跳过；完整冻结Linux闭包含9项transport控制，共50项运行、49通过、1项Windows junction明确跳过，四项Linux接收器全部执行。精确容器`6ceb3601a2b5d9f7b166858d84749a6e4896ff04ac7a75bf3b74019896731762`退出0且非OOM；证据为`artifacts/p01-s2-lifecycle-controls-20261108-79c8c7e0/`。首Linux快照`e119d19f`因测试把Python符号链接当普通输入而失败，保留失败容器和日志，仅将测试夹具改为解析后的真实文件，生产nofollow策略不变。
+
+另从S1已验收的只读重开容器复制三固定镜像至`artifacts/p01-s2-s1-inputs-20261108-febd2fdb/archives/`，严格`verify_all`通过，来源容器前后inspect一致。首复制准备代`cd6b8798`因controller误用导入容器的挂载点而在只读inspect处失败，尚未复制；原代保留，按实际只读重开挂载点`/imported`使用新输出代完成。
+
+以上生命周期验证是实现与模拟控制验收，不证明已经通过公共入口创建实际新WSL环境。完整create/observe/exec、严格三镜像加载、有效smoke及另一全新代真实集成仍须完成，不构成S2或P01整体验收。
 
 ## 状态
 

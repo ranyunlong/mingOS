@@ -51,6 +51,8 @@ S2独立环境已有QEMU和WSL实验：新WSL VHD/daemon初始store为空，三�
 
 S2公共化补充：显式Docker transport完成实现和独立复核；公共输入冻结、rootfs构造与Linux二进制接收模块完成Windows14项控制、Linux17通过/1项Windows专属跳过及独立复核。实际rootfs重写后全部17,278个原成员逐项一致，仅新增8个固定引擎二进制与`wsl.conf`。新distro/私有daemon生命周期、完整CLI及正式新代集成继续，不将这两个子任务计作S2或P01完成。
 
+生命周期初始实现`9f4d0f3`已通过独立复核和完整冻结Linux控制49通过/1项Windows专属跳过（50项含9项transport控制）；初始状态仍为creating，完整load/smoke/observe/exec继续。S1只读恢复卷中的三镜像已复制到独立新目录并严格核验，供正式另一新代验收。全部项目仍0/11完成。
+
 ## 完整 changelog
 
 ### 2026-11-08 — P01 S1实际交接导入通过

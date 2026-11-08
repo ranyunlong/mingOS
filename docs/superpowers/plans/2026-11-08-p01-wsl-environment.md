@@ -1,6 +1,6 @@
 # P01 S2 WSL Environment Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 在正式公共入口创建全新 WSL2/VHD/daemon，严格加载三个固定 index，并通过有效资源限制 smoke 与独立观察。
 
@@ -60,7 +60,7 @@ Task3接口裁定：`launch_environment`只接受generation，由它派生全部
 
 **Consumes:** `qualification_image_archive._docker_run` 的 command capture 与 `(result, operation)`；**Produces:** 上述 DockerTransport API。
 
-- [ ] 写 RED 测试，环境中同时设置坏 DOCKER_HOST、DOCKER_CONTEXT，断言 argv 仍由显式 endpoint 组成；空/相对executable、缺endpoint、tcp endpoint失败。
+- [x] 写 RED 测试，环境中同时设置坏 DOCKER_HOST、DOCKER_CONTEXT，断言 argv 仍由显式 endpoint 组成；空/相对executable、缺endpoint、tcp endpoint失败。
 
 ```python
 def test_explicit_endpoint(self):
@@ -73,10 +73,10 @@ def test_loader_executable_cannot_change(self):
         client.migration_runner({'operations': []}, 'load', ['/bin/other','image','load'], 30)
 ```
 
-- [ ] `python -B -m unittest discover -s scripts/boot -p test_docker_transport.py -v`，保存实际失败输出。
-- [ ] 实现 argv validation；executable/config接受POSIX或Windows绝对路径，拒绝traversal/control字符；endpoint只接受明确unix/npipe。拒绝args中的连接覆盖选项`--host/-H`、`--context/-c`、`--config`及TLS连接覆盖（含`=value`或短选项附值）。`run`复制并清理Docker/context/TLS/proxy环境，显式`--host --config`，stdin保持二进制文件对象、shell=False。adapter校验executable，只允许stdin kwarg，调用原capture helper时显式传清理环境/shell=False并保持timeout，禁止wrapper shell拼命令。
-- [ ] 追加 fake-runner 测试断言 load 的 stdin 对象身份不变、超时/非零保留 operation、不会修改 os.environ/context；跑同一命令应全PASS。
-- [ ] 单独提交该交付，controller 复核。
+- [x] `python -B -m unittest discover -s scripts/boot -p test_docker_transport.py -v`，保存实际失败输出。
+- [x] 实现 argv validation；executable/config接受POSIX或Windows绝对路径，拒绝traversal/control字符；endpoint只接受明确unix/npipe。拒绝args中的连接覆盖选项`--host/-H`、`--context/-c`、`--config`及TLS连接覆盖（含`=value`或短选项附值）。`run`复制并清理Docker/context/TLS/proxy环境，显式`--host --config`，stdin保持二进制文件对象、shell=False。adapter校验executable，只允许stdin kwarg，调用原capture helper时显式传清理环境/shell=False并保持timeout，禁止wrapper shell拼命令。
+- [x] 追加 fake-runner 测试断言 load 的 stdin 对象身份不变、超时/非零保留 operation、不会修改 os.environ/context；跑同一命令应全PASS。
+- [x] 单独提交该交付，controller 复核。
 
 ### Task 2: 独占输入、rootfs 与冻结传输
 
@@ -84,8 +84,8 @@ def test_loader_executable_cannot_change(self):
 
 **Consumes:** 固定 loader `FIXED`/`verify_all`；**Produces:** freeze_inputs/prepare_rootfs/receive_file，控制器参数验证及独占命令记录器。
 
-- [ ] 写实际临时 tar/stream 测试：bundle错hash/bytes、重复名、symlink、超大成员；rootfs替换路径经链接、绝对/traversal/重复成员拒绝，合法 `/bin -> usr/bin` rootfs links 保留；输出已存在拒绝。
-- [ ] 接收器 Linux 测试使用真实临时目录，核对短传/超长/hash错误、已有文件、symlink父目录拒绝，错误后部分文件留存且同目标再次接收失败。
+- [x] 写实际临时 tar/stream 测试：bundle错hash/bytes、重复名、symlink、超大成员；rootfs替换路径经链接、绝对/traversal/重复成员拒绝，合法 `/bin -> usr/bin` rootfs links 保留；输出已存在拒绝。
+- [x] 接收器 Linux 测试使用真实临时目录，核对短传/超长/hash错误、已有文件、symlink父目录拒绝，错误后部分文件留存且同目标再次接收失败。
 
 ```python
 def test_failed_transfer_is_not_reused(self):
@@ -97,10 +97,10 @@ def test_failed_transfer_is_not_reused(self):
         receive_file(path, hashlib.sha256(b'abc').hexdigest(), 3, 0o444, io.BytesIO(b'abc'))
 ```
 
-- [ ] Windows 跑 `python -B -m unittest discover -s scripts/boot -p test_wsl_environment.py -v`，Linux 跑 `python3 -B -m unittest discover -s <frozen-tests> -p test_wsl_environment_guest.py -v`，确认新API缺失/故意输入失败而非平台语义跳过。
-- [ ] 实现freeze exclusive目录/文件、fsync、hash清单，构造wsl.conf与bundle替换tar；bundle固定bytes/hash前后核验，精确成员集合从可信固定tar实际观察后固化常量。禁止extractall；输入保留同fd前后stamp/hash复核。接收器用dirfd逐级O_NOFOLLOW，写循环处理partial write，hash/size通过才fchmod。
-- [ ] 实现 capture 每操作独立 `*.command.json/stdout.log/stderr.log/result.json`，全部exclusive；finally写超时/OSError结果；stdin记录sha/bytes而非内容。S2 helper清单覆盖transport、guest/controller、development loader及qualification helper，依赖闭包无隐式/public。
-- [ ] 加冻结后宿主源文件变化、guest helper改1byte、日志路径已存在、Windows reparse父目录的负控；运行本任务测试通过后提交。
+- [x] Windows 跑 `python -B -m unittest discover -s scripts/boot -p test_wsl_environment.py -v`，Linux 跑 `python3 -B -m unittest discover -s <frozen-tests> -p test_wsl_environment_guest.py -v`，确认新API缺失/故意输入失败而非平台语义跳过。
+- [x] 实现freeze exclusive目录/文件、fsync、hash清单，构造wsl.conf与bundle替换tar；bundle固定bytes/hash前后核验，精确成员集合从可信固定tar实际观察后固化常量。禁止extractall；输入保留同fd前后stamp/hash复核。接收器用dirfd逐级O_NOFOLLOW，写循环处理partial write，hash/size通过才fchmod。
+- [x] 实现 capture 每操作独立 `*.command.json/stdout.log/stderr.log/result.json`，全部exclusive；finally写超时/OSError结果；stdin记录sha/bytes而非内容。S2 helper清单覆盖transport、guest/controller、development loader及qualification helper，依赖闭包无隐式/public。
+- [x] 加冻结后宿主源文件变化、guest helper改1byte、日志路径已存在、Windows reparse父目录的负控；运行本任务测试通过后提交。
 
 ### Task 3: 新 distro 与私有 daemon 生命周期
 
@@ -108,13 +108,13 @@ def test_failed_transfer_is_not_reused(self):
 
 **Consumes:** Task1 transport、Task2输入/记录/接收；**Produces:** create_environment初始阶段、launch_environment和handle。
 
-- [ ] fake subprocess 对调用序列写RED：前置Tools缺失/旧distro/已有output时禁止 create/export/import；rootfs只导出已inspect的stopped container ID；禁止所有delete/prune/reset/unregister/shutdown/context use命令。
-- [ ] 为 config builder 写确定性断言：data/exec/pid/socket/containerd namespace仅本代；bridge/iptables等false；传入XDG_RUNTIME_DIR/DOCKER_HOST/代理环境后daemon实际env只含allowlist。
-- [ ] 实现spec创建步骤1–6；outer必须显式 npipe endpoint，固定Tools与verify_one结果逐项对照；创建stopped export container、export、prepare_rootfs、新WSL import。先记录外层info/ID/context/旧IDs，后续独立旧资源检查不能依赖列表行次序。
-- [ ] Linux launcher先generation cgroup再unshare，进入management后启用本代cpu/memory/pids；private mount遮蔽WSL共享路径，env -i与显式0700 TMPDIR。保存启动前后共享控制位、namespace、mountinfo、daemon/containerd cmdline与root/state/socket归属。
-- [ ] 30秒ready后空清单必须fsync且先于load/create；daemon退出、超时、非空store、缺controller、默认socket可见、共享控制位变化全部阻断。handle含/proc PID starttime、exe hash、ns ID、socket inode/owner、info.ID。
-- [ ] 实现admit_environment每次验证handle并进入management/nsenter；模拟PID复用、starttime不同、daemon ID不同和socket替换均失败，不在失败后重启。
-- [ ] 跑两模块unittest并保存结果；controller审查后提交。
+- [x] fake subprocess 对调用序列写RED：前置Tools缺失/旧distro/已有output时禁止 create/export/import；rootfs只导出已inspect的stopped container ID；禁止所有delete/prune/reset/unregister/shutdown/context use命令。
+- [x] 为 config builder 写确定性断言：data/exec/pid/socket/containerd namespace仅本代；bridge/iptables等false；传入XDG_RUNTIME_DIR/DOCKER_HOST/代理环境后daemon实际env只含allowlist。
+- [x] 实现spec创建步骤1–6；outer必须显式 npipe endpoint，固定Tools与verify_one结果逐项对照；创建stopped export container、export、prepare_rootfs、新WSL import。先记录外层info/ID/context/旧IDs，后续独立旧资源检查不能依赖列表行次序。
+- [x] Linux launcher先generation cgroup再unshare，进入management后启用本代cpu/memory/pids；private mount遮蔽WSL共享路径，env -i与显式0700 TMPDIR。保存启动前后共享控制位、namespace、mountinfo、daemon/containerd cmdline与root/state/socket归属。
+- [x] 30秒ready后空清单必须fsync且先于load/create；daemon退出、超时、非空store、缺controller、默认socket可见、共享控制位变化全部阻断。handle含/proc PID starttime、exe hash、ns ID、socket inode/owner、info.ID。
+- [x] 实现admit_environment每次验证handle并进入management/nsenter；模拟PID复用、starttime不同、daemon ID不同和socket替换均失败，不在失败后重启。
+- [x] 跑两模块unittest并保存结果；controller审查后提交。
 
 ### Task 4: 严格载入、有效限制 smoke 与观察 API
 

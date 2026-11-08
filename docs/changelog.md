@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-08 — P01 S2生命周期初始阶段
+
+- 新增新distro/VHD及私有daemon初始编排、全新路径/空store/环境检查、managed-containerd路径观察和PID/starttime/exe/ns/socket/daemon身份准入；提交`9f4d0f3`，独立spec/quality复核通过。
+- 外层只导出已inspect的精确固定Tools stopped容器；旧资源按64个ID分批记录，helper二进制传输采用nofollow目录FD，全部host/guest命令和超时partial日志保留。
+- Windows41项控制37通过/4项Linux接收器跳过；完整Linux闭包含transport共50项运行49通过/1项Windows junction跳过。首Linux夹具符号链接失败保留，仅修正测试文件路径，不放宽生产检查。
+- 从已验收S1只读卷复制三固定镜像并严格核验，来源前后未变；首次controller挂载点检查失败代保留，新代使用实际只读挂载点通过。
+- 初始状态仍为creating，完整create/load/smoke/observe/exec与正式另一新代实际验收继续；S2/P01及11项目总进度未改判完成。
+
 ## 2026-11-08 — P01 S2显式transport与公共输入控制
 
 - 新增`docker_transport.py`，固定executable/endpoint/config，清理环境，保持原镜像loader的binary stdin与命令收据合同；组合短选项准入P2已修复并独立复核，9项控制及16项迁移回归通过。
