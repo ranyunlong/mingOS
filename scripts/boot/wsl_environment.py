@@ -217,11 +217,12 @@ def _one(values):
 
 
 def _decode_wsl(data):
-    return data.decode('utf-16-le' if b'\0' in data else 'utf-8-sig').replace('\x00','')
+    encoding='utf-16' if data.startswith((b'\xff\xfe',b'\xfe\xff')) else ('utf-16-le' if b'\0' in data else 'utf-8-sig')
+    return data.decode(encoding).replace('\x00','').lstrip('\ufeff')
 
 
-def create_empty_environment(*,generation,distro,output_directory,wsl_executable,
-                             outer_docker,docker_bundle,archive_root):
+def _create_environment(*,generation,distro,output_directory,wsl_executable,
+                        outer_docker,docker_bundle,archive_root,complete=False):
     """Initial private daemon stage only. A returned receipt remains creating.
 
     All failed generations are retained; this API never retries a claimed output.
@@ -234,6 +235,8 @@ def create_empty_environment(*,generation,distro,output_directory,wsl_executable
     receipt={'schemaVersion':1,'generation':generation,'distro':distro,'status':'creating',
              'phase':'preflight','formalQualification':False,'finalSystemAccepted':False,
              'coldBuildExecuted':False,'resourcesPreserved':True,'commands':[]}
+    receipt['wslExecutable']=str(wsl_executable)
+    receipt['outputDirectory']=str(output)
     sink=(output/'environment-result.json').open('xb')
     def persist():
         sink.seek(0); sink.truncate(); _json(sink,receipt)
@@ -267,6 +270,7 @@ def create_empty_environment(*,generation,distro,output_directory,wsl_executable
         manifest=freeze_inputs(helpers,output/'frozen'); verify_frozen(output/'frozen',manifest)
         receipt['helpers']=manifest
         outer={'endpoint':outer_docker.endpoint,
+               'executable':outer_docker.executable,'configDirectory':outer_docker.config_directory,
                'info':json.loads(docker('outer-info',['info','--format','{{json .}}'])),
                'context':docker('outer-context',['context','show']).decode().strip()}
         outer['imageIds']=sorted(set(docker('outer-image-ids',['image','ls','-q','--no-trunc']).decode().splitlines()))
@@ -320,7 +324,253 @@ def create_empty_environment(*,generation,distro,output_directory,wsl_executable
         handle=json.loads(command('guest-launch',[str(wsl_executable),'-d',distro,'--user','root','--exec','/usr/bin/python3',remote,generation],90))
         if handle.get('generation')!=generation: raise ValueError('guest handle generation differs')
         receipt['handle']=handle;receipt['phase']='empty-daemon-observed';persist()
+        if complete:
+            _finish_create(receipt,output,archive_root,manifest,persist,command,docker,inspect_many)
         return receipt
     except BaseException as error:
         receipt['status']='failed';receipt['error']=repr(error); persist();raise
     finally: sink.close()
+
+HELPER_NAMES=('wsl_environment.py','wsl_environment_guest.py','docker_transport.py','development_image_migration.py','qualification_image_archive.py')
+
+
+def create_empty_environment(*,generation,distro,output_directory,wsl_executable,outer_docker,docker_bundle,archive_root):
+    """Internal lifecycle stage; intentionally never returns environment-ready."""
+    return _create_environment(generation=generation,distro=distro,output_directory=output_directory,
+        wsl_executable=wsl_executable,outer_docker=outer_docker,docker_bundle=docker_bundle,archive_root=archive_root)
+
+
+def create_environment(*,generation,distro,output_directory,wsl_executable,outer_docker,docker_bundle,archive_root):
+    """Create once and carry the same held receipt through every acceptance phase."""
+    return _create_environment(generation=generation,distro=distro,output_directory=output_directory,
+        wsl_executable=wsl_executable,outer_docker=outer_docker,docker_bundle=docker_bundle,
+        archive_root=archive_root,complete=True)
+
+
+TRANSFER_BOOTSTRAP='''import os,sys,hashlib
+path=sys.argv[1];size=int(sys.argv[2]);expected=sys.argv[3];mode=int(sys.argv[4]);parts=path.split("/")[1:]
+if not path.startswith("/") or any(p in ("",".","..") for p in parts):raise ValueError("invalid transfer path")
+parent=os.open("/",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+for part in parts[:-1]:
+ child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent);os.close(parent);parent=child
+fd=os.open(parts[-1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,384,dir_fd=parent)
+try:
+ digest=hashlib.sha256();count=0
+ while True:
+  chunk=sys.stdin.buffer.read(min(1048576,size-count+1))
+  if not chunk:break
+  count+=len(chunk)
+  if count>size:raise ValueError("transfer too long")
+  digest.update(chunk);view=memoryview(chunk)
+  while view:
+   written=os.write(fd,view)
+   if written<=0:raise OSError("short write")
+   view=view[written:]
+ if count!=size or digest.hexdigest()!=expected:raise ValueError("transfer pin differs")
+ os.fchmod(fd,mode);os.fsync(fd)
+finally:os.close(fd)
+os.fsync(parent);os.close(parent)
+'''
+
+
+def _guest_prefix(receipt):
+    return [receipt['wslExecutable'],'-d',receipt['distro'],'--user','root','--exec','/usr/bin/python3','-I']
+
+
+def _transfer(receipt,command,key,source,destination,pin,mode=0o444):
+    with _open_input(source) as stream:
+        stamp=_stamp(stream)
+        if _hash(stream)!={k:pin[k] for k in ('sha256','bytes')}:raise ValueError('transfer source pin differs')
+        command(key,[*_guest_prefix(receipt),'-c',TRANSFER_BOOTSTRAP,destination,str(pin['bytes']),pin['sha256'],str(mode)],300,stdin=stream)
+        _unchanged(stream,stamp,{k:pin[k] for k in ('sha256','bytes')})
+
+
+def _invoke_guest(receipt,output,key,request,persist,*,timeout=120):
+    from wsl_environment_guest import TRUSTED_DISPATCH
+    manifest=receipt['helpers'];verify_frozen(Path(manifest['root']),manifest)
+    if set(manifest['files'])!=set(HELPER_NAMES):raise ValueError('full five module closure required')
+    request={**request,'generation':receipt['generation'],'handle':receipt['handle'],
+             'codeRoot':receipt['guestCodeRoot'],'pins':manifest['files']}
+    argv=[*_guest_prefix(receipt),'-c',TRUSTED_DISPATCH,receipt['guestCodeRoot'],
+          json.dumps(manifest['files']),'--stdin-request']
+    request_path=output/(key+'.request.json')
+    with request_path.open('xb') as stream:_json(stream,request)
+    receipt['commands'].append(key);persist()
+    with _open_input(request_path) as stream:
+        result=capture(output,key,argv,timeout=timeout,stdin=stream)
+    # Parse and preserve guest evidence even on a guest error/partial loader failure.
+    raw=(output/(key+'.stdout.log')).read_bytes()
+    try:envelope=json.loads(raw)
+    except (ValueError,UnicodeDecodeError) as error:raise ValueError('guest returned no valid evidence envelope') from error
+    receipt.setdefault('guestOperations',{})[key]=envelope;persist()
+    evidence=envelope.get('evidence',{})
+    if 'load-result.json' in evidence:
+        receipt['load']=json.loads(evidence['load-result.json']);persist()
+    if result.returncode or envelope.get('status')!='ok':raise ValueError('guest operation failed: '+key)
+    return envelope['result']
+
+
+def validate_smoke_result(result):
+    from wsl_environment_guest import validate_effective,validate_smoke_inspect,validate_smoke_state,SMOKE_SCRIPT
+    try:
+        validate_effective(result['actualEffective'])
+        for key in ('inspectBefore','inspectAfter'):validate_smoke_inspect(result[key],result['id'])
+        if result['inspectBefore']['State']['Running'] is not False:raise ValueError('smoke began running')
+        validate_smoke_state(result['inspectAfter']['State'])
+        if result['script']!={'sha256':hashlib.sha256(SMOKE_SCRIPT).hexdigest(),'bytes':len(SMOKE_SCRIPT)}:
+            raise ValueError('smoke script pin differs')
+    except (KeyError,TypeError) as error:raise ValueError('incomplete smoke result') from error
+
+
+def _outer_after(docker,inspect_many):
+    result={'info':json.loads(docker('after-outer-info',['info','--format','{{json .}}'])),
+            'context':docker('after-outer-context',['context','show']).decode().strip()}
+    for name,args,kind in [('images',['image','ls','-q','--no-trunc'],'image'),
+                           ('containers',['ps','-a','-q','--no-trunc'],'container'),
+                           ('volumes',['volume','ls','-q'],'volume')]:
+        identifiers=sorted(set(docker('after-outer-'+name+'-ids',args).decode().splitlines()))
+        result[name]=inspect_many('after-outer-'+name,kind,identifiers)
+    return result
+
+
+def compare_outer(before,after,export_id):
+    if before['info'].get('ID')!=after['info'].get('ID') or before['context']!=after['context']:
+        raise ValueError('outer daemon/context changed')
+    changes={}
+    for kind,key,fields in [('images','Id',('Id','Descriptor','Architecture','Os','RootFS','Config')),
+                            ('containers','Id',('Id','Image','Config','HostConfig','Mounts','State')),
+                            ('volumes','Name',('Name','CreatedAt','Driver','Options','Labels'))]:
+        old={v[key]:v for v in before[kind]};new={v[key]:v for v in after[kind]}
+        for identifier,value in old.items():
+            if identifier not in new or any(value.get(k)!=new[identifier].get(k) for k in fields):
+                raise ValueError('old outer resource changed: '+kind+'/'+identifier)
+        added=set(new)-set(old);changes[kind]=sorted(added)
+        if added!=({export_id} if kind=='containers' else set()):
+            raise ValueError('inconclusive: unowned outer resource additions: '+kind)
+        if kind=='containers':
+            export=new[export_id]
+            if (export.get('State',{}).get('Running') is not False or export.get('Mounts')!=[]
+                    or export.get('Config',{}).get('Labels',{}).get('mingos.p01.generation') is None):
+                raise ValueError('owned export container changed')
+    return {'status':'preserved','additions':changes,'unknownConcurrentChanges':False}
+
+
+def _finish_create(receipt,output,archive_root,manifest,persist,command,docker,inspect_many):
+    import development_image_migration as migration
+    generation=receipt['generation'];base='/opt/'+generation;code='/root/'+generation+'-code'
+    receipt['guestCodeRoot']=code
+    receipt['inner']={'executable':'/usr/local/bin/docker','endpoint':'unix:///run/'+generation+'/docker.sock',
+        'configDirectory':base+'/client','dataRoot':'/var/lib/'+generation+'/docker','execRoot':'/run/'+generation+'/exec',
+        'containerdNamespace':generation,'containerdPluginsNamespace':generation+'-plugins'}
+    receipt['phase']='helper-transfer';persist()
+    # Existing /opt/<generation> was created exclusively by this generation's launcher.
+    command('guest-directories',[*_guest_prefix(receipt),'-c',
+        'import os,sys; os.mkdir(sys.argv[1],448); os.mkdir(sys.argv[2],448)',code,base+'/archives'])
+    for name,pin in manifest['files'].items():_transfer(receipt,command,'transfer-'+name,output/'frozen'/name,code+'/'+name,pin)
+    receipt['phase']='archive-transfer';persist()
+    for role,entry in migration.FIXED.items():
+        _transfer(receipt,command,'transfer-'+role,Path(archive_root)/entry['file'],base+'/archives/'+entry['file'],
+                  {'sha256':entry['sha256'],'bytes':entry['bytes']})
+    receipt['phase']='load';persist()
+    receipt['load']=_invoke_guest(receipt,output,'guest-load',{'action':'load','archiveRoot':base+'/archives'},persist,timeout=5600)
+    if (receipt['load'].get('completedLoads')!=['rust','tools','kotlin']
+            or receipt['load'].get('verifiedInspections')!=['rust','tools','kotlin']
+            or receipt['load'].get('status')!='development-toolchain-load-inspect-verified'):
+        raise ValueError('exact three-role load completion required')
+    receipt['phase']='smoke';persist()
+    receipt['smoke']=_invoke_guest(receipt,output,'guest-smoke',{'action':'smoke'},persist,timeout=240)
+    validate_smoke_result(receipt['smoke'])
+    receipt['phase']='observe';persist()
+    receipt['observation']=_invoke_guest(receipt,output,'guest-observe',{'action':'observe','load':receipt['load'],'smoke':receipt['smoke']},persist)
+    from wsl_environment_guest import validate_effective,validate_handle
+    validate_handle(receipt['handle'],receipt['observation']['handle']);validate_effective(receipt['observation']['actualEffective'])
+    receipt['firstEmpty']=receipt['observation']['firstEmpty']
+    receipt['privateEvidence']=receipt['observation']['privateEvidence']
+    receipt['phase']='outer-preservation';persist()
+    receipt['outerAfter']=_outer_after(docker,inspect_many);persist()
+    receipt['oldResources']=compare_outer(receipt['outer'],receipt['outerAfter'],receipt['exportContainerId'])
+    receipt['status']='environment-ready';receipt['phase']='environment-ready';persist()
+
+
+def _read_ready(path):
+    with _open_input(path) as stream:
+        value=json.load(stream)
+    if value.get('schemaVersion')!=1 or value.get('status')!='environment-ready' or value.get('phase')!='environment-ready':
+        raise ValueError('only completed environment-ready receipts are usable')
+    validate_parameters(value['generation'],value['distro'],[value['wslExecutable'],value['helpers']['root']])
+    verify_frozen(Path(value['helpers']['root']),value['helpers'])
+    if value.get('guestCodeRoot')!='/root/'+value['generation']+'-code':raise ValueError('guest code root differs')
+    if value.get('load',{}).get('completedLoads')!=['rust','tools','kotlin']:raise ValueError('incomplete load receipt')
+    if value.get('oldResources',{}).get('status')!='preserved':raise ValueError('missing resource preservation')
+    validate_smoke_result(value['smoke'])
+    return value
+
+
+def _followup(environment_receipt,output_directory,action,argv=None,timeout=30):
+    output=_safe_path(output_directory);output.mkdir()
+    receipt={'schemaVersion':1,'status':'creating','phase':'receipt-validation','resourcesPreserved':True,
+             'formalQualification':False,'finalSystemAccepted':False,'coldBuildExecuted':False,'commands':[]}
+    with (output/'environment-result.json').open('xb') as sink:
+        def persist():sink.seek(0);sink.truncate();_json(sink,receipt)
+        persist()
+        try:
+            source=_read_ready(environment_receipt)
+            for key in ('generation','distro','wslExecutable','helpers','handle','guestCodeRoot','load','smoke'):
+                receipt[key]=source[key]
+            receipt['phase']=action;persist()
+            request={'action':action,'load':source['load'],'smoke':source['smoke']}
+            if action=='exec':
+                if (not isinstance(argv,list) or not argv or any(not isinstance(v,str) or '\x00' in v for v in argv)
+                        or not argv[0].startswith('/') or '\\' in argv[0] or type(timeout) is not int or timeout<=0):
+                    raise ValueError('absolute Linux executable argv and positive timeout required')
+                request.update(argv=argv,timeout=timeout)
+            result=_invoke_guest(receipt,output,'guest-'+action,request,persist,timeout=timeout+90 if action=='exec' else 120)
+            if action=='observe':
+                from wsl_environment_guest import validate_effective,validate_handle
+                validate_handle(source['handle'],result['handle']);validate_effective(result['actualEffective'])
+            receipt['result']=result;receipt['status']='environment-ready';receipt['operationStatus']='observed' if action=='observe' else 'executed';persist();return receipt
+        except BaseException as error:
+            receipt['status']='failed';receipt['error']=repr(error);persist();raise
+
+
+def observe_environment(environment_receipt,output_directory):
+    return _followup(environment_receipt,output_directory,'observe')
+
+
+def exec_environment(environment_receipt,argv,*,output_directory,timeout):
+    return _followup(environment_receipt,output_directory,'exec',argv,timeout)
+
+
+def main(argv=None):
+    import argparse
+    from docker_transport import DockerTransport
+    parser=argparse.ArgumentParser(description=__doc__);commands=parser.add_subparsers(dest='action',required=True)
+    create=commands.add_parser('create')
+    for name in ('generation','distro','output-directory','wsl-executable','outer-docker-executable','outer-docker-endpoint',
+                 'outer-docker-config','docker-bundle','archive-root'):create.add_argument('--'+name,required=True)
+    for action in ('observe','exec'):
+        sub=commands.add_parser(action);sub.add_argument('--environment-receipt',type=Path,required=True)
+        sub.add_argument('--output-directory',type=Path,required=True)
+        if action=='exec':sub.add_argument('--timeout',type=int,required=True);sub.add_argument('argv',nargs=argparse.REMAINDER)
+    args=parser.parse_args(argv)
+    try:
+        if args.action=='create':
+            result=create_environment(generation=args.generation,distro=args.distro,output_directory=Path(args.output_directory),
+                wsl_executable=Path(args.wsl_executable),outer_docker=DockerTransport(args.outer_docker_executable,args.outer_docker_endpoint,args.outer_docker_config),
+                docker_bundle=Path(args.docker_bundle),archive_root=Path(args.archive_root))
+        elif args.action=='observe':result=observe_environment(args.environment_receipt,args.output_directory)
+        else:
+            linux=args.argv[1:] if args.argv[:1]==['--'] else args.argv
+            result=exec_environment(args.environment_receipt,linux,output_directory=args.output_directory,timeout=args.timeout)
+        print(json.dumps(result));return 0
+    except BaseException as error:
+        failed={'schemaVersion':1,'status':'failed','phase':'request','error':repr(error),'resourcesPreserved':True}
+        path=Path(args.output_directory)/'environment-result.json'
+        # A failed claim must never report an older occupant's receipt as this request.
+        if not isinstance(error,FileExistsError) and path.is_file():
+            try:failed=json.loads(path.read_bytes())
+            except (OSError,ValueError):pass
+        print(json.dumps(failed));return 1
+
+
+if __name__=='__main__':raise SystemExit(main())

@@ -77,7 +77,6 @@ class InputsTests(unittest.TestCase):
         for generation,distro in [('UPPER','MingOS-P01-test'),('ok','Ubuntu'),('../x','MingOS-P01-test')]:
             with self.assertRaises(ValueError): env.validate_parameters(generation,distro)
 
-if __name__=='__main__': unittest.main()
 
 
 class AdditionalInputsTests(unittest.TestCase):
@@ -231,3 +230,119 @@ class LifecycleSequenceTests(unittest.TestCase):
         bootstrap=argv[argv.index('-c')+1]
         self.assertIn('O_DIRECTORY',bootstrap)
         self.assertIn('dir_fd=',bootstrap)
+
+class PublicStageTests(unittest.TestCase):
+    def test_public_full_api_and_cli_exist(self):
+        for name in ('create_environment','observe_environment','exec_environment','main'):
+            self.assertTrue(callable(getattr(env,name,None)), name+' API missing')
+    def test_unknown_or_incomplete_receipt_never_executes(self):
+        self.assertTrue(callable(getattr(env,'exec_environment',None)), 'exec_environment API missing')
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);receipt=root/'receipt.json'
+            for state in ('failed','creating','mystery'):
+                receipt.write_text(json.dumps({'schemaVersion':1,'status':state}))
+                with patch.object(env.subprocess,'run') as run,self.assertRaises(ValueError):
+                    env.exec_environment(receipt,['/bin/true'],output_directory=root/state,timeout=3)
+                run.assert_not_called()
+    def test_actual_limits_rechecked_on_host(self):
+        self.assertTrue(callable(getattr(env,'validate_smoke_result',None)), 'validate_smoke_result API missing')
+        with self.assertRaises(ValueError):env.validate_smoke_result({'actualEffective':{'cpuMax':'max 100000'}})
+
+
+
+class WslEncodingTests(unittest.TestCase):
+    def test_existing_distro_name_survives_bom_and_encoding(self):
+        for encoding in ('utf-16','utf-16-le','utf-8-sig','utf-8'):
+            with self.subTest(encoding=encoding):
+                self.assertEqual(env._decode_wsl('MingOS-P01-existing\r\n'.encode(encoding)).splitlines(),['MingOS-P01-existing'])
+
+class OuterPreservationTests(unittest.TestCase):
+    def test_unknown_addition_missing_id_or_changed_old_state_blocks(self):
+        import copy
+        old={'info':{'ID':'outer'},'context':'desktop','images':[{'Id':'image','Descriptor':{'digest':'index'}}],'containers':[{'Id':'old','State':{'Running':True}}],'volumes':[{'Name':'vol','CreatedAt':'time','Driver':'local','Options':{},'Labels':{}}]}
+        after=copy.deepcopy(old);after['containers'].append({'Id':'export','State':{'Running':False},'Mounts':[],'Config':{'Labels':{'mingos.p01.generation':'p01-test'}}})
+        self.assertEqual(env.compare_outer(old,after,'export')['status'],'preserved')
+        for mutate in (lambda v:v['images'].clear(),lambda v:v['containers'][0]['State'].update(Running=False),lambda v:v['volumes'].append({'Name':'unknown'}),lambda v:v['info'].update(ID='different')):
+            changed=copy.deepcopy(after);mutate(changed)
+            with self.assertRaises(ValueError):env.compare_outer(old,changed,'export')
+
+class FollowupClaimTests(unittest.TestCase):
+    def test_existing_output_claim_precedes_receipt_or_process(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(env.subprocess,'run') as run:
+            with self.assertRaises(FileExistsError):env.observe_environment(Path(tmp)/'missing.json',Path(tmp))
+            run.assert_not_called()
+    def test_cli_failure_is_json_and_does_not_read_old_occupant(self):
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'environment-result.json').write_text('{"status":"environment-ready","generation":"old"}')
+            stdout=io.StringIO()
+            with redirect_stdout(stdout):code=env.main(['observe','--environment-receipt',str(root/'missing'),'--output-directory',str(root)])
+            value=json.loads(stdout.getvalue());self.assertEqual(code,1);self.assertEqual(value['status'],'failed');self.assertNotIn('generation',value)
+
+class FullCreationFlowTests(unittest.TestCase):
+    def exercise(self,fail_load=False):
+        import development_image_migration as migration
+        from test_wsl_environment_guest import SmokeBoundaryTests
+        fixture=LifecycleSequenceTests('test_sequence_stopped_inspected_id_only_and_no_destructive_calls');fixture.setUp();self.addCleanup(fixture.doCleanups)
+        smoke_case=SmokeBoundaryTests();smoke_case.setUp()
+        smoke={'id':smoke_case.cid,'inspectBefore':smoke_case.inspection,'inspectAfter':smoke_case.inspection,
+               'actualEffective':smoke_case.actual,'script':{'bytes':len(__import__('wsl_environment_guest').SMOKE_SCRIPT),'sha256':hashlib.sha256(__import__('wsl_environment_guest').SMOKE_SCRIPT).hexdigest()}}
+        fixed={k:{**v,'bytes':3,'sha256':hashlib.sha256(b'abc').hexdigest()} for k,v in migration.FIXED.items()}
+        for entry in fixed.values():(fixture.root/entry['file']).write_bytes(b'abc')
+        load={'status':'development-toolchain-load-inspect-verified','completedLoads':['rust','tools','kotlin'],'verifiedInspections':['rust','tools','kotlin'],'images':[]}
+        self.receipt_inode=None
+        def capture(directory,key,argv,**kwargs):
+            if key.startswith('after-outer-'):
+                if key=='after-outer-info':data=b'{"ID":"outer"}'
+                elif key=='after-outer-context':data=b'desktop-linux\n'
+                elif key=='after-outer-containers-ids':data=fixture.cid.encode()
+                elif key=='after-outer-containers-0':data=json.dumps([{'Id':fixture.cid,'State':{'Running':False},'Mounts':[],'Config':{'Labels':{'mingos.p01.generation':'p01-test'}}}]).encode()
+                else:data=b''
+            elif key in ('guest-load','guest-smoke','guest-observe'):
+                fixture.calls.append((key,argv,kwargs));self.receipt_inode=(directory/'environment-result.json').stat().st_ino
+                if key=='guest-load' and fail_load:
+                    data=json.dumps({'status':'failed','result':{'error':'partial'},'evidence':{'load-result.json':json.dumps({**load,'status':'failed','completedLoads':['rust']})}}).encode()
+                    (directory/(key+'.stdout.log')).write_bytes(data);return subprocess.CompletedProcess(argv,1)
+                if key=='guest-load':result=load
+                elif key=='guest-smoke':result=smoke
+                else:result={'handle':{'generation':'p01-test','pid':42},'actualEffective':smoke_case.actual,'firstEmpty':{'proof':True},'privateEvidence':{}}
+                data=json.dumps({'status':'ok','result':result,'evidence':{}}).encode()
+            else:return fixture.capture(directory,key,argv,**kwargs)
+            (directory/(key+'.stdout.log')).write_bytes(data);return subprocess.CompletedProcess(argv,0)
+        def prepare(a,b,c):c.write_bytes(b'rootfs');return {'rootfs':{'sha256':'fake'}}
+        with patch.object(env,'BUNDLE_BYTES',6),patch.object(env,'BUNDLE_SHA256',hashlib.sha256(b'bundle').hexdigest()),patch.object(env,'capture',side_effect=capture),patch.object(env,'prepare_rootfs',side_effect=prepare),patch.object(migration,'verify_all',return_value={'images':[fixture.tools]}),patch.object(migration,'verify_one',return_value=fixture.tools),patch.object(migration,'FIXED',fixed),patch('wsl_environment_guest.validate_handle'):
+            try:
+                value=env.create_environment(generation='p01-test',distro='MingOS-P01-test',output_directory=fixture.root/'output',wsl_executable=Path(sys.executable).resolve(),outer_docker=fixture.transport,docker_bundle=fixture.bundle,archive_root=fixture.root)
+            except ValueError:
+                if not fail_load:raise
+                value=json.loads((fixture.root/'output/environment-result.json').read_bytes())
+        self.assertEqual((fixture.root/'output/environment-result.json').stat().st_ino,self.receipt_inode)
+        return value,[k for k,_,_ in fixture.calls]
+    def test_partial_load_stops_same_held_receipt_before_smoke(self):
+        value,commands=self.exercise(True)
+        self.assertEqual(value['status'],'failed');self.assertEqual(value['phase'],'load');self.assertEqual(value['load']['completedLoads'],['rust']);self.assertNotIn('guest-smoke',commands)
+    def test_complete_create_preserves_same_receipt_and_final_phase(self):
+        value,commands=self.exercise()
+        self.assertEqual(value['status'],'environment-ready');self.assertEqual(value['phase'],'environment-ready')
+        self.assertEqual(value['load']['completedLoads'],['rust','tools','kotlin'])
+        self.assertEqual(value['oldResources']['status'],'preserved')
+        self.assertLess(commands.index('guest-load'),commands.index('guest-smoke'))
+
+class GuestRequestTransferTests(unittest.TestCase):
+    def test_large_observation_request_uses_binary_stdin_not_windows_argv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);source=root/'module.py';source.write_bytes(b'x')
+            manifest=env.freeze_inputs([source],root/'frozen')
+            receipt={'helpers':manifest,'generation':'p01-test','distro':'MingOS-P01-test','wslExecutable':str(Path(sys.executable).resolve()),'handle':{},'guestCodeRoot':'/root/p01-test-code','commands':[]}
+            big='e'*100000
+            def captured(directory,key,argv,**kwargs):
+                self.assertLess(sum(map(len,argv)),10000)
+                self.assertIsNotNone(kwargs.get('stdin'))
+                stream=kwargs['stdin'];self.assertGreaterEqual(stream.fileno(),0)
+                self.assertEqual(json.loads(stream.read())['largeEvidence'],big)
+                (directory/(key+'.stdout.log')).write_bytes(b'{"status":"ok","result":{},"evidence":{}}')
+                return subprocess.CompletedProcess(argv,0)
+            with patch.object(env,'HELPER_NAMES',('module.py',)),patch.object(env,'capture',side_effect=captured):
+                env._invoke_guest(receipt,root,'guest-observe',{'action':'observe','largeEvidence':big},lambda:None)
+
+if __name__ == '__main__': unittest.main()

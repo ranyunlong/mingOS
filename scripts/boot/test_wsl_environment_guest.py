@@ -77,7 +77,6 @@ class ReceiverTests(unittest.TestCase):
             self.receive()
         self.assertEqual((self.root/'target').read_bytes(),b'abc')
 
-if __name__ == '__main__': unittest.main()
 
 class AdmissionTests(unittest.TestCase):
     def setUp(self):
@@ -159,3 +158,175 @@ class GuestCommandEvidenceTests(unittest.TestCase):
             self.assertEqual(next(root.glob('*.stderr.log')).read_bytes(),b'partial stderr')
             result=json.loads(next(root.glob('*.result.json')).read_text())
             self.assertTrue(result['processMayRemain']);self.assertIsNone(result['exitCode'])
+
+class FullStageTests(unittest.TestCase):
+    def test_unverified_archives_never_load(self):
+        self.assertTrue(callable(getattr(guest,'load_archives',None)), 'load_archives API missing')
+        import development_image_migration as migration
+        with tempfile.TemporaryDirectory() as tmp, patch.object(migration,'_prepare_all',side_effect=ValueError('third archive invalid')), patch.object(guest.subprocess,'run') as run:
+            with self.assertRaises(Exception): guest.load_archives('p01-test',tmp,Path(tmp)/'load.json')
+            run.assert_not_called()
+            self.assertEqual(__import__('json').loads((Path(tmp)/'load.json').read_text())['completedLoads'],[])
+    def test_partial_load_receipt_retained_without_smoke(self):
+        self.assertTrue(callable(getattr(guest,'load_archives',None)), 'load_archives API missing')
+        import development_image_migration as migration
+        import json, subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); (root/'a').write_bytes(b'archive')
+            image={'role':'rust','imageId':'sha256:r','diffIds':[],'configObject':{'config':{}}}
+            loaded={'Id':'sha256:r','Descriptor':{'digest':'sha256:r','mediaType':migration.INDEX},'Architecture':'amd64','Os':'linux','RootFS':{'Type':'layers','Layers':[]},'Config':{}}
+            with (root/'a').open('rb') as source, patch.object(migration,'_prepare_all',return_value=[(source,image),(source,{**image,'role':'tools'})]),patch.object(migration,'_check_sealed_source'),patch.object(guest.subprocess,'run',side_effect=[subprocess.CompletedProcess([],0,b'',b''),subprocess.CompletedProcess([],0,json.dumps([loaded]).encode(),b''),subprocess.CompletedProcess([],1,b'',b'failed')]):
+                with self.assertRaises(Exception):guest.load_archives('p01-test',root,root/'load.json')
+            report=json.loads((root/'load.json').read_text());self.assertEqual(report['completedLoads'],['rust']);self.assertEqual(report['status'],'failed')
+            commands=[v['command'] for v in report['operations']]
+            self.assertTrue(all(c[1:3]==['--host','unix:///run/p01-test/docker.sock'] for c in commands))
+    def test_actual_effective_limits_are_independently_rejected(self):
+        self.assertTrue(callable(getattr(guest,'validate_effective',None)), 'validate_effective API missing')
+        good={'uid':[65534]*4,'gid':[65534]*4,'capabilities':{'CapInh':'0000000000000000','CapPrm':'0000000000000000','CapEff':'0000000000000000','CapBnd':'0000000000000000','CapAmb':'0000000000000000'},'noNewPrivs':1,'rootReadOnly':True,'cpuMax':'200000 100000','memoryMax':'4294967296','pidsMax':'256','interfaces':['lo'],'routes':[],'desktopPathsVisible':False}
+        guest.validate_effective(good)
+        for key,value in [('cpuMax','max 100000'),('memoryMax','max'),('pidsMax','max'),('uid',[0]*4),('rootReadOnly',False),('interfaces',['lo','eth0']),('routes',['default']),('desktopPathsVisible',True)]:
+            with self.subTest(key=key),self.assertRaises(ValueError):guest.validate_effective({**good,key:value})
+    def test_start_exit_zero_does_not_override_oom_or_container_exit(self):
+        self.assertTrue(callable(getattr(guest,'validate_smoke_state',None)), 'validate_smoke_state API missing')
+        good={'Running':False,'ExitCode':0,'OOMKilled':False,'Status':'exited'}
+        guest.validate_smoke_state(good)
+        for changed in ({**good,'ExitCode':42},{**good,'OOMKilled':True},{**good,'Running':True}):
+            with self.assertRaises(ValueError): guest.validate_smoke_state(changed)
+
+
+
+class SmokeBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        import json,development_image_migration as migration
+        self.cid='a'*64;self.image=migration.FIXED['tools']['imageId'];self.calls=[]
+        self.actual={'uid':[65534]*4,'gid':[65534]*4,'capabilities':{k:'0000000000000000' for k in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')},'noNewPrivs':1,'rootReadOnly':True,'cpuMax':'200000 100000','memoryMax':'4294967296','pidsMax':'256','interfaces':['lo'],'routes':[],'desktopPathsVisible':False}
+        self.inspection={'Id':self.cid,'Image':self.image,'Mounts':[],
+            'Config':{'Image':self.image,'User':'65534:65534','OpenStdin':True,'Entrypoint':['/usr/bin/python3'],'Cmd':['-']},
+            'HostConfig':{'NetworkMode':'none','ReadonlyRootfs':True,'Init':True,'NanoCpus':2000000000,'Memory':4294967296,'MemorySwap':8589934592,'PidsLimit':256,'CapDrop':['ALL'],'AutoRemove':False,'RestartPolicy':{'Name':'no','MaximumRetryCount':0},'CgroupnsMode':'private','Privileged':False,'SecurityOpt':['no-new-privileges']},
+            'State':{'Running':False,'ExitCode':0,'OOMKilled':False,'Status':'exited'}}
+        self.stdin=None;self.state=None
+    def boundary(self,handle,argv,**kwargs):
+        import json,subprocess,copy
+        self.calls.append(argv)
+        self.assertGreater(kwargs['timeout'],0);self.assertLessEqual(kwargs['timeout'],60)
+        self.assertEqual(argv[:5],['/usr/local/bin/docker','--host','unix:///run/p01-test/docker.sock','--config',self.client])
+        if 'create' in argv:
+            self.assertNotIn('-c',argv);self.assertNotIn('--volume',argv);self.assertNotIn('--mount',argv)
+            return subprocess.CompletedProcess(argv,0,self.cid.encode(),b'')
+        if 'start' in argv:
+            stream=kwargs['stdin'];self.assertGreaterEqual(stream.fileno(),0);self.stdin=stream.read()
+            self.assertEqual(stream.mode,'rb')
+            return subprocess.CompletedProcess(argv,0,json.dumps(self.actual).encode(),b'')
+        value=copy.deepcopy(self.inspection)
+        if len(self.calls)>3 and self.state is not None:value['State']=self.state
+        return subprocess.CompletedProcess(argv,0,json.dumps([value]).encode(),b'')
+    def run_smoke(self,root):
+        self.client=str(root)+'/client'
+        with patch.object(guest,'paths',return_value={'base':str(root),'run':'/run/p01-test'}),patch.object(guest,'admit_environment',side_effect=self.boundary):
+            return guest.run_smoke({'generation':'p01-test'})
+    def test_smoke_fd_and_mismatched_actual_limits(self):
+        for key,value in [('cpuMax','max 100000'),('memoryMax','max'),('pidsMax','max')]:
+            with tempfile.TemporaryDirectory() as tmp:
+                self.calls=[];old=self.actual[key];self.actual[key]=value
+                with self.assertRaises(ValueError):self.run_smoke(Path(tmp))
+                self.assertEqual(self.stdin,guest.SMOKE_SCRIPT)
+                self.assertTrue((Path(tmp)/'smoke-inspect-after.json').is_file())
+                self.assertTrue((Path(tmp)/'smoke-actual-effective.json').is_file())
+                self.actual[key]=old
+    def test_attach_zero_still_rejects_exit_and_oom(self):
+        for state in ({'Running':False,'ExitCode':17,'OOMKilled':False,'Status':'exited'},{'Running':False,'ExitCode':0,'OOMKilled':True,'Status':'exited'}):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.calls=[];self.state=state
+                with self.assertRaises(ValueError):self.run_smoke(Path(tmp))
+                self.assertTrue((Path(tmp)/'smoke-inspect-after.json').is_file())
+    def test_success_records_fd_script_pin_and_both_inspections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result=self.run_smoke(Path(tmp))
+            self.assertEqual(result['script'],{'sha256':hashlib.sha256(self.stdin).hexdigest(),'bytes':len(self.stdin)})
+            self.assertEqual(result['actualEffective'],self.actual)
+    def test_every_mount_or_privilege_override_rejected(self):
+        import copy
+        guest.validate_smoke_inspect(self.inspection,self.cid)
+        for key,value in [('Privileged',True),('Binds',['/host:/guest']),('Memory',1),('NanoCpus',1),('PidsLimit',1),('SecurityOpt',[])]:
+            changed=copy.deepcopy(self.inspection);changed['HostConfig'][key]=value
+            with self.subTest(key=key),self.assertRaises(ValueError):guest.validate_smoke_inspect(changed,self.cid)
+    def test_start_nonzero_retains_result_and_attempts_final_inspect_once(self):
+        import json,subprocess
+        original=self.boundary
+        for inspect_failure in (False,True):
+            with self.subTest(inspect_failure=inspect_failure),tempfile.TemporaryDirectory() as tmp:
+                self.calls=[]
+                def boundary(handle,argv,**kwargs):
+                    result=original(handle,argv,**kwargs)
+                    if 'start' in argv:return subprocess.CompletedProcess(argv,17,b'partial stdout',b'container failed')
+                    if len(self.calls)==4 and inspect_failure:raise OSError('final inspection unavailable')
+                    return result
+                with patch.object(self,'boundary',side_effect=boundary),self.assertRaises(ValueError) as caught:
+                    self.run_smoke(Path(tmp))
+                self.assertEqual([argv[5] for argv in self.calls],['create','container','start','container'])
+                self.assertRegex(str(caught.exception),'attach.*17')
+                result=json.loads((Path(tmp)/'smoke-start-result.json').read_text())
+                self.assertEqual(result['exitCode'],17);self.assertEqual(result['stdout'],'partial stdout');self.assertEqual(result['stderr'],'container failed')
+                if inspect_failure:
+                    error=json.loads((Path(tmp)/'smoke-inspect-after-error.json').read_text())
+                    self.assertIn('final inspection unavailable',error['error'])
+                else:self.assertTrue((Path(tmp)/'smoke-inspect-after.json').is_file())
+    def test_start_timeout_preserves_original_exception_and_attempts_final_inspect_once(self):
+        import json,subprocess
+        original=self.boundary
+        for inspect_failure in (False,True):
+            with self.subTest(inspect_failure=inspect_failure),tempfile.TemporaryDirectory() as tmp:
+                self.calls=[];attach_error=subprocess.TimeoutExpired(['start'],60,output=b'partial stdout',stderr=b'partial stderr')
+                def boundary(handle,argv,**kwargs):
+                    result=original(handle,argv,**kwargs)
+                    if 'start' in argv:raise attach_error
+                    if len(self.calls)==4 and inspect_failure:raise OSError('final inspection unavailable')
+                    return result
+                with patch.object(self,'boundary',side_effect=boundary),self.assertRaises(subprocess.TimeoutExpired) as caught:
+                    self.run_smoke(Path(tmp))
+                self.assertIs(caught.exception,attach_error)
+                self.assertEqual([argv[5] for argv in self.calls],['create','container','start','container'])
+                result=json.loads((Path(tmp)/'smoke-start-result.json').read_text())
+                self.assertIsNone(result['exitCode']);self.assertTrue(result['processMayRemain']);self.assertIn('TimeoutExpired',result['error'])
+                self.assertEqual(result['stdout'],'partial stdout');self.assertEqual(result['stderr'],'partial stderr')
+                if inspect_failure:
+                    error=json.loads((Path(tmp)/'smoke-inspect-after-error.json').read_text())
+                    self.assertIn('final inspection unavailable',error['error'])
+                else:self.assertTrue((Path(tmp)/'smoke-inspect-after.json').is_file())
+
+class TrustedDispatchTests(unittest.TestCase):
+    @unittest.skipUnless(os.name=='posix','Linux openat closure verification')
+    def test_tampered_helper_never_imported_and_success_does_not_write_pycache(self):
+        import subprocess,json,sys
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);file=root/'wsl_environment_guest.py'
+            data=b'def dispatch(request):\n print("executed")\n';file.write_bytes(data)
+            pins={'wsl_environment_guest.py':{'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)}}
+            argv=[sys.executable,'-I','-c',guest.TRUSTED_DISPATCH,str(root),json.dumps(pins),'{}']
+            result=subprocess.run(argv,capture_output=True);self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,b'executed\n')
+            self.assertEqual({p.name for p in root.iterdir()},{'wsl_environment_guest.py'})
+            file.write_bytes(data.replace(b'executed',b'tampered'))
+            result=subprocess.run(argv,capture_output=True);self.assertNotEqual(result.returncode,0);self.assertEqual(result.stdout,b'')
+
+
+class LoadEvidenceTests(unittest.TestCase):
+    def test_partial_load_operations_include_timeout_and_fd_pin(self):
+        import development_image_migration as migration,json,subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);file=root/'archive';file.write_bytes(b'archive')
+            image={'role':'rust','imageId':'sha256:r','diffIds':[],'configObject':{'config':{}}}
+            with file.open('rb') as source,patch.object(migration,'_prepare_all',return_value=[(source,image)]),patch.object(migration,'_check_sealed_source'),patch.object(guest.subprocess,'run',return_value=subprocess.CompletedProcess([],1,b'partial',b'failed')):
+                with self.assertRaises(Exception):guest.load_archives('p01-test',root,root/'load.json')
+            operation=json.loads((root/'load.json').read_text())['operations'][0]
+            self.assertEqual(operation.get('timeout'),1800)
+            self.assertEqual(operation.get('stdin'),{'bytes':7,'sha256':hashlib.sha256(b'archive').hexdigest()})
+
+class LiveObservationTests(unittest.TestCase):
+    def test_live_store_and_daemon_configuration_changes_rejected(self):
+        self.assertTrue(callable(getattr(guest,'validate_live_info',None)),'validate_live_info API missing')
+        good={'ID':'inner','ServerVersion':'29.8.1','OSType':'linux','Architecture':'x86_64','CgroupVersion':'2','CgroupDriver':'cgroupfs','Driver':'overlayfs','DriverStatus':[['driver-type','io.containerd.snapshotter.v1']],'DockerRootDir':'/var/lib/p01-test/docker','Images':3,'Containers':1}
+        guest.validate_live_info(good,'p01-test')
+        for key,value in [('DockerRootDir','/var/lib/docker'),('Images',0),('Containers',0),('ServerVersion','wrong'),('CgroupDriver','systemd')]:
+            with self.subTest(key=key),self.assertRaises(ValueError):guest.validate_live_info({**good,key:value},'p01-test')
+
+if __name__ == '__main__': unittest.main()

@@ -45,14 +45,16 @@ exec_environment(environment_receipt: Path, argv: list[str], *,
                  output_directory: Path, timeout: int) -> dict
 receive_file(path: str, sha256: str, size: int, mode: int, stream) -> dict
 launch_environment(generation: str, *, ready_timeout: int = 30) -> dict
-admit_environment(handle: dict, argv: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess
-run_smoke(handle: dict, name: str) -> dict
-observe_guest(handle: dict) -> dict
+admit_environment(handle: dict, argv: list[str], *, timeout: int = 30, stdin=None) -> subprocess.CompletedProcess
+run_smoke(handle: dict) -> dict
+observe_guest(handle: dict, load: dict, smoke: dict) -> dict
 ```
 
 `freeze_inputs` 返回 `{files: {basename: {sha256, bytes, mode}}, root: str}`；`prepare_rootfs` 返回来源hash及 binary pins；`launch_environment` 返回 PID/starttime/ns/socket/daemon identities，传给 admit/smoke/observe。所有函数错误抛 ValueError/OSError，controller 最外层保存 phase/exception 后非零退出；不得吞异常返回成功。
 
 Task3接口裁定：`launch_environment`只接受generation，由它派生全部私有路径；不接受可指向旧data-root的任意config。`admit_environment`在验证身份、进入management及再次验证后，显式执行Linux argv并返回真实进程结果。内部`create_empty_environment`使用完整create同组关键字参数，返回`status=creating, phase=empty-daemon-observed`；Task4须在完整load/smoke/保全验证后才生成最终ready状态。这些接口只替换原计划的推测性内部签名，不改变环境验收条件。
+
+Task4接口对齐：`run_smoke`不接收调用者name；新generation和固定generation label关联本代新容器。`observe_guest`显式接收既有load/smoke证明供只读核对。`admit_environment`的可选`stdin`仅转发同一binary文件FD供既有smoke使用，不映射Windows路径、不放宽Linux argv或Docker transport连接策略。
 
 ### Task 1: 显式 Docker transport
 

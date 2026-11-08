@@ -41,7 +41,7 @@ CLI `create` 显式接受 `--generation --distro --output-directory --wsl-execut
 
 `exec` 是后续 S3–S6 的 Linux argv transport，不把 `C:\...` 转为 `/mnt/c/...`。Windows source/handoff 使用二进制 stdin transfer；guest 源码实际路径由后续 S1 消费/恢复决定并显式传入冷构建，S2 不调用当前依赖 Windows 路径的 `cold-boot.py`，不预先替它宣称 Linux 支持。
 
-guest内部生命周期接口为`launch_environment(generation: str, *, ready_timeout=30) -> dict`，只从generation派生本代路径；`admit_environment(handle: dict, argv: list[str], *, timeout=30)`验证身份、让helper进入management后再次验证，再执行显式Linux argv并返回`subprocess.CompletedProcess`。controller内部`create_empty_environment`接收与完整create相同的关键字参数，初始阶段成功仍只返回`creating/empty-daemon-observed`；它不是最终ready入口。
+guest内部生命周期接口为`launch_environment(generation: str, *, ready_timeout=30) -> dict`，只从generation派生本代路径；`admit_environment(handle: dict, argv: list[str], *, timeout=30, stdin=None)`验证身份、让helper进入management后再次验证，再执行显式Linux argv并返回`subprocess.CompletedProcess`。可选stdin仅转发同一binary文件FD供smoke使用，不放宽argv或transport连接策略。`run_smoke(handle: dict) -> dict`不接收调用者name，由新generation和固定generation label关联本代新容器；`observe_guest(handle: dict, load: dict, smoke: dict) -> dict`显式接收既有load/smoke证明作只读核对。controller内部`create_empty_environment`接收与完整create相同的关键字参数，初始阶段成功仍只返回`creating/empty-daemon-observed`；它不是最终ready入口。
 
 ## 创建过程与隔离
 
