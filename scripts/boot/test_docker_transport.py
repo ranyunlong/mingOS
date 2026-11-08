@@ -42,6 +42,28 @@ class DockerTransportTests(unittest.TestCase):
                     self.client.run(args, timeout=1)
             run.assert_not_called()
 
+    def test_combined_short_connection_overrides_never_execute(self):
+        cases = [['-DHunix:///bad', 'info'], ['-Dcother', 'info'],
+                 ['-DDcother', 'info'], ['-DH', 'unix:///bad', 'info'],
+                 ['-Dc', 'other', 'info'], ['-DDc', 'other', 'info'],
+                 ['-vHunix:///bad', 'info'], ['-itH', 'unix:///bad', 'info']]
+        for args in cases:
+            for entry in ['run', 'migration_runner']:
+                with self.subTest(args=args, entry=entry), patch('subprocess.run') as run:
+                    run.return_value = subprocess.CompletedProcess([], 0, b'', b'')
+                    receipt = {'operations': []}
+                    with self.assertRaises(ValueError):
+                        if entry == 'run':
+                            self.client.run(args, timeout=1)
+                        else:
+                            self.client.migration_runner(receipt, 'info', [self.client.executable, *args], 1)
+                    run.assert_not_called()
+                    self.assertEqual(receipt['operations'], [])
+
+    def test_normal_values_and_separate_short_options_are_preserved(self):
+        args = ['-D', 'image', 'inspect', '-f', '{{.Config.Hostname}}', 'cache:check']
+        self.assertEqual(self.client.argv(args)[5:], args)
+        self.assertEqual(self.client.argv(['-l=trace', 'info'])[5:], ['-l=trace', 'info'])
     def test_run_cleans_environment_and_keeps_binary_stdin(self):
         bad = {'DOCKER_HOST': 'bad', 'DOCKER_CONTEXT': 'bad', 'DOCKER_TLS_VERIFY': '1', 'DOCKER_CERT_PATH': 'bad', 'HTTP_PROXY': 'bad', 'https_proxy': 'bad', 'ALL_PROXY': 'bad', 'NO_PROXY': 'bad', 'KEEP': 'yes'}
         with tempfile.TemporaryFile('w+b') as source, patch.dict(os.environ, bad), patch('subprocess.run') as run:

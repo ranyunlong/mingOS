@@ -70,6 +70,11 @@ class DockerTransport:
         for arg in args:
             _text(arg)
             option = arg.split('=', 1)[0]
+            # No combined or attached short flags: a boolean prefix can hide
+            # connection shorthands (e.g. -DH/socket). Callers can separate
+            # ordinary short flags and their values, or use long options.
+            if option.startswith('-') and not option.startswith('--') and len(option) > 2:
+                raise ValueError('combined or attached short options are forbidden')
             if (option in {'--host', '--context', '--config', '--tls', '--tlsverify',
                            '--tlscacert', '--tlscert', '--tlskey'}
                     or arg.startswith(('-H', '-c'))):
@@ -92,4 +97,3 @@ class DockerTransport:
         _stdin(source)
         return _docker_run(receipt, key, explicit_command, timeout, stdin=source,
                            env=_environment(), shell=False)
-
