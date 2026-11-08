@@ -51,6 +51,8 @@ S2独立环境已有QEMU和WSL实验：新WSL VHD/daemon初始store为空，三�
 
 最新S2：提交`5ac0edd`全新f4244bac正式create、独立witness及公共observe/exec通过，独立实际21门接受。全部旧资源完整对象严格一致，DNS例外未应用；365文件/8目录证据封存，live VHD明确不声称字节不变。S1/S2的阶段完成不关闭P01；S3独立验收格式衔接和实施继续。详见[环境记录](p01-environment-audit.md)。
 
+发布检查点：S2实现/验收已推送并精确核对远程`95970c008ee3bc68538211c4dbcf4e0af8ed2b5b`。S3[正式设计](superpowers/specs/2026-11-08-p01-source-build-design.md)及[七任务计划](superpowers/plans/2026-11-08-p01-source-build.md)已保存，独立验收格式复核通过；Task1开始本地严格证明链校验与执行器冻结。实际S3恢复/编译/导出仍未完成，所有11项目状态保持原范围。
+
 S2公共化补充：显式Docker transport完成实现和独立复核；公共输入冻结、rootfs构造与Linux二进制接收模块完成Windows14项控制、Linux17通过/1项Windows专属跳过及独立复核。实际rootfs重写后全部17,278个原成员逐项一致，仅新增8个固定引擎二进制与`wsl.conf`。新distro/私有daemon生命周期、完整CLI及正式新代集成继续，不将这两个子任务计作S2或P01完成。
 
 生命周期初始实现`9f4d0f3`已通过独立复核和完整冻结Linux控制49通过/1项Windows专属跳过（50项含9项transport控制）；初始状态仍为creating，完整load/smoke/observe/exec继续。S1只读恢复卷中的三镜像已复制到独立新目录并严格核验，供正式另一新代验收。全部项目仍0/11完成。

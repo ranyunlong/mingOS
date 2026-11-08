@@ -5,6 +5,7 @@
 更新：2026-11-08。Kotlin/Wasm 应用平台、图形/动画、Ming 多窗口桌面和 SDK6 输入/数据已接通。可复建 x86_64 开发 VM、Notes/Motion、正常数据持久化、同 daemon 新卷恢复及独立更新/卸载资格已交付，源码和记录已发布到远程开发分支。全新环境一键部署等11项继续推进，完整系统尚未验收。
 
 - [当前系统验收状态](current-system-status.md)：当前构建、历史冻结、真实 VM 结果与剩余门槛。
+- [P01 S3源码/缓存/应用构建设计](superpowers/specs/2026-11-08-p01-source-build-design.md)与[七任务实施计划](superpowers/plans/2026-11-08-p01-source-build.md)：S1/S2已验收，S3从本地严格证明链校验开始，实际编译与端到端验收仍待完成。
 
 - [需求与决策记录](requirements.md)：区分用户确认、架构建议和待验证事项。
 - [总体架构设计](superpowers/specs/2026-10-23-mingos-architecture-design.md)：系统分层、信任边界和路线图。

@@ -1,0 +1,157 @@
+# P01 S3 source/cache/Kotlin Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax. Task 1 is local strict spec/gate and harness freeze only, with no WSL allocation or execution. This publication does not execute the plan.
+
+**Goal:** Restore descriptor-identical original source and cache in accepted S2, genuinely compile both Kotlin profiles, and independently verify sealed host export.
+
+**Architecture:** Windows coordinator owns admission, immutable input pins and binary transfers. A separately frozen guest harness reuses existing restricted cache/Kotlin workers through an explicit endpoint executable wrapper. Independent RO replay binds compiler evidence, actual executable bytes and complete exported guest copy; sealed host export is mandatory and its return to Linux is optional extra handoff assurance.
+
+**Tech Stack:** Python standard library, PowerShell host observations, WSL binary subprocess transport, DockerTransport, fixed Tools/Kotlin/Rust images, existing Node Kotlin runner/replay.
+
+**Spec:** [P01 S3 source build design](../specs/2026-11-08-p01-source-build-design.md). Its fixed packet table, complete typed qualification contract and 21 literal gate names are normative implementation requirements, not a runtime candidate-derived policy.
+
+## Global constraints
+
+- S2 f4244bac is independently accepted only at recorded witness intervals, with reviewed provenance `5ac0edd5feb525951e44faffbc935e4b4eee586f` and externally pinned packet-v2. Task 1 validates its strict local proof/spec graph and freezes harness only; no WSL/Docker subprocess, allocation, transfer or build. Later runtime needs _read_ready and fresh admission. Historical 554bde65/8039baf3/dbdcae92 remain unaccepted and retained. S3–S6/P01 remain open.
+- Preserve all original/historical/failed archives, disks, logs, images, containers, volumes and distributions; never clean or retry an existing generation.
+- Original source descriptor remains `26b90b37e3abaad293d0fafd3aae626909ed549607e42aee19557077f53e3ef0`; orchestration code is frozen separately.
+- `formalQualification=false`, `finalSystemAccepted=false`, `coldBuildExecuted=false`, `guestStarted=false`.
+- Actual Kotlin profiles are developer-workflow and uninstall; six actual compiles; no synthetic-control evidence accepted.
+- Keep existing cache 128pids and Kotlin 256pids; worker root/input RO, no network, UID/GID65534, no capabilities, NNP/seccomp, 2CPU/4GiB.
+- No S4 Rust/probe compilation, S5 bundle/pack assembly or S6 runtime work.
+- Preserve accepted S2 helper bytes and unrelated controller work. Adopt the independently PASS-reviewed controller reconciliation; earlier acceptance-reconciliation proposal remains unadopted. No new approval envelope, thirteen observed schemas or duplicate full semantic reevaluator is required. Future S6 still needs its independently frozen per-install automatic semantic qualifier.
+
+## File map and execution order
+
+Create `scripts/boot/{source_build.py,source_build_guest.py,wsl_environment_transfer.py,source_build_seal.py,source_build_toolchain.py}` and corresponding `test_*.py`; create `scripts/boot/source_build_replay.mjs` for exported-copy replay glue. Generated endpoint wrapper lives only in each frozen harness. Reuse current `import_handoff`, `developer_cache`, `kotlin_delivery`, `docker_transport`, `kotlin_delivery_replay.mjs`, `build-linux-host-kotlin.mjs` without modifying original imported source. The design/plan are published now as requirements; update actual S3 acceptance documentation only after observed completion. Any change to stable consumers requires explicit justification and rerunning their relevant tests.
+
+| Task | Requires completed interfaces | Creates or extends shared files | Independently testable deliverable |
+| --- | --- | --- | --- |
+| 1 | Adopted packet-v2 typed graph, external trusted acceptance pin, accepted helper bytes | Create source_build.py and test_source_build.py | Local strict spec/qualification reads and exclusive local harness freeze only; no WSL/Docker execution/allocation; run/reopen arrives in Task 6 |
+| 2 | Task 1 gate, accepted validation/receive_file semantics and independently reviewed new bulk adapter contract | Create wsl_environment_transfer.py and tests | Admitted binary INPUT transfer only; export API remains a documented proposal, with no implementation/import until Task 6 |
+| 3 | Task 1 harness and Task 2 input transfer | Create source_build_seal.py, source_build_guest.py and their tests | Seal/RO verifier and explicit endpoint wrapper, with no compilation yet |
+| 4 | Tasks 1–3 gate/transfer/wrapper/seal | Extend source_build_guest.py and its tests | Source/cache phase with control tests and effective worker evidence |
+| 5 | Task 4 restored source/cache, Task 3 seal | Extend source_build_guest.py; create source_build_toolchain.py/source_build_replay.mjs and tests | Two-profile genuine runner integration, actual byte checks and independent copied-output replay |
+| 6 | Task 3 complete seal oracle and Task 5 copied-output closure | Extend wsl_environment_transfer.py/source_build.py/source_build_guest.py/source_build_seal.py and tests | Implement export sender, bounded host capture, strict extractor and complete host export proof; optional return separately |
+| 7 | Tasks 1–6, exact accepted packet-v2 and fresh live admission | New actual artifacts; final documentation | Actual S3 evidence review and stage status |
+
+Shared files are edited sequentially in this order. No task imports an interface whose implementation occurs later. Early control tests use explicit fixtures for already-defined contracts and label controls; they do not claim the later actual pipeline is complete.
+
+### Task 1: Strict local spec/qualification gate and harness freeze
+
+**Files:** Create `scripts/boot/source_build.py`, `scripts/boot/test_source_build.py`. This task creates no other production/test modules and performs no WSL/Docker runtime allocation or transfer. Local test fixtures, local exclusive failure output and local harness snapshots are its only writes during implementation.
+
+**Consumes:** Exact design spec schema, independently supplied acceptance SHA, accepted packet-v2 and its raw referenced evidence. **Produces:** `qualify_source_build(spec: Path, spec_sha256: str) -> dict` (read-only local gate); `freeze_harness(spec: dict, qualification: dict, *, output_directory: Path) -> dict` (exclusive local freeze, revalidating its spec/qualification pins). `run_source_build(...)` and `reopen_source_build(...)` remain future Task 6 orchestration contracts; no placeholder functions/imports or early run CLI may invoke future modules. Existing `_read_ready` remains a later pre-runtime gate; Task 1 must not trigger live admission.
+
+**Trusted staged inputs:**
+
+- Acceptance `artifacts/p01-s2-formal-20261108-f4244bac/qualification-evidence/packet-v2/s2-acceptance.json`,699bytes/SHA256 `44a5c2a4056288c75400aae012b2970c9994f144cdab8bf6e2e210c7d1e75fda` supplied externally in the trusted spec/harness.
+- Source closure sibling `source-closure.json`,5813bytes/SHA256 `6912751518fa06e67f1779063028878a691236389bd4f02063aae67d3c55b241`.
+- Independent verdict `.superpowers/sdd/2026-11-08-p01-wsl-environment/task-5-f4244bac-independent-actual-review-v2.json`,7062bytes/SHA256 `3af53d027f2fbd8f3ec0c858064adad01df9e8bb946137d2b5d5f4f8d1b7497b`.
+- Environment `artifacts/p01-s2-formal-20261108-f4244bac/environment/environment-result.json`,14222031bytes/SHA256 `60a8b23dd0118a6e37f5b6b924f32ee9ef21c2b12b31b0eea3fd36e1d92d0ea6`. Exact full paths, Markdown/inventory pins and observer/witness pins are frozen in the design table/contract; do not substitute earlier stale JSON.
+
+- [ ] Write local unittest controls for rejected qualification, wrong external pin, status-only/ready-only/renamed-collector acceptance, malformed spec, unknown/missing fields, duplicate keys at all nested depths, boolean-as-integer and numeric coercion. Assert gate rejection before output/harness allocation and that importing the module, gate calls and tests never execute WSL/Docker. Use fail-on-call spies for subprocess/admission; controlled local file reads/writes are allowed.
+- [ ] Run `python -m unittest scripts.boot.test_source_build -v` only with the resolved configured Python executable during implementation; verify missing implementation is the failure rather than environment setup. This publication does not run tests or infer their success.
+- [ ] Implement strict spec and packet readers with exact six-key acceptance, full SourceClosure/ClosureFile/Ref maps, exact VerdictRefs and ActualVerifierRecord nested types in the design. Hardcode the reviewed 21 gate-name literals; reject unknown/missing/duplicate gates and results outside passed/narrow DNS empty exception. Four completion flags remain false, resourcesPreserved true, unresolvedItems empty. Test every gate removal/replacement/duplication and mutation of result/count/flag/ref types, including all integer bool substitutions. A candidate cannot supply or widen the schema/allowlist.
+- [ ] Validate all raw-byte hashes/counts and repeated generation/distro/reviewedCommit across original request/receipt, closure and verdict; validate environment/codePins/request/sourceReview/frozenControls ref equality. Freeze five helper-name set and match public/frozen bytes/codePins/frozenManifest. Preserve Windows438 host mode independently of guest transfer contract; descriptive text cannot select policy. Validate original observer result remains collection-only s2Accepted=false/independentReviewRequired=true and observer/witness literal code pins are distinct from independent verdict/Markdown identities. Test mixed-generation, stale Markdown ref, swapped source/control refs and an outside-inventory ref incorrectly claimed as inventory member.
+- [ ] Rehash all 365 immutable manifest files and check exact directory/file inventory with only environment/distro and qualification-evidence exclusions. Validate original typed inventory fields/relative names/file pins and excluded live-VHD identity/size scope; reject extra exclusions/members, missing files, links/reparse aliases and drift. Keep collection-era manifest status unchanged. Explicitly rehash independently pinned outside-base source/control/Markdown/verdict refs; never demand they be fictitious inventory members. Original raw formats remain unchanged. Test narrow DNS empty result only with both integer counts0 and original oldResources.equivalences array length0.
+- [ ] Implement only local external SHA validation, read-only qualification result and exclusive harness closure freeze with safe reads, `xb`, exact dirs/modes/hash inventory and fsync. Recheck pins when freeze consumes qualification; no caller-supplied dict may bypass gate. Record reviewed checkout identity and frozen actual files; keep imported original source separate and reject overlapping/linked roots. Failures preserve partial local outputs and resources.
+- [ ] Run focused tests and local import/help controls during implementation. Review Task 1 file diff and confirm absence of runtime/subprocess paths or future-module imports. No new full evidence semantic evaluator/approval hierarchy is included: this stage consumes the independently accepted exact packet under an external pin. Keep future S6 automatic semantic qualifier as an explicit downstream gate, not a new Task 1 blocker.
+### Task 2: Public admitted binary input transfer
+
+**Files:** Create `wsl_environment_transfer.py`, `test_wsl_environment_transfer.py`.
+
+**Interfaces:** Implement `transfer_environment(environment_receipt, source, destination, sha256, size, mode, *, output_directory, timeout) -> dict`. Existing guest APIs: `receive_file(path,sha256,size,mode,stream)` and control-only `admit_environment(handle,argv,*,timeout=30,stdin=None)`. Implement the newly proposed, separately reviewed `stream_admitted(handle,argv,*,input_file,output_policy,guest_deadline,operation_directory)` for bulk I/O; it preserves admission semantics without existing capture behavior. Public `export_environment(environment_receipt, guest_directory, seal_sha256, *, output_directory, max_bytes, timeout) -> dict` is only proposed here; its implementation/tests wait for Task 6 after Task 3's complete seal oracle. Do not create a placeholder export function or import the future seal module in Task 2.
+
+- [ ] Add binary fixture `bytes(range(256))*4097`; test host binary descriptor forwarding and real nonseekable guest pipe staging into exclusive seekable rb spool, no shell/text mode, absolute WSL/Python invocation, and independent command stdout/stderr evidence.
+- [ ] Add tests for before/after source identity mutation, size/hash mismatch, partial write, negative timeout, escaped destination, existing terminal, linked ancestor, malformed pins and old socket/helper admission. Assert partial output retained, failure persisted and no remove/unregister calls.
+- [ ] Run `python -m unittest scripts.boot.test_wsl_environment_transfer -v`; confirm failures then implement the frozen verified helper bootstrap from the design. Implement separately frozen/reviewed stream_admitted from corrected design; never pass raw WSL pipe to existing admit_environment. Destination receive_file executes only after actual management-cgroup/namespace admission. Keep S2 helpers byte-identical.
+- [ ] Independently review new adapter's bounded observation equivalence to accepted validate_handle/namespace semantics, double comparison around management membership, exact nsenter argv/environment and post-check before implementation. No _entered/read_bytes for bulk child output. Existing input hashing is already 1MiB chunked; tell/seek still requires regular spool.
+- [ ] Exercise real _stdin/_entered regular rb input hash/rewind contract and real nonseekable pipe rejection. Integration controls use real OS pipes/processes and accepted validation functions, including stale pid/starttime/exe/namespaces/socket/containerd namespaces and wrong management membership; mocks alone do not establish streaming or admission correctness.
+- [ ] Test retained spool + authoritative destination capacity (2x all input/harness bytes), actual bavail and pinned reserves; bounded size+sentinel/hash/fsync/identity staging, partial writes and timeout retention, capped receiver stdout/stderr. No full-file bulk reads.
+- [ ] Freeze file-only harness manifest with exact dirs/modes/file sizes/hashes; create admitted 0700 dirs, transfer each regular file, finalize 0555 dirs bottom-up, verify exact aggregate closure before import/execution. Reject directory-as-source and incomplete harness; bootstrap remains independent.
+- [ ] Freeze design's amended `stream_admitted` closed output_policy and guest_deadline contract before implementation: trusted RECEIVER_CONTROL/EXPORT_ARCHIVE/COMPLETION_CONTROL dispatch, inherited binary export fd1, no archive JSON, bounded completion retrieval without _entered underneath. Keep generic transport tests separate from Task 6 seal/archive semantics.
+- [ ] Implement incremental executable identity observation with <=1MiB reads, descriptor/process/starttime/namespace before-after checks, full root-owned S_ISSOCK device/inode/uid/gid equality and complete capped docker-info inside exact target namespaces/endpoint/config/env. Reuse accepted validators, not process_identity.read_bytes. Observe successful management membership and three handle comparisons; preserve S2 helpers unchanged.
+- [ ] Enforce guest-created absolute monotonic deadline from validated duration starting before spool; independent host deadline; no cross-OS timestamp and no budget reset for completion. Freeze <=64KiB pipe reads,2 queued chunks/direction,64KiB control/1MiB stderr,max+one,8MiB transport-owned buffers, nonblocking partial writes, selectors/watchdog and supervised cancellable regular-file operations. No blocking pipe/disk/reap can silently bypass deadline; bounded persistence failure remains failure.
+- [ ] Create dedicated SID/PGID workers with frozen launcher handshake and independently verified PID/starttime/PGID/SID+nonce recorded before exec. Before TERM/KILL revalidate ownership; TERM2seconds then KILL/reap3seconds maximum. For dead leader/descendant-held pipes, close at deadline, record possible survivors and never signal an unverified PGID. Host disconnect/EPIPE triggers guest cancellation; guest deadline survives host loss.
+- [ ] Add real-process controls for silent/stalled spool, blocked host sink/disconnect, stderr flood,max+one,partial writes,no-output hang, leader exit with descendants holding pipes, nonzero after partial bytes, executable replacement/stale full socket/namespaces, failed management membership and absent/changed completion. Assert exact raw channel separation, bounded memory/termination, strict operation record cap/types and retained failed artifacts. No Task 1 changes or S2 rerun are required.
+- [ ] Finish the admitted INPUT path without export/seal imports; defer sender, bounded archive stdout capture, export corruption/limit tests and strict host extractor to Task 6. This task passes only input-transfer tests and makes no export completion claim.
+- [ ] Verify bootstrap loads only accepted frozen S2 helpers and independently frozen receiver bytes; record exact argv and code hashes. Do not edit accepted helper closure or claim exec_environment accepts stdin.
+- [ ] Run focused transfer tests and existing `test_wsl_environment`/`test_wsl_environment_guest` after this task implementation, using the pinned accepted helper contract. Review/commit only own files.
+
+### Task 3: Seal contract and endpoint wrapper
+
+**Files:** Create `source_build_seal.py`, `test_source_build_seal.py`, `source_build_guest.py`, `test_source_build_guest.py`.
+
+**Interfaces:** `seal(root: Path, *, context: dict, output: Path) -> dict`; `verify(root: Path, seal: Path, seal_sha256: str) -> dict`; guest `run(spec: dict, output: Path) -> dict`.
+
+- [ ] Add seal fixtures with one executable and empty directory. Require exact directory/file sets, modes/size/hash, rejects added file, changed mode/content, symlink, hardlink, special file, unsafe name and changed context. Assert RO root/seal/verifier checks are independent of byte equality.
+- [ ] Add wrapper tests injecting DOCKER_HOST/DOCKER_CONTEXT and hostile CONTAINERD_ADDRESS/CONTAINERD_NAMESPACE/CONTAINERD_SNAPSHOTTER plus lower/mixed-case keys (drop all keys whose uppercase starts CONTAINERD_), and attempting separate/equals --host/--context/--config, -H/-c, attached/combined shorts and every --tls/--tlsverify/--tlscacert/--tlscert/--tlskey override spelling; require sanitization/rejection. Assert argv begins with absolute Docker binary plus accepted endpoint/config, and wrapper produces no extra stdout.
+- [ ] Run targeted unittest modules; implement seal canonical JSON and traversal with a sibling seal to avoid self-reference. Use strict nofollow opens/identity checks and fsync, retaining partial failures.
+- [ ] Generate executable wrapper importing frozen DockerTransport and execing its actual argv with sanitized environment. Before each phase hash wrapper/module/binary; require actual endpoint socket/namespace identity through S2 live admission. Unit tests must call current Kotlin runner with `options['docker']=wrapper`, not a callable, and reject fake-control results in acceptance.
+- [ ] Run existing cache/Kotlin unit tests as regression controls; review/commit own changes.
+
+### Task 4: Descriptor-identical import and cache restoration
+
+**Files:** Extend `source_build_guest.py`, `test_source_build_guest.py`.
+
+**Interfaces:** Existing `import_handoff.import_restore(archive_path,archive_pin,handoff_pin,source_descriptor_pin,output_directory)`, `reopen(...)`; `developer_cache.restore(inputs,descriptor_sha,output,docker=wrapper) -> dict` returns cargoVolume/gradleVolume and restore/projection/consumerVerify receipts.
+
+- [ ] Write orchestration tests requiring S1 archive+all three external pins, source path beneath fresh import, RO source/harness/archive mounts on independent reopen, and exact three cache sibling inputs. Verify mismatched descriptor prevents Docker calls.
+- [ ] Write tests that source mutation, cache baseline drift, ext4 mismatch, RO verify absence or false statvfsReadOnly stops before Kotlin. Require exact owned volume IDs plus endpoint in state, failure preserves all resources, and Cargo consumer never used for compiler work in S3.
+- [ ] Implement worker creation with design confinement and effective observations. Root ownership initialization gets CHOWN only and fresh empty targets; import/cache projection/reopen execute UID65534. Reuse cache's existing 128pids confinement unchanged.
+- [ ] Implement full source descriptor before/after validation and separate filtered Kotlin snapshot mapping. Harness is always a separate input; do not patch source scripts to add new orchestration.
+- [ ] Add real preflight host/ext4 free space observations and budget ledger including retained archive/restores/two private Kotlin caches/export/reserves; preserve 8GiB per-Kotlin prepare observation. Fail rather than deleting anything or reducing limits.
+- [ ] Run focused and existing import/cache tests; review/commit own changes. Actual import/cache acceptance remains part of Task 7, after accepted S2 gate.
+
+### Task 5: Six genuine Kotlin compiles and toolchain byte verification
+
+**Files:** Extend `source_build_guest.py`, create `source_build_toolchain.py`, `source_build_replay.mjs`, tests `test_source_build_toolchain.py`; extend guest tests.
+
+**Interfaces:** Current `kotlin_delivery.run(options, docker=None) -> dict`; new `observe(image: str, expected: dict, output: Path) -> dict`, `verify(observation: dict, tools_root: Path, expected: dict) -> dict`. Expected tool identities come from admitted image/locked toolchain closure, never from a package's own evidence.
+
+- [ ] Add tests asserting profile order and exact labels developer-workflow=[notes-demo,animated-demo], uninstall=[read-file,image-viewer,text-entry-demo,uninstall]; each gets separate new output/volumes and original restored Gradle cache. Reject synthetic_controls, fake-control, missing compiler log/task, predecessor mismatch or package identity mismatch.
+- [ ] Add fixture where Node/Java version strings are correct but actual binary hash differs from toolchain.json; verification must fail. Cover executable symlink resolution inside fixed image, wrong image, Gradle archive/wrapper mismatch and absent tool bytes. Do not edit imported build-linux-host-kotlin.mjs.
+- [ ] Implement real per-profile runner invocation through wrapper. Require pipeline-completed/actual-docker, six executed compiler chains, forced offline flags, proper package SDK and independently RO verify-all. Collect exact command/raw logs and final inspect including timeout/stop-owned outcome.
+- [ ] Implement new RO-root/no-network tool observation containers hashing actual Node, Java, Gradle distribution and locked compiler dependencies; observe Tools/Rust executables for S4 handoff without compiling Rust. Cross-check every package toolchain.json nodePath/nodeSha256/javaPath/javaSha256 and fixed image identity against independent actual bytes.
+- [ ] Copy output with existing Docker cp, then mount exported copy RO in another verifier container and rerun existing `verifyReplayContracts`/`verifyPackage` through explicit frozen JS glue. Compare exact copy inventory including POSIX modes against original output volume; bind source mapping, dependencies, six package evidence and observations into new seal.
+- [ ] Run focused tests plus existing Kotlin tests once; review/commit own changes.
+
+### Task 6: Sealed host export and independent RO replay
+
+**Files:** Extend source_build coordinator/guest/seal and tests.
+
+**Interfaces:** `export_environment` streams payload+seal; `reopen_source_build` consumes external seal pin and original spec. `transfer_environment` may additionally return canonical archive to new ext4 input for optional handoff checking.
+
+**Dependencies:** Task 3 seal/verify must already pass; Task 5 supplies complete output-volume/copy inventories and compiler replay. Implement the previously proposed export API here, never by trusting a caller's unverified inventory.
+
+- [ ] Test archive corruption/truncation, extra member, duplicate/path traversal, wrong mode, nonzero sender, Windows directory hash mismatch, wrong seal/context, missing compiler log, writable replay and reused extraction root. Check rejection preserves archive/logs/partial extraction.
+- [ ] Add exact binary sender tests with `bytes(range(256))*4097`, independent raw stderr, timeout/truncation/over-limit controls, stale source identity and changed seal. Use separately reviewed bounded admission adapter from Task 2, never _entered/read_bytes or exec_environment stdout. Implement admitted sender using Task 3 verified complete seal, nofollow traversal, bounded output and before/after identity. Stream stdout directly to an exclusive binary host file; no multi-GB buffering or JSON/log text in archive bytes. Reuse S1 strict low-level extractor only if its exact policy fits this regular-file/directory format; otherwise implement narrow bounded extraction rejecting links/specials/duplicates/escape paths.
+- [ ] Integration-test actual OS pipe backpressure with concurrent bounded stderr drain, >max_bytes sender, diagnostics cap, hanging child, nonzero exit after partial output, absent/changed completion record, exact owned PID termination and retained partial artifacts. Assert bounded read sizes/queues and memory independent of total size; host and adapter independently enforce deadline/limit. Completion nonce/seal/count/digest/child identity arrives only in separately retrieved fsynced <=64KiB control record after EOF; compare host hash/count and reject missing completion.
+- [ ] Implement binary host archive capture, strict host extraction and full host byte/count comparison. Do not infer POSIX mode equality from Windows extraction. Retain archive as canonical export and record actual SHA/size.
+- [ ] Require separate Linux RO replay of copied exported tree, exact output-volume/copy seal equality and full six-package compiler provenance. Validate host archive member names/types/modes/sizes/bytes against that seal plus archive digest; Windows filesystem modes do not qualify. Mount source/cache/seal/harness RO and invoke no compilers during replay.
+- [ ] Complete success receipt only after mandatory RO copy replay and host export checks; bind original source/cache/harness, qualified S2 source/env/verifier chain, wrapper/endpoint, tools, both Kotlin generations, copy/export archive and replay digests. Failures write failed receipts only and retain all resources.
+- [ ] Optional handoff check, outside S3 completion gate: return canonical host archive with external pin to a new ext4 path, strictly extract in a new restricted worker, then replay in a different RO container. Record return/extraction/replay pins and failures separately; this proves no S4/S6 behavior.
+- [ ] Run focused tests and Python import/--help checks; review/commit own changes.
+
+### Task 7: Actual S3 acceptance and documentation
+
+**Files:** New exclusive actual artifact generation; implementation documentation and changelog updates only after observed results. No existing artifact edits.
+
+- [ ] Controller reviews completed Tasks 1–6 and their recorded gates under standing authorization before actual S3. Use externally pinned f4244bac packet-v2 and reviewed source provenance `5ac0edd5feb525951e44faffbc935e4b4eee586f`; its point-in-time S2 acceptance is not live admission or S3 acceptance. Revalidate complete local qualification, original _read_ready and fresh live namespace/management admission before any runtime resource operation. Preserve historical failed generations. Resolve configured Python executable and capture current dirty state to protect unrelated controller work.
+- [ ] Run all new focused tests plus stable import/cache/Kotlin and S2 transport tests once; record command/executable/exit and test summary. Tests with injected controls are labeled controls, never actual compiler acceptance.
+- [ ] Freeze the reviewed harness, create a pinned spec with explicit budget/timeout/export limits, and call new run CLI against the actual original 3.54GB archive. Record accepted new daemon image/container/volume listings before and after. Observe original daemon preservation through S2's admitted observation path.
+- [ ] Inspect actual full S1 ext4 import+separate RO reopen, actual cache restore+consumer RO verifies, two real Kotlin runs/six compiler outputs, toolchain byte checks, guest copy replay and seal. Any failure creates a new retained failed generation; resolve cause and rerun in a new generation only.
+- [ ] Perform independent Linux RO replay from the copied export, export actual sealed archive to Windows, validate archive full member closure, and have controller inspect complete final receipt/raw command evidence. Acceptance oracle is design's full source/cache/toolchain/compiler/transfer chain; no pipeline-completed shortcut. Optional canonical archive return is recorded separately and is not required to close S3.
+- [ ] Document actual source counts/modes, exact command/results, all resource IDs, export pins, limitations and failures. Mark S3 accepted only after controller evidence review; keep S4/S5/S6 and P01 open. Commit only own implementation/docs, report local/remote commit identity if publishing is within controller's authorized workflow.
+
+## Implementation handoff and remaining gates
+
+Tasks 1–2 cover local qualification/freeze and separately reviewed bulk input transfer; Task 3 seal/wrapper; Task 4 exact source/cache/storage; Task 5 six actual compiles/toolchain/copy replay; Task 6 sealed host export with optional return; Task 7 actual S3 evidence review. File/interface ownership above is sequential, with no forward imports. Task 1 only supplies local gate/freeze; it cannot allocate or run WSL. The independent reconciliation PASS resolves the former schema blocker, not bulk adapter review or actual S3 acceptance.
+
+Use exact adopted packet-v2 and typed 21-gate contract in the published design. Collector remains s2Accepted=false; no new duplicate semantic reevaluator or approval envelope is mandated. Earlier acceptance proposal remains unadopted. f4244bac is accepted only at observed intervals; fresh admission remains mandatory before downstream use. All historical failed/sealed assets remain preserved; no failed stage is reclassified.
+
+S4 requires separate raw Node executable export/pin/path/mode/digest and RO consumer verification; S3 observations do not close it. S6 public single entry must obtain fixed outer Tools from pinned archive when absent, strictly load and verify exact identity; manual existing Tools cannot close P01, and first outer load proof stays separate from inner empty-store/three-image proof. S6 additionally needs its independently frozen automatic semantic qualifier for every new install and its own equivalent proof; it cannot copy f4244bac or accept collector status. No per-install human approval is required. These are downstream obligations, not S3 runtime work.
+
+
+

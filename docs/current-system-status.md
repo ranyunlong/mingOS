@@ -6,6 +6,8 @@
 
 当前范围：`persistentUpdateNormalRebootVerified=true`；`persistentUpdateExplicitRecoveryVerified=true` 仅覆盖下述 Linux 受控进程中断与显式恢复。`formalQualification=false`、`finalSystemAccepted=false`。
 
+连续交付检查点：S2实际验收文档及其修复已推送，远程精确提交`95970c008ee3bc68538211c4dbcf4e0af8ed2b5b`。S3的[设计](superpowers/specs/2026-11-08-p01-source-build-design.md)和[七任务计划](superpowers/plans/2026-11-08-p01-source-build.md)已落盘，验收格式经独立复核；Task1正在实现本地严格spec/证明链校验与执行器冻结，不启动WSL/Docker。S3实际恢复、六次Kotlin编译、独立只读回放和封存导出均尚未验收。
+
 S2公共入口create/observe/exec已实现并通过Task4代码复核，提交`f00331c`。首次正式新代`554bde65`的create退出0，但独立实际审计发现插件命名空间实际为`plugins.moby`，与本代专属值不符，因此S2未通过；原代、失败观察和全部资源保留。首轮修复补齐实际命名空间准入/回放检查并通过冻结Linux回归139项运行、138通过、1项Windows junction专属跳过及独立代码复核；但新代`8039baf3`在launch阶段因固定Docker拒绝单数JSON键而失败。已保留停止发行版的离线导出和原始错误；固定二进制`--help/--validate`证实应省略两种plugin JSON键并使用复数CLI选项，受影响修复和另一个全新代实际验收继续，不将配置校验当作实际namespace通过，见[环境记录](p01-environment-audit.md)。
 
 历史检查点（已由下段后续正式结果更新）：复数CLI修复`28a67af`已在两全新代`dbdcae92`/`4b1bac35`通过实际专属namespace、三镜像载入和有效smoke，但两次均因旧容器Dns从null变为空数组而在outer-preservation退出1。完整原始比较和独立复核确认其余旧对象未变，两代仍失败。固定源码和Desktop日志支持加载期初始化解释；精确版本限定、保留raw且显式记录差异的语义规则当时已通过独立设计复核。该检查点远程为`46af996`，本地`28a67af`有3个未推送提交；这些值不是后续发布状态。
