@@ -33,7 +33,7 @@
 
 | 阶段 | 交付物 | 必须证明的行为 |
 | --- | --- | --- |
-| S1 | 公共严格 handoff 导入模块 | 四个外部 pin、完整 sibling allowlist、独占源码恢复、完整只读重开，失败留存 |
+| S1 | 公共严格 handoff 导入模块 | 三个外部 pin、完整 sibling allowlist、独占源码恢复、完整只读重开，失败留存 |
 | S2 | 新环境及 Docker transport | 明确 executable/endpoint、独立 guest/store、首次空清单、固定三镜像 index 身份；现有 daemon 前后保持 |
 | S3 | 源码/缓存消费者及应用构建 | 新消费者、只读复核、实际离线强制 Kotlin 编译、Node 和工具链观察的实际字节核验 |
 | S4 | 开发冷构建及 probe | 新开发合同、实际空 target Rust 编译、新 probe 绑定本次源码和构建，历史 driver 不变 |
