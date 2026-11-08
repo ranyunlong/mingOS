@@ -50,6 +50,16 @@ guest-c daemon ID：`81326b10-1096-4e41-a8a0-0303a61dd95e`；driver `overlayfs`�
 
 完整汇总为`image-load-c62467b1/load-and-smoke-summary.json`。主执行者独立重核原loader六次操作、三个原index/config/rootfs、smoke原始输出/inspect、helper hashes及共享祖先未变，并在随后只读调用中确认同一daemon ID、3镜像/1容器。外层Desktop ID和镜像集合保持；无原容器/卷删除。并行S1 import从Running正常变为Exited0及新增reopen容器均单独归因，不宣称完整外层清单字节相同。
 
+## S2公共输入模块的实际验收
+
+公开`docker_transport.py`已完成显式endpoint/config、环境清理及原loader适配。独立复核发现的组合短选项准入缺口已修复；9项transport控制和16项迁移回归通过，复核批准仅覆盖该模块。
+
+公开`wsl_environment.py`与`wsl_environment_guest.py`的输入冻结、rootfs构造、命令记录和Linux二进制接收器已完成独立复核。补齐有效首成员后的重复检查及header-only超大成员控制后，Windows14项通过；最终冻结Linux快照运行18项，17项通过、1项Windows junction专属控制明确跳过，四项真实Linux接收器控制均执行。证据为`artifacts/p01-s2-linux-green-20261108-31a4a996/`，精确容器`d2a0e4af516ef18e63c0fcf637bef543af793f815677e32f53a70e0bf3796349`退出0且非OOM，资源保留。
+
+实际公开`prepare_rootfs`消费原保留export及固定Docker bundle，独立tar遍历比较全部17,278个原成员的内容、模式、属主与链接语义，精确新增8个二进制及`wsl.conf`，输出17,287成员。输出1,460,418,560字节、SHA256为`74b938e0c30b07f14103ed138cfd5d2fe87e37365bd7719e5f65c10471b597b0`，来源输入前后摘要不变；结果与原实验字节一致，但验收按独立成员比较完成，没有采信历史结果替代本次执行。完整证据为`artifacts/p01-s2-actual-rootfs-20261108-e5a18d06/`。
+
+这些结果只关闭S2计划的transport及输入任务。新distro/daemon公共生命周期、完整create/observe/exec、真实全新代集成验收仍须完成，不构成S2或P01整体验收。
+
 ## 状态
 
 P01 S1公共严格导入已通过实际大包导入和独立只读重开及独立复核。WSL实验已完成三镜像加载和实际受限容器，但S2公共化及S3–S6源码/缓存消费、真实编译、新包装配和持久化验收继续。全部11项新项目仍为0项完成并发布；原开发VM交付与正式验收标志保持原范围。

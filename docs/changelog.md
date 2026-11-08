@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-08 — P01 S2显式transport与公共输入控制
+
+- 新增`docker_transport.py`，固定executable/endpoint/config，清理环境，保持原镜像loader的binary stdin与命令收据合同；组合短选项准入P2已修复并独立复核，9项控制及16项迁移回归通过。
+- 新增公共输入冻结、独占命令捕获、流式固定Docker bundle/rootfs构造和Linux dirfd二进制接收器；输入模块提交`ddce57d`，独立复核通过。
+- Windows输入控制14通过；新冻结Linux容器18项运行、17通过、1项Windows junction明确跳过；接收器四项真实Linux控制均执行。
+- 实际公开rootfs构造及独立成员比较通过：17,278原成员完整保留，新增8个固定二进制和`wsl.conf`，输出17,287成员及1,460,418,560字节；所有输入前后摘要一致，证据与失败代保留。
+- S2公共生命周期、完整create/observe/exec及正式另一新代集成继续。S3–S6未关闭，11项目仍0/11完成，正式验收标志保持false。
+
 ## 2026-11-08 — P01 公共严格导入与真实大包验收
 
 - 新增`import_handoff.py`公开Linux导入、源码恢复、只读重开API与CLI；固定三个外部pin、完整成员白名单、独占输出和canonical closed receipt，所有资格声明保持false。
