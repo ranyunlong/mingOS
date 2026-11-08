@@ -212,4 +212,772 @@ class WrapperTests(unittest.TestCase):
         # fake external Docker fails before allocation and is never accepted.
 
 
+class SourceCacheBudgetTests(unittest.TestCase):
+    """Pure accounting controls; these do not observe a Windows VHD."""
+    def feature(self, name):
+        self.assertTrue(hasattr(target, name), 'Task4 missing ' + name)
+        return getattr(target, name)
+
+    def test_budget_counts_retained_spools_restores_both_private_caches_and_export(self):
+        budget = self.feature('_source_cache_budget')(
+            archive=100, harness=20, delivery=300, source=40,
+            cache_archive=50, cache_payload=60, gradle=30, entries=10,
+            host_reserve=7, linux_reserve=11, export_max=80)
+        self.assertEqual(budget['items'], {
+            'inputArchiveAndHarness': 120, 'retainedInputSpools': 120,
+            'restoredDelivery': 300, 'restoredSource': 40,
+            'cachePrivateArchive': 50, 'cacheRestoredPayload': 60,
+            'cacheConsumers': 60, 'kotlinPrivateSources': 80,
+            'kotlinPrivateGradleCaches': 60, 'kotlinWorkAndOutputs': 17179869184,
+            'guestCopyAndCanonicalExport': 160, 'metadataAndLogs':268476416, 'linuxReserve': 11})
+        self.assertEqual(budget['linuxTotalBytes'], 17448346661)
+        self.assertEqual(budget['alreadyRetainedBytes'], 240)
+        self.assertEqual(budget['linuxAdditionalBytes'], 17448346421)
+        self.assertEqual(budget['hostRequiredBytes'], 167)
+        self.assertEqual(budget['kotlinPrepareMinimumBytes'], 8 * 1024**3)
+
+    def test_budget_rejects_bool_negative_and_missing_values(self):
+        function = self.feature('_source_cache_budget')
+        good = dict(archive=100, harness=20, delivery=300, source=40,
+                    cache_archive=50, cache_payload=60, gradle=30, entries=10,
+                    host_reserve=7, linux_reserve=11, export_max=80)
+        for key in good:
+            for value in (True, -1, '100'):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    function(**{**good, key: value})
+        for key in ('host_reserve','linux_reserve','export_max'):
+            with self.subTest(key=key),self.assertRaises(ValueError):function(**{**good,key:0})
+
+    def test_export_ceiling_above_prepare_floor_is_never_reduced(self):
+        budget=self.feature('_source_cache_budget')(archive=1,harness=1,delivery=1,source=1,
+            cache_archive=1,cache_payload=1,gradle=1,entries=1,
+            host_reserve=1,linux_reserve=1,export_max=10*1024**3)
+        self.assertEqual(budget['items']['kotlinWorkAndOutputs'],20*1024**3)
+        self.assertEqual(budget['items']['guestCopyAndCanonicalExport'],20*1024**3)
+        self.assertEqual(budget['hostRequiredBytes'],20*1024**3+1)
+
+    def test_fixed_paths_derive_from_both_generations_reject_aliases(self):
+        paths = self.feature('_phase_paths')('s2-control', 's3-control')
+        self.assertEqual(str(paths['archive']), '/var/lib/s2-control/s3/s3-control/inputs/handoff/handoff.tar')
+        self.assertEqual(str(paths['harness']), '/var/lib/s2-control/s3/s3-control/inputs/harness')
+        self.assertEqual(str(paths['output']), '/var/lib/s2-control/s3/s3-control/source-cache')
+        for s2, s3 in [('x/../y', 'ok'), ('ok', '../bad'), ('', 'ok')]:
+            with self.assertRaises(ValueError): target._phase_paths(s2, s3)
+
+    def test_filtered_snapshot_keeps_full_source_identity_separate(self):
+        manifest = {'files': {'src/Main.kt': {'sha256': 'a'*64},
+                              'build/stale': {'sha256': 'b'*64},
+                              'src/build/generated': {'sha256': 'c'*64},
+                              'LICENSE': {'sha256': 'd'*64}},
+                    'directories': ['build', 'src', 'src/build']}
+        mapping = self.feature('_filtered_source_mapping')(manifest, 'e'*64)
+        self.assertEqual(mapping['sourceDescriptorSha256'], 'e'*64)
+        self.assertEqual(mapping['snapshot'], {'files': {'LICENSE': 'd'*64, 'src/Main.kt': 'a'*64},
+                                               'directories': ['', 'src']})
+        self.feature('_check_filtered_snapshot')(mapping, mapping['snapshot'])
+        for changed in ({'files': {'LICENSE':'d'*64}, 'directories':['']},
+                        {'files':mapping['snapshot']['files'], 'directories':['','src','build']}):
+            with self.assertRaises(ValueError): target._check_filtered_snapshot(mapping, changed)
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'Linux full-source/cache descriptor controls')
+class SourceCacheInputTests(unittest.TestCase):
+    """Real S1/cache bytes, with no Docker API or live admission substitution."""
+    def setUp(self):
+        from test_import_handoff import ImportControls
+        import current_source as source
+        import developer_cache_worker as cache
+        import handoff_manifest as handoff
+        import tarfile
+        self.fixture = ImportControls(); self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        f = self.fixture; self.base = f.base
+        inputs = f.root / 'rebuild-inputs/cache'
+        (inputs / 'fixture.json').unlink()
+        cargo, gradle = self.base/'cargo', self.base/'gradle'
+        cargo.mkdir(); gradle.mkdir()
+        (cargo/'crate').write_bytes(b'cargo'); (gradle/'module.jar').write_bytes(b'gradle')
+        (cargo/'crate').chmod(0o644); (gradle/'module.jar').chmod(0o644)
+        baseline = self.base/'baseline.json'
+        baseline.write_bytes(source.encoded({'schemaVersion':1,'files':{'module.jar':source.sha(b'gradle')}}))
+        # Export requires the recorded source ownership; explicit fixture adaptation
+        # is confined to temporary roots and never represents a Docker restore.
+        if os.getuid() == 0:
+            for root in (cargo, gradle):
+                os.chown(root,65534,65534)
+                for p in root.iterdir(): os.chown(p,65534,65534)
+        cache.export_inputs(cargo,gradle,baseline,inputs)
+        self.cache_pin = source.sha((inputs/'developer-inputs.json').read_bytes())
+        f.raw = source.encoded(handoff.make(f.root,f.runtime_pin,f.source_pin))
+        (f.root/'handoff-manifest.json').write_bytes(f.raw)
+        f.handoff_pin = source.sha(f.raw)
+        with tarfile.open(f.archive,'w',format=tarfile.PAX_FORMAT) as archive:
+            archive.add(f.root,arcname='delivery')
+        f.archive_pin = source.sha(f.archive.read_bytes()); f.archive.chmod(0o444)
+        self.spec = {'handoff': {'sha256':f.archive_pin,'bytes':f.archive.stat().st_size,
+                    'manifestSha256':f.handoff_pin,'sourceDescriptorSha256':f.source_pin},
+                    'cacheDescriptorSha256':self.cache_pin}
+
+    def feature(self,name):
+        self.assertTrue(hasattr(target,name), 'Task4 missing '+name)
+        return getattr(target,name)
+
+    def test_archive_preflight_checks_three_external_pins_and_exact_cache_siblings(self):
+        result = self.feature('_source_cache_inputs')(self.spec,self.fixture.archive)
+        self.assertGreater(result['deliveryBytes'],0)
+        self.assertEqual(result['sourceBytes'],len(b'fixture license\n')+len(b'#!/bin/sh\nexit 0\n'))
+        self.assertEqual(result['cacheDescriptorSha256'],self.cache_pin)
+        self.assertEqual(result['cacheFiles'],['dependencies.tar','developer-inputs.json','gradle-baseline.json'])
+        import copy
+        for key in ('sha256','manifestSha256','sourceDescriptorSha256'):
+            bad=copy.deepcopy(self.spec);bad['handoff'][key]='0'*64
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                target._source_cache_inputs(bad,self.fixture.archive)
+        bad=copy.deepcopy(self.spec);bad['cacheDescriptorSha256']='0'*64
+        with self.assertRaises(ValueError): target._source_cache_inputs(bad,self.fixture.archive)
+
+    def test_full_source_recheck_rejects_mutation_and_extra_directory(self):
+        root,_=self.fixture.imported()
+        observe=self.feature('_full_source_mapping')
+        first=observe(root,self.fixture.source_pin)
+        self.assertEqual(first['snapshot']['files']['bin/run'],hashlib.sha256(b'#!/bin/sh\nexit 0\n').hexdigest())
+        (root/'source-repo/bin/run').write_bytes(b'changed')
+        with self.assertRaises(ValueError): observe(root,self.fixture.source_pin)
+
+    def test_cache_baseline_drift_and_extra_sibling_fail_before_restore(self):
+        root,_=self.fixture.imported(); inputs=root/'delivery/rebuild-inputs/cache'
+        verify=self.feature('_verified_cache_inputs')
+        verify(inputs,self.cache_pin)
+        (inputs/'gradle-baseline.json').write_bytes(b'{}')
+        with self.assertRaises(ValueError): verify(inputs,self.cache_pin)
+        (inputs/'surprise').write_bytes(b'extra')
+        with self.assertRaises(ValueError): verify(inputs,self.cache_pin)
+
+    def test_full_source_extra_directory_and_mode_change_rejected(self):
+        root,_=self.fixture.imported();observe=self.feature('_full_source_mapping')
+        observe(root,self.fixture.source_pin)
+        (root/'source-repo/unlisted').mkdir()
+        with self.assertRaises(ValueError):observe(root,self.fixture.source_pin)
+        (root/'source-repo/unlisted').rmdir()
+        (root/'source-repo/bin/run').chmod(0o644)
+        with self.assertRaises(ValueError):observe(root,self.fixture.source_pin)
+
+    def test_guest_harness_independently_checks_metadata_pin_modes_and_exact_members(self):
+        verify=self.feature('_guest_harness')
+        root=self.base/'frozen-harness';root.mkdir();root.chmod(0o555)
+        # Root is temporarily writable only while constructing this explicit fixture.
+        root.chmod(0o755);(root/'empty').mkdir();(root/'empty').chmod(0o555)
+        helper=root/'helper.py';helper.write_bytes(b'control');helper.chmod(0o444)
+        manifest={'schemaVersion':1,'kind':'p01-s3-harness-input',
+                  'checkout':{'path':'C:/checkout','reviewedCommit':'a'*40,'dirtyFiles':{}},
+                  'directories':{'empty':{'hostMode':511,'transferMode':365}},
+                  'files':{'helper.py':{'bytes':7,'sha256':hashlib.sha256(b'control').hexdigest(),
+                                        'hostMode':438,'transferMode':292}}}
+        meta=root/'manifest.json';meta.write_text(json.dumps(manifest));meta.chmod(0o444);root.chmod(0o555)
+        pin=hashlib.sha256(meta.read_bytes()).hexdigest()
+        observed=verify(root,pin);self.assertGreater(observed['bytes'],7)
+        for mutation in ('extra','mode','bytes','metadata'):
+            with self.subTest(mutation=mutation):
+                root.chmod(0o755)
+                if mutation=='extra':(root/'extra').write_bytes(b'extra')
+                if mutation=='mode':helper.chmod(0o644)
+                if mutation=='bytes':helper.chmod(0o644);helper.write_bytes(b'changed');helper.chmod(0o444)
+                if mutation=='metadata':meta.chmod(0o644);meta.write_bytes(b'{}');meta.chmod(0o444)
+                root.chmod(0o555)
+                with self.assertRaises(ValueError):verify(root,pin)
+                root.chmod(0o755)
+                if (root/'extra').exists():(root/'extra').unlink()
+                helper.chmod(0o644);helper.write_bytes(b'control');helper.chmod(0o444)
+                meta.chmod(0o644);meta.write_text(json.dumps(manifest));meta.chmod(0o444);root.chmod(0o555)
+        root.chmod(0o755);(root/'empty').chmod(0o755)
+
+    def test_initializer_rejects_nonempty_target_without_partial_chown_or_deletion(self):
+        initialize=self.feature('_initialize_empty_targets')
+        first,second=self.base/'first',self.base/'second';first.mkdir();second.mkdir()
+        marker=second/'retain';marker.write_bytes(b'retain')
+        before=first.stat()
+        with self.assertRaises(ValueError):initialize([first,second])
+        after=first.stat()
+        self.assertEqual((before.st_uid,before.st_gid,before.st_mode),(after.st_uid,after.st_gid,after.st_mode))
+        self.assertEqual(marker.read_bytes(),b'retain')
+        if os.geteuid()==0:
+            marker.unlink();initialize([first,second])
+            for path in (first,second):
+                self.assertEqual((path.stat().st_uid,path.stat().st_gid,path.stat().st_mode&0o777),(65534,65534,0o700))
+        else:
+            marker.unlink()
+            with self.assertRaises(ValueError):initialize([first,second])
+
+    def test_linux_capacity_observation_uses_actual_nofollow_directory_and_bavail(self):
+        observe=self.feature('_linux_space')
+        value=observe(self.base)
+        self.assertEqual(value['device'],self.base.stat().st_dev)
+        self.assertEqual(value['inode'],self.base.stat().st_ino)
+        self.assertEqual(value['path'],str(self.base))
+        self.assertIs(type(value['filesystemType']),int)
+        self.assertGreater(value['availableBytes'],0)
+        self.assertLessEqual(value['availableBytes'],os.statvfs(self.base).f_blocks*os.statvfs(self.base).f_frsize)
+        self.assertIn(' - ',value['mountinfo'])
+        link=self.base/'linked-capacity';link.symlink_to(self.base,target_is_directory=True)
+        with self.assertRaises((ValueError,OSError)):observe(link)
+
+
+class SourceTransferSignatureTests(unittest.TestCase):
+    def test_phase_requires_original_task2_transfer_context(self):
+        import inspect
+        parameter=inspect.signature(target._source_cache_phase).parameters.get('transfer_context')
+        self.assertIsNotNone(parameter,'private phase must require original Task2 transfer context')
+        self.assertIs(parameter.default,inspect.Parameter.empty)
+
+    def test_original_transfer_history_ownership_cannot_be_bypassed(self):
+        self.assertTrue(hasattr(target,'_transfer_history_owner'),'original root-owned transfer histories required')
+        target._transfer_history_owner((1,2,0o100600,1,0,0,8,1,1))
+        for uid,gid in ((65534,0),(0,65534),(65534,65534)):
+            with self.subTest(uid=uid,gid=gid),self.assertRaises(ValueError):
+                target._transfer_history_owner((1,2,0o100600,1,uid,gid,8,1,1))
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'Linux actual transfer closure filesystem controls')
+class SourceTransferClosureTests(unittest.TestCase):
+    """Synthetic operation history; real nofollow trees, pins and accepted validator."""
+    def setUp(self):
+        import wsl_environment_transfer as transfer
+        self.temporary=tempfile.TemporaryDirectory();self.addCleanup(self.temporary.cleanup)
+        self.base=Path(self.temporary.name)
+        self.paths={'archive':self.base/'inputs/handoff/handoff.tar','harness':self.base/'inputs/harness',
+                    'output':self.base/'source-cache'}
+        for path in ('inputs/handoff','inputs/harness/scripts/boot','staging','operations/handoff','operations/harness'):
+            (self.base/path).mkdir(parents=True,exist_ok=True)
+        self.paths['archive'].write_bytes(b'archive');self.paths['archive'].chmod(0o444)
+        adapter=self.paths['harness']/transfer.ADAPTER_ROLE
+        adapter.write_bytes(b'isolated transfer adapter');adapter.chmod(0o444)
+        row={'bytes':adapter.stat().st_size,'sha256':hashlib.sha256(adapter.read_bytes()).hexdigest(),
+             'hostMode':0o644,'transferMode':0o444}
+        manifest={'schemaVersion':1,'kind':'p01-s3-harness-input','checkout':{},
+                  'directories':{name:{'hostMode':0o755,'transferMode':0o555} for name in ('scripts','scripts/boot')},
+                  'files':{transfer.ADAPTER_ROLE:row}}
+        meta=self.paths['harness']/'manifest.json';meta.write_text(json.dumps(manifest));meta.chmod(0o444)
+        meta_pin={'bytes':meta.stat().st_size,'sha256':hashlib.sha256(meta.read_bytes()).hexdigest()}
+        self.spec={'generation':'s3-control','environment':{'path':'C:/environment.json','sha256':'b'*64},
+            's2Acceptance':{'path':'C:/acceptance.json','sha256':'c'*64},
+            'harness':{'manifestSha256':meta_pin['sha256']},
+            'handoff':{'bytes':7,'sha256':hashlib.sha256(b'archive').hexdigest()}}
+        self.handle={'generation':'s2-control'}
+        self.context={'specRef':{'path':'C:/spec.json','sha256':'a'*64},'environment':self.spec['environment'],
+            'acceptance':self.spec['s2Acceptance'],'generation':'s3-control','s2Generation':'s2-control',
+            'adapter':{key:row[key] for key in ('bytes','sha256')},'manifestPin':meta_pin}
+        for name in ('context.json','staging/context.json'):self.write(name,self.context)
+        self.members={'handoff':{'handoff.tar':{'bytes':7,'sha256':self.spec['handoff']['sha256'],'mode':0o444}},
+            'harness':{transfer.ADAPTER_ROLE:{'bytes':row['bytes'],'sha256':row['sha256'],'mode':0o444},
+                       'manifest.json':{**meta_pin,'mode':0o444}}}
+        for role,nonce in (('handoff','d'*32),('harness','e'*32)):
+            self.write('operations/'+role+'/owner.json',{'context':self.context,'nonce':nonce})
+            self.write('operations/'+role+'/complete.json',{'status':'succeeded','context':self.context})
+            for ordinal,(name,pin) in enumerate(sorted(self.members[role].items())):
+                record={'schemaVersion':1,'operationNonce':nonce,'action':'receive','status':'succeeded',
+                    'bytes':pin['bytes'],'sha256':pin['sha256'],'sealSha256':None,'error':None,
+                    'possibleSurvivors':False,'observations':[],
+                    'child':{'pid':12,'pgid':12,'sid':12,'starttime':'34'}}
+                transfer.validate_operation_record(record)
+                self.write('operations/'+role+'/member-'+str(ordinal)+'.json',record)
+        for path in (self.paths['harness'],self.paths['harness']/'scripts',self.paths['harness']/'scripts/boot',
+                     self.paths['archive'].parent):path.chmod(0o555)
+        def writable():
+            for path in (self.paths['harness'],self.paths['harness']/'scripts',self.paths['harness']/'scripts/boot',
+                         self.paths['archive'].parent):path.chmod(0o755)
+        self.addCleanup(writable)
+
+    def write(self,name,value):
+        (self.base/name).write_text(json.dumps(value))
+
+    def observe(self):
+        self.assertTrue(hasattr(target,'_completed_transfers'),'Task4 missing _completed_transfers')
+        if os.geteuid()==0:
+            return target._completed_transfers(self.spec,self.handle,'a'*64,self.context,self.paths)
+        # Ordinary fixture workers cannot create root-owned temporary histories.
+        # This ownership-only seam never stands in for actual source acceptance.
+        with mock.patch.object(target,'_transfer_history_owner',return_value=None):
+            return target._completed_transfers(self.spec,self.handle,'a'*64,self.context,self.paths)
+
+    @unittest.skipUnless(hasattr(os,'geteuid') and os.geteuid()==0, 'actual root-owned history control')
+    def test_actual_root_history_rejects_changed_owner_and_input_owner(self):
+        self.observe()
+        for path in (self.base/'context.json',self.base/'operations/handoff',self.paths['archive'],
+                     self.paths['harness']/'scripts/boot/wsl_environment_transfer.py'):
+            try:
+                os.chown(path,65534,65534)
+                with self.subTest(path=str(path)),self.assertRaises(ValueError):self.observe()
+            finally:os.chown(path,0,0)
+
+    def test_complete_original_context_and_both_role_histories_are_stable(self):
+        self.assertEqual(self.observe(),self.observe())
+
+    def test_every_original_context_binding_is_required(self):
+        import copy
+        self.observe()
+        for field,value in (('specRef',{'path':'C:/spec.json','sha256':'f'*64}),
+                ('environment',{'path':'C:/other.json','sha256':'b'*64}),
+                ('acceptance',{'path':'C:/other.json','sha256':'c'*64}),
+                ('generation','other'),('s2Generation','other'),('manifestPin',{'bytes':1,'sha256':'f'*64}),
+                ('adapter',{'bytes':1,'sha256':'f'*64})):
+            original=self.context;self.context=copy.deepcopy(original);self.context[field]=value
+            try:
+                with self.subTest(field=field),self.assertRaises(ValueError):self.observe()
+            finally:self.context=original
+
+    def test_root_and_staging_context_changes_are_rejected(self):
+        self.observe()
+        for name in ('context.json','staging/context.json'):
+            self.write(name,{**self.context,'generation':'changed'})
+            with self.subTest(name=name),self.assertRaises(ValueError):self.observe()
+            self.write(name,self.context)
+
+    def test_missing_or_failed_completion_and_duplicate_owner_nonce_rejected(self):
+        self.observe()
+        for role in ('handoff','harness'):
+            path=self.base/'operations'/role/'complete.json';raw=path.read_bytes();path.unlink()
+            with self.subTest(role=role),self.assertRaises((ValueError,OSError)):self.observe()
+            path.write_text(json.dumps({'status':'failed','context':self.context}))
+            with self.assertRaises(ValueError):self.observe()
+            path.write_bytes(raw)
+        self.write('operations/harness/owner.json',{'context':self.context,'nonce':'d'*32})
+        with self.assertRaises(ValueError):self.observe()
+
+    def test_member_record_pin_nonce_action_and_extra_history_rejected(self):
+        self.observe();path=self.base/'operations/handoff/member-0.json';original=json.loads(path.read_bytes())
+        for key,value in (('sha256','f'*64),('bytes',8),('operationNonce','f'*32),('action','export'),('possibleSurvivors',True)):
+            path.write_text(json.dumps({**original,key:value}))
+            with self.subTest(key=key),self.assertRaises(ValueError):self.observe()
+            path.write_text(json.dumps(original))
+        extra=self.base/'operations/handoff/member-00.json';extra.write_text(json.dumps(original))
+        with self.assertRaises(ValueError):self.observe()
+
+    def test_same_byte_member_replacement_changes_observation_and_symlink_rejected(self):
+        first=self.observe();path=self.base/'operations/handoff/member-0.json';raw=path.read_bytes()
+        saved=self.base/'saved-member';path.rename(saved);path.write_bytes(raw)
+        self.assertNotEqual(first,self.observe())
+        path.unlink();path.symlink_to(saved)
+        with self.assertRaises((ValueError,OSError)):self.observe()
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'Linux phase controls; external daemon seams mocked')
+class SourceCachePhaseTests(unittest.TestCase):
+    """Real original import/cache inputs; privileged runtime is an explicit seam."""
+    def setUp(self):
+        self.data=SourceCacheInputTests();self.data.setUp();self.addCleanup(self.data.doCleanups)
+        self.calls=[]
+        d=self.data; self.base=d.base;self.imported,self.import_receipt=d.fixture.imported()
+        self.spec={**d.spec,'generation':'s3-control','environment':{'path':'C:/environment.json','sha256':'b'*64},
+                   'harness':{'path':'C:/harness','manifestSha256':'c'*64},
+                   'limits':{'hostReserveBytes':1,'linuxReserveBytes':1,'exportMaxBytes':1024**3,
+                             'phaseTimeoutSeconds':60,'transferTimeoutSeconds':60}}
+        self.handle={'generation':'s2-control'}
+        self.wrapper={'identity':{'endpoint':'unix:///run/s2-control/docker.sock'},
+                      'pins':{'wrapper':{'path':'/control/wrapper'}}}
+        self.host={'specSha256':'a'*64,'environment':self.spec['environment'],'s2Generation':'s2-control',
+                   'generation':'s3-control','availableBytes':100*1024**3,
+                   'vhd':{'path':'C:/data.vhdx','bytes':200,'device':3,'inode':4}}
+        self.host_file=self.base/'host-capacity.json'; self.host_file.write_text(json.dumps(self.host))
+        self.host_ref={'path':str(self.host_file),'sha256':hashlib.sha256(self.host_file.read_bytes()).hexdigest()}
+        self.paths={'archive':d.fixture.archive,'harness':self.base/'harness','output':self.base/'phase'}
+        self.paths['harness'].mkdir()
+        self.cache={'status':'developer-cache-restored-consumers-readonly-verified','validationKind':'actual-docker',
+                    'descriptorSha256':d.cache_pin,'volumeName':'e'*64,'cargoVolume':'owned-cargo',
+                    'gradleVolume':'owned-gradle','restore':{'status':'payload-restored'},
+                    'readonlyVerify':{'status':'payload-readonly-verified','statvfsReadOnly':True},
+                    'projection':{'status':'consumer-projection-verified','sourceBeforeAfterMatched':True},
+                    'consumerVerify':{'status':'consumer-readonly-content-verified','statvfsReadOnly':True},
+                    'formalQualification':False,'finalSystemAccepted':False,'guestStarted':False,'resourcesPreserved':True}
+
+    def invoke(self, *, corrupt=None, reopen=None, cache=None, space=None, closures=None):
+        self.assertTrue(hasattr(target,'_source_cache_phase'),'Task4 source/cache phase missing')
+        import contextlib, developer_cache, kotlin_delivery
+        self.engine=mock.Mock();self.engine.volumes={'owned-import':{}};self.engine.containers=[]
+        self.engine.docker='/control/wrapper'
+        self.engine.register.side_effect=lambda name,*args,**kw:{'Name':name,'Driver':'local','Mountpoint':str(self.base)}
+        self.calls=[]
+        def restore(engine, paths, spec):
+            self.calls.append(('import',str(paths['archive']),spec['handoff'].copy()))
+            return self.imported,self.import_receipt
+        def reopened(engine,paths,spec,root):
+            self.calls.append(('reopen',str(root)))
+            if corrupt:corrupt()
+            return reopen or {'status':'handoff-and-source-readonly-reopened',
+                'archiveSha256':self.spec['handoff']['sha256'],'handoffSha256':self.spec['handoff']['manifestSha256'],
+                'sourceDescriptorSha256':self.spec['handoff']['sourceDescriptorSha256'],
+                'formalQualification':False,'finalSystemAccepted':False,'coldBuildExecuted':False}
+        def cache_restore(inputs,pin,output,docker):
+            self.calls.append(('cache',str(inputs),pin,docker))
+            return cache or self.cache
+        with contextlib.ExitStack() as stack:
+            if hasattr(target,'_completed_transfers'):
+                stack.enter_context(mock.patch.object(target,'_completed_transfers',side_effect=closures,
+                                                      return_value={'isolatedControl':True}))
+            stack.enter_context(mock.patch.object(target,'_phase_paths',return_value=self.paths))
+            stack.enter_context(mock.patch.object(target,'wrapper_pins',return_value={'admission':{'controlOnly':True}}))
+            stack.enter_context(mock.patch.object(target,'_guest_harness',return_value={'bytes':10,'controlOnly':True}))
+            stack.enter_context(mock.patch.object(target,'_linux_space',return_value=space or {'filesystemType':0xef53,
+                'device':7,'availableBytes':100*1024**3,'mountinfo':'7 / ext4 rw','inode':9,'path':str(self.base)}))
+            stack.enter_context(mock.patch.object(target,'_PhaseEngine',return_value=self.engine))
+            stack.enter_context(mock.patch.object(target,'_restore_source',side_effect=restore))
+            stack.enter_context(mock.patch.object(target,'_reopen_source',side_effect=reopened))
+            stack.enter_context(mock.patch.object(target,'_reverify_consumers',return_value=self.cache['consumerVerify']))
+            stack.enter_context(mock.patch.object(target,'_cache_manager_identity',side_effect=lambda record:contextlib.nullcontext()))
+            stack.enter_context(mock.patch.object(developer_cache,'restore',side_effect=cache_restore))
+            stack.enter_context(mock.patch.object(kotlin_delivery,'run',side_effect=AssertionError('Task4 must never compile')))
+            arguments={'spec_sha256':'a'*64,'host_observation':self.host_ref,'output':self.paths['output']}
+            import inspect
+            if 'transfer_context' in inspect.signature(target._source_cache_phase).parameters:
+                arguments['transfer_context']={'isolatedControl':True}
+            return target._source_cache_phase(self.spec,self.handle,self.wrapper,**arguments)
+
+    def test_transfer_completion_failure_precedes_output_and_docker(self):
+        self.assertTrue(hasattr(target,'_completed_transfers'),'Task4 missing completed transfer closure check')
+        with self.assertRaises(ValueError):self.invoke(closures=ValueError('incomplete accepted transfer'))
+        self.assertEqual(self.calls,[]);self.assertFalse(self.paths['output'].exists())
+
+    def test_changed_transfer_context_during_phase_retains_failure(self):
+        self.assertTrue(hasattr(target,'_completed_transfers'),'Task4 missing completed transfer closure check')
+        observations=iter([{'first':True},{'changed':True}])
+        with self.assertRaises(ValueError):self.invoke(closures=lambda *a,**kw:next(observations))
+        receipt=json.loads((self.paths['output']/'result.json').read_bytes())
+        self.assertEqual(receipt['status'],'failed');self.assertTrue(receipt['resourcesPreserved'])
+
+    def test_phase_orders_real_input_checks_import_independent_reopen_and_cache(self):
+        result=self.invoke()
+        self.assertEqual(result['status'],'source-cache-phase-completed')
+        self.assertEqual([row[0] for row in self.calls],['import','reopen','cache'])
+        self.assertEqual(self.calls[0][2],self.spec['handoff'])
+        self.assertEqual(self.calls[-1][1],str(self.imported/'delivery/rebuild-inputs/cache'))
+        self.assertEqual(self.calls[-1][3],'/control/wrapper')
+        self.assertEqual(result['sourceRepo'],str(self.imported/'source-repo'))
+        self.assertEqual(result['endpoint'],'unix:///run/s2-control/docker.sock')
+        self.assertEqual(result['ownedVolumes'],['e'*64,'owned-cargo','owned-gradle','owned-import'])
+        self.assertEqual(result['cargoReservedFor'],'S4')
+        self.assertTrue(result['resourcesPreserved']);self.assertFalse(result['coldBuildExecuted'])
+
+    def test_descriptor_mismatch_stops_before_first_docker_or_output_allocation(self):
+        self.spec['cacheDescriptorSha256']='0'*64
+        with self.assertRaises(ValueError): self.invoke()
+        self.assertEqual(self.calls,[])
+        self.assertFalse(self.paths['output'].exists())
+
+    def test_source_mutation_after_reopen_fails_and_retains_resources(self):
+        with self.assertRaises(ValueError):
+            self.invoke(corrupt=lambda:(self.imported/'source-repo/LICENSE').write_bytes(b'changed'))
+        receipt=json.loads((self.paths['output']/'result.json').read_bytes())
+        self.assertEqual(receipt['status'],'failed');self.assertTrue(receipt['resourcesPreserved'])
+        self.assertEqual(receipt['endpoint'],'unix:///run/s2-control/docker.sock')
+        self.assertEqual(receipt['ownedVolumes'],['owned-import'])
+        self.assertEqual([row[0] for row in self.calls],['import','reopen'])
+        self.assertTrue((self.imported/'source-repo/LICENSE').exists())
+
+    def test_missing_cache_ro_result_never_reaches_completed_phase(self):
+        bad={**self.cache,'consumerVerify':{'status':'consumer-readonly-content-verified','statvfsReadOnly':False}}
+        with self.assertRaises(ValueError):self.invoke(cache=bad)
+        receipt=json.loads((self.paths['output']/'result.json').read_bytes())
+        self.assertEqual(receipt['status'],'failed')
+        self.assertEqual(receipt['ownedVolumes'],['e'*64,'owned-cargo','owned-gradle','owned-import'])
+        self.assertTrue(receipt['resourcesPreserved'])
+
+    def test_baseline_mutation_after_reopen_stops_before_cache_docker(self):
+        with self.assertRaises(ValueError):
+            self.invoke(corrupt=lambda:(self.imported/'delivery/rebuild-inputs/cache/gradle-baseline.json').write_bytes(b'{}'))
+        self.assertEqual([row[0] for row in self.calls],['import','reopen'])
+        self.assertEqual(json.loads((self.paths['output']/'result.json').read_bytes())['status'],'failed')
+
+    def test_changed_host_capacity_pin_fails_before_docker(self):
+        self.host_file.write_bytes(b'{}')
+        with self.assertRaises(ValueError):self.invoke()
+        self.assertEqual(self.calls,[])
+        self.assertFalse(self.paths['output'].exists())
+
+    def test_non_ext4_or_exhausted_linux_stops_before_docker(self):
+        for filesystem,available in [(0x9fa0,100*1024**3),(0xef53,1)]:
+            with self.subTest(filesystem=filesystem,available=available),self.assertRaises(ValueError):
+                self.invoke(space={'filesystemType':filesystem,'device':7,'availableBytes':available,
+                                   'mountinfo':'retained raw','inode':9,'path':str(self.base)})
+            self.assertEqual(self.calls,[])
+            self.assertFalse(self.paths['output'].exists())
+
+
+class SourceCacheReceiptTests(unittest.TestCase):
+    def feature(self,name):
+        self.assertTrue(hasattr(target,name),'Task4 missing '+name)
+        return getattr(target,name)
+
+    def test_cache_receipt_requires_all_independent_readonly_receipts(self):
+        check=self.feature('_cache_result')
+        good={'status':'developer-cache-restored-consumers-readonly-verified',
+              'validationKind':'actual-docker','descriptorSha256':'a'*64,
+              'volumeName':'e'*64,'cargoVolume':'owned-cargo','gradleVolume':'owned-gradle',
+              'restore':{'status':'payload-restored'},'readonlyVerify':{'status':'payload-readonly-verified','statvfsReadOnly':True},
+              'projection':{'status':'consumer-projection-verified','sourceBeforeAfterMatched':True},
+              'consumerVerify':{'status':'consumer-readonly-content-verified','statvfsReadOnly':True},
+              'formalQualification':False,'finalSystemAccepted':False,'guestStarted':False,'resourcesPreserved':True}
+        self.assertEqual(check(good,'a'*64),good)
+        import copy
+        for field in ('restore','readonlyVerify','projection','consumerVerify'):
+            bad=copy.deepcopy(good);del bad[field]
+            with self.subTest(field=field), self.assertRaises(ValueError):check(bad,'a'*64)
+        for key,value in [('statvfsReadOnly',False),('statvfsReadOnly',1)]:
+            bad=copy.deepcopy(good);bad['consumerVerify'][key]=value
+            with self.assertRaises(ValueError):check(bad,'a'*64)
+        for key,value in [('validationKind','fake-control'),('cargoVolume','owned-gradle')]:
+            with self.assertRaises(ValueError):check({**good,key:value},'a'*64)
+
+    def test_effective_worker_policy_rejects_privilege_network_cgroup_and_rw_input(self):
+        check=self.feature('_check_effective_worker')
+        observed={'uid':65534,'gid':65534,'interfaces':['lo'],
+                  'status':'CapEff:\t0000000000000000\nCapPrm:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\n',
+                  'memoryMax':'4294967296','pidsMax':'256','cpuMax':'200000 100000',
+                  'readOnly':{'/':True,'/harness':True,'/archive/handoff.tar':True,'/imported':True},
+                  'mountinfo':'retained raw mountinfo'}
+        self.assertEqual(check(observed,['/','/harness','/archive/handoff.tar','/imported']),observed)
+        import copy
+        for key,value in [('uid',0),('gid',0),('interfaces',['lo','eth0']),('pidsMax','128'),
+                          ('memoryMax','max'),('cpuMax','max 100000'),
+                          ('status',observed['status'].replace('Seccomp:\t2','Seccomp:\t0'))]:
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                check({**observed,key:value},['/','/harness','/archive/handoff.tar','/imported'])
+        bad=copy.deepcopy(observed);bad['readOnly']['/imported']=False
+        with self.assertRaises(ValueError):check(bad,['/','/harness','/archive/handoff.tar','/imported'])
+        root={**observed,'uid':0,'gid':0,'status':observed['status'].replace('0000000000000000','0000000000000001')}
+        check(root,['/','/harness'],root=True)
+        with self.assertRaises(ValueError):check({**root,'status':root['status'].replace('0000000000000001','0000000000000003')},['/','/harness'],root=True)
+
+    def test_independent_reopen_worker_mounts_archive_harness_and_import_readonly(self):
+        function=self.feature('_reopen_source')
+        import developer_cache
+        engine=mock.Mock();engine.container.return_value=('d'*64,json.dumps({
+            'result':{'status':'handoff-and-source-readonly-reopened'},'effective':{'control':True}}).encode())
+        engine.evidence.receipt={}
+        paths={'archive':Path('/fixed/handoff.tar'),'harness':Path('/fixed/harness')}
+        spec={'handoff':{'sha256':'a'*64,'manifestSha256':'b'*64,'sourceDescriptorSha256':'c'*64}}
+        with mock.patch.object(target,'_check_effective_worker',return_value=None):
+            function(engine,paths,spec,Path('/fixed/imported'))
+        args=engine.container.call_args.args
+        self.assertEqual(args[0],'reopen-source')
+        mounts=args[1]
+        self.assertEqual({m['target'] for m in mounts},{'/archive/handoff.tar','/harness','/imported'})
+        self.assertTrue(all(m['readonly'] for m in mounts))
+        self.assertIn('reopen',args[2]);self.assertIn('a'*64,args[2]);self.assertIn('b'*64,args[2]);self.assertIn('c'*64,args[2])
+
+    def test_cache_reverify_keeps_prior_source_container_ledger(self):
+        function=self.feature('_reverify_consumers')
+        engine=mock.Mock();engine.containers=[{'cid':'a'*64,'role':'import-source'}]
+        engine.evidence.receipt={'containers':engine.containers}
+        cache_engine=mock.Mock();cache_engine.containers=[]
+        def run(*args):
+            cache_engine.containers.append({'cid':'b'*64,'role':'reverify-cache-consumers'})
+            engine.evidence.receipt['containers']=cache_engine.containers
+            return 'b'*64,json.dumps({'effective':{},'result':{
+                'status':'consumer-readonly-content-verified','statvfsReadOnly':True}}).encode()
+        cache_engine.container.side_effect=run
+        result={'volumeName':'c'*64,'cargoVolume':'cargo','gradleVolume':'gradle','descriptorSha256':'d'*64}
+        with mock.patch.object(target._cache,'Engine',return_value=cache_engine), \
+                mock.patch.object(target,'_check_effective_worker'):
+            function(engine,{'harness':Path('/harness')},Path('/inputs'),result)
+        self.assertEqual(engine.evidence.receipt['containers'],[
+            {'cid':'a'*64,'role':'import-source'},{'cid':'b'*64,'role':'reverify-cache-consumers'}])
+
+    def test_cancelled_cache_restore_reads_durable_snapshot_without_final_result(self):
+        function=self.feature('_cache_failure_observation')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            snapshot={'volumeName':'a'*64,'containers':[{'cid':'b'*64,'role':'project'}]}
+            (root/'receipt-0001-initial.json').write_text('{}')
+            (root/'receipt-0002-progress.json').write_text(json.dumps(snapshot))
+            self.assertEqual(function(root),snapshot)
+            log=root/'operation-001.stdout.log';log.write_bytes(('c'*64+'\n').encode('ascii'))
+            snapshot['operations']=[{'command':['/wrapper','create','--network','none'],
+                'exitCode':None,'stdoutPath':str(log)}]
+            (root/'receipt-0002-progress.json').write_text(json.dumps(snapshot))
+            observed=function(root)
+            self.assertEqual(observed['operations'][0]['retainedAllocationStdout'],'c'*64+'\n')
+            self.assertIn('retainedAllocationLogIdentity',observed['operations'][0])
+            (root/'result.json').write_bytes(b' '*(8*1024**2+1))
+            with self.assertRaises(ValueError):function(root)
+
+    def test_capacity_rejects_wrong_filesystem_device_low_space_and_host_context(self):
+        check=self.feature('_check_source_cache_capacity')
+        budget={'linuxTotalBytes':2000,'linuxAdditionalBytes':1000,'alreadyRetainedBytes':1000,
+                'hostRequiredBytes':90,'kotlinPrepareMinimumBytes':8*1024**3}
+        host={'specSha256':'a'*64,'environment':{'path':'C:/environment.json','sha256':'b'*64},
+              's2Generation':'s2','generation':'s3','availableBytes':100,'vhd':{'path':'C:/data.vhdx','bytes':200,'device':3,'inode':4}}
+        linux={'filesystemType':0xef53,'device':7,'availableBytes':1000,'mountinfo':'7 / ext4 rw',
+               'path':'/var/lib/s2','inode':9}
+        self.assertEqual(check(budget,host,linux,spec_sha256='a'*64,environment=host['environment'],
+                               s2_generation='s2',generation='s3',expected_device=7),linux)
+        import copy
+        for field,value in [('filesystemType',0x9fa0),('device',8),('availableBytes',999)]:
+            with self.subTest(field=field),self.assertRaises(ValueError):
+                check(budget,host,{**linux,field:value},spec_sha256='a'*64,environment=host['environment'],
+                      s2_generation='s2',generation='s3',expected_device=7)
+        for field,value in [('specSha256','c'*64),('generation','other'),('availableBytes',89),('vhd',None)]:
+            with self.subTest(field=field),self.assertRaises(ValueError):
+                check(budget,{**host,field:value},linux,spec_sha256='a'*64,environment=host['environment'],
+                      s2_generation='s2',generation='s3',expected_device=7)
+
+
+class SourceHostCapacityTests(unittest.TestCase):
+    """Actual Windows disk/file observations; fixture file is not an accepted VHD."""
+    def test_native_host_observation_measures_free_space_and_preserves_growing_vhd_identity(self):
+        self.assertTrue(hasattr(target,'_observe_host_capacity'),'Task4 host observer missing')
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);vhd=root/'control.vhdx';vhd.write_bytes(b'abc')
+            info=vhd.stat()
+            accepted={'path':str(vhd),'bytes':2,'device':info.st_dev,'inode':info.st_ino}
+            spec={'generation':'s3-control','environment':{'path':str(root/'environment.json'),'sha256':'b'*64}}
+            if os.name!='nt':
+                with self.assertRaises(ValueError):target._observe_host_capacity(spec,'a'*64,'s2-control',accepted)
+                return
+            first=target._observe_host_capacity(spec,'a'*64,'s2-control',accepted)
+            self.assertEqual(first['specSha256'],'a'*64)
+            self.assertEqual(first['environment'],spec['environment'])
+            self.assertEqual(first['s2Generation'],'s2-control');self.assertEqual(first['generation'],'s3-control')
+            self.assertEqual(first['vhd'],{**accepted,'bytes':3})
+            self.assertGreater(first['availableBytes'],0)
+            import shutil
+            self.assertLessEqual(first['availableBytes'],shutil.disk_usage(root).total)
+            vhd.write_bytes(b'abcde')
+            second=target._observe_host_capacity(spec,'a'*64,'s2-control',accepted)
+            self.assertEqual(second['vhd'],{**accepted,'bytes':5})
+            for key,value in [('inode',info.st_ino+1),('device',info.st_dev+1),('bytes',6),('bytes',True),
+                              ('path',str(root)+'/../'+root.name+'/control.vhdx')]:
+                with self.subTest(key=key,value=value),self.assertRaises(ValueError):
+                    target._observe_host_capacity(spec,'a'*64,'s2-control',{**accepted,key:value})
+            directory=root/'target';directory.mkdir();(directory/'alias.vhdx').write_bytes(b'abc')
+            junction=root/'junction'
+            made=subprocess.run(['cmd','/c','mklink','/J',str(junction),str(directory)],capture_output=True)
+            self.assertEqual(made.returncode,0,made.stderr.decode(errors='replace'))
+            try:
+                alias=directory/'alias.vhdx';identity=alias.stat()
+                linked={'path':str(junction/'alias.vhdx'),'bytes':3,'device':identity.st_dev,'inode':identity.st_ino}
+                with self.assertRaises(ValueError):target._observe_host_capacity(spec,'a'*64,'s2-control',linked)
+            finally:os.rmdir(junction)
+            vhd.rename(root/'retained-original.vhdx');vhd.write_bytes(b'abcde')
+            with self.assertRaises(ValueError):target._observe_host_capacity(spec,'a'*64,'s2-control',accepted)
+            vhd.unlink();vhd.mkdir()
+            with self.assertRaises(ValueError):target._observe_host_capacity(spec,'a'*64,'s2-control',accepted)
+
+
+class CacheManagerIdentityTests(unittest.TestCase):
+    """Root positive runs separately in a controller-owned management fixture.
+
+    This is never a payload-worker confinement test or actual S2 admission.
+    """
+    def test_manager_identity_rejects_non_linux_or_nonroot(self):
+        self.assertTrue(hasattr(target,'_cache_manager_identity'),'Task4 cache manager identity missing')
+        record={}
+        if sys.platform!='linux' or os.geteuid()!=0:
+            with self.assertRaises(ValueError):
+                with target._cache_manager_identity(record):self.fail('unqualified identity entered')
+        else:
+            # A root controller runs the real positive/exception controls below.
+            with tempfile.TemporaryDirectory() as temp:
+                with target._cache_manager_identity(record):
+                    path=Path(temp)/'owned';path.mkdir(mode=0o700)
+                self.assertEqual((path.stat().st_uid,path.stat().st_gid),(65534,65534))
+            self.assertEqual(record['before'],record['after'])
+
+    def test_root_manager_real_fs_creation_exception_restoration_and_no_cap_expansion(self):
+        self.assertTrue(hasattr(target,'_cache_manager_identity'),'Task4 cache manager identity missing')
+        if sys.platform!='linux' or os.geteuid()!=0:
+            with self.assertRaises(ValueError):
+                with target._cache_manager_identity({}):pass
+            return
+        import ctypes
+        libc=ctypes.CDLL(None,use_errno=True)
+        def actual():
+            status=Path('/proc/self/status').read_text()
+            caps={line.split(':',1)[0]:line.split(':',1)[1].strip()
+                  for line in status.splitlines() if line.startswith(('CapInh:','CapPrm:','CapEff:','CapBnd:','CapAmb:'))}
+            return {'resuid':list(os.getresuid()),'resgid':list(os.getresgid()),
+                    'fsuid':libc.setfsuid(-1),'fsgid':libc.setfsgid(-1),'capabilities':caps}
+        before=actual()
+        with tempfile.TemporaryDirectory() as temp:
+            for failure in (False,True):
+                record={};directory=Path(temp)/('failure' if failure else 'success')
+                try:
+                    with target._cache_manager_identity(record):
+                        during=actual()
+                        self.assertEqual(during['resuid'],before['resuid'])
+                        self.assertEqual(during['resgid'],before['resgid'])
+                        self.assertEqual((during['fsuid'],during['fsgid']),(65534,65534))
+                        self.assertEqual(during['capabilities'],before['capabilities'])
+                        directory.mkdir(mode=0o700)
+                        file=directory/'helper.py';fd=os.open(file,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+                        os.write(fd,b'control');os.fsync(fd);os.close(fd)
+                        self.assertEqual((directory.stat().st_uid,directory.stat().st_gid,directory.stat().st_mode&0o777),(65534,65534,0o700))
+                        self.assertEqual((file.stat().st_uid,file.stat().st_gid,file.stat().st_mode&0o777),(65534,65534,0o600))
+                        self.assertEqual(record['before'],before);self.assertEqual(record['during'],during)
+                        if failure:raise RuntimeError('retained fixture failure')
+                except RuntimeError as error:
+                    self.assertTrue(failure);self.assertEqual(str(error),'retained fixture failure')
+                self.assertEqual(actual(),before)
+                self.assertEqual(record['after'],before)
+                self.assertTrue(file.exists())
+
+    def test_manager_identity_cannot_run_on_another_thread(self):
+        self.assertTrue(hasattr(target,'_cache_manager_identity'),'Task4 cache manager identity missing')
+        import threading
+        results=[]
+        def run():
+            try:
+                with target._cache_manager_identity({}):results.append('incorrectly-entered')
+            except ValueError:results.append('rejected')
+        thread=threading.Thread(target=run);thread.start();thread.join(timeout=5)
+        self.assertFalse(thread.is_alive());self.assertEqual(results,['rejected'])
+
+
+class SourceWorkerConfinementTests(unittest.TestCase):
+    """Synthetic Docker inspections, independently checked against requested flags."""
+    def engine(self, *, drift=False):
+        self.assertTrue(hasattr(target,'_PhaseEngine'),'Task4 worker engine missing')
+        from test_developer_cache import FakeEvidence
+        class Evidence(FakeEvidence):
+            def run(self,key,command,timeout,**kwargs):
+                raw=super().run(key,command,timeout,**kwargs)
+                args=command[1:]
+                if args[0]=='create':
+                    self.item['HostConfig']['PidsLimit']=int(args[args.index('--pids-limit')+1])
+                    value=args[args.index('--tmpfs')+1];mount,options=value.split(':',1)
+                    self.item['HostConfig']['Tmpfs']={mount:options}
+                return raw
+        evidence=Evidence(drift=drift)
+        engine=target._PhaseEngine(evidence,'b'*32,'/control/wrapper',timeout=60)
+        engine.volumes['owned-output']={}
+        return engine,evidence
+
+    def test_import_worker_uses_256_pids_bounded_tmpfs_retained_and_no_caps(self):
+        import developer_cache as cache
+        engine,evidence=self.engine()
+        engine.container('import-source',[cache.mount('volume','owned-output','/output')],
+                         ['-I','-B','/harness/scripts/boot/source_build_guest.py','import'])
+        created=next(command for key,command in evidence.calls if key=='import-source-create')
+        for flag,value in [('--network','none'),('--user','65534:65534'),('--cpus','2'),
+                           ('--memory','4g'),('--pids-limit','256'),('--cap-drop','ALL'),
+                           ('--security-opt','no-new-privileges'),('--tmpfs','/tmp:rw,nosuid,nodev,size=64m,mode=1777')]:
+            self.assertEqual(created[created.index(flag)+1],value)
+        self.assertIn('--read-only',created);self.assertNotIn('--cap-add',created)
+        self.assertNotIn('--rm',created)
+        self.assertEqual(evidence.calls[-1][0],'import-source-inspect-after')
+        self.assertFalse(any(command[1] in ('rm','rmi','pull','build') for _,command in evidence.calls))
+
+    def test_initializer_capability_is_chown_only_and_drift_prevents_execution(self):
+        import developer_cache as cache
+        engine,evidence=self.engine()
+        engine.container('initialize-source',[cache.mount('volume','owned-output','/output')],
+                         ['-I','-B','/harness/scripts/boot/source_build_guest.py','initialize'],root=True)
+        created=next(command for key,command in evidence.calls if key=='initialize-source-create')
+        self.assertEqual(created[created.index('--user')+1],'0:0')
+        self.assertEqual(created[created.index('--cap-add')+1],'CHOWN')
+        self.assertEqual(created.count('--cap-add'),1)
+        engine,evidence=self.engine(drift=True)
+        with self.assertRaises(ValueError):
+            engine.container('import-source',[],['-I','-B','/harness/scripts/boot/source_build_guest.py','import'])
+        self.assertFalse(any(command[1]=='start' for _,command in evidence.calls))
+
+
 if __name__ == '__main__': unittest.main()
