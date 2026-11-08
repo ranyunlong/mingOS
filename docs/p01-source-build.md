@@ -30,6 +30,10 @@ Linux容器使用固定Tools镜像、只读根/代码、禁网、UID/GID65534、
 
 Task 2设计已明确固定spec进入传输/完整harness接口、输入阶段双份容量预算、独立观察证据例外和失败代锁定，并通过独立接口复核；传输实现尚未验收。观察bootstrap/adapter独立冻结，不能依赖尚未传输的harness；S2 helper保持原字节。
 
+adapter字节权限链已补充独立设计复核PASS：外部固定spec绑定原HOST harness manifest中的`wsl_environment_transfer.py`固定角色，safe-open本机模块并核对大小/摘要，冻结内嵌loader和实际argv，再在guest准入证据目录中核验安装字节后导入。它不依赖未完成的guest harness，也不增加独立pin文件或spec字段。
+
+开发检查点`artifacts/p01-s3-task2-controls-20261108-042dfe82/result.json`保留冻结源码、精确容器及状态：真实Linux管道/进程控制10/10、零跳过/失败/错误，exit0，1.086秒。该容器仅为root-owned Unix socket控制夹具，使用capdropALL/NNP/只读根及代码/禁网/2CPU/4GiB/256pids；不作为实际S3受限worker验收。同一冻结副本在Windows执行主机二进制管道、超时和adapter角色拒绝控制3/3，exit0，0.329秒，记录为`.superpowers/sdd/2026-11-08-p01-source-build/task-2-host-core-b1640e17/`。当时公开入口和bootstrap尚未完成，已知监督与持久登记工作继续；这不是Task2完整GREEN、源码审查或实际传输验收。
+
 Tasks 2–7仍须完成受限传输、seal及真实Docker wrapper、原源码/缓存恢复、两profile六次真实Kotlin编译、工具字节核验、独立只读回放、封存导出、完整编排和实际S3验收。随后还有S4冷构建、S5装包、S6端到端安装及保存重开。11项目总交付仍0/11。
 
 `formalQualification=false`、`finalSystemAccepted=false`、`coldBuildExecuted=false`、`guestStarted=false`。完整项目状态见[未交付总表](undelivered-projects.md)，变更见[changelog](changelog.md)。
