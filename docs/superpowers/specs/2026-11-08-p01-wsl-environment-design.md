@@ -41,6 +41,8 @@ CLI `create` 显式接受 `--generation --distro --output-directory --wsl-execut
 
 `exec` 是后续 S3–S6 的 Linux argv transport，不把 `C:\...` 转为 `/mnt/c/...`。Windows source/handoff 使用二进制 stdin transfer；guest 源码实际路径由后续 S1 消费/恢复决定并显式传入冷构建，S2 不调用当前依赖 Windows 路径的 `cold-boot.py`，不预先替它宣称 Linux 支持。
 
+guest内部生命周期接口为`launch_environment(generation: str, *, ready_timeout=30) -> dict`，只从generation派生本代路径；`admit_environment(handle: dict, argv: list[str], *, timeout=30)`验证身份、让helper进入management后再次验证，再执行显式Linux argv并返回`subprocess.CompletedProcess`。controller内部`create_empty_environment`接收与完整create相同的关键字参数，初始阶段成功仍只返回`creating/empty-daemon-observed`；它不是最终ready入口。
+
 ## 创建过程与隔离
 
 1. 创建前完成参数、输入、Tools、WSL能力、目标 distro 不存在及冻结代码核验。输出目录以 exclusive mkdir 占用，一旦存在绝不复用。先落盘请求及外层 daemon/context/image/container/volume 基线，所有命令保存 argv、timeout、stdin SHA/size、stdout/stderr、exitCode 和时间；捕获超时/异常也落盘。

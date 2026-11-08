@@ -98,7 +98,7 @@ def validate_parameters(generation,distro,paths=()):
         raise ValueError('invalid generation/distro')
     for path in paths: _safe_path(path)
 
-def capture(directory,key,argv,*,timeout,stdin=None):
+def capture(directory,key,argv,*,timeout,stdin=None,environment=None):
     if not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]*',key): raise ValueError('invalid operation key')
     directory=_safe_path(directory)
     handles=[]
@@ -114,7 +114,7 @@ def capture(directory,key,argv,*,timeout,stdin=None):
         _json(command,{'argv':list(argv),'timeout':timeout,'stdin':pin,'started':time.time()})
         record={'exitCode':None,'processMayRemain':False}
         try:
-            completed=subprocess.run(argv,stdin=stdin,stdout=stdout,stderr=stderr,timeout=timeout,shell=False)
+            completed=subprocess.run(argv,stdin=stdin,stdout=stdout,stderr=stderr,timeout=timeout,shell=False,env=environment)
             record['exitCode']=completed.returncode
             return completed
         except (OSError,subprocess.TimeoutExpired) as error:
@@ -199,3 +199,128 @@ def prepare_rootfs(export_path,bundle_path,output_path):
         output.flush(); os.fsync(output.fileno())
     with output_path.open('rb') as stream: rootfs_pin=_hash(stream)
     return {'export':export_pin,'bundle':bundle_pin,'rootfs':rootfs_pin,'binaries':dict(BINARY_PINS)}
+
+
+def validate_tools_image(image,verified):
+    expected={'Id':verified['imageId'],'Architecture':'amd64','Os':'linux',
+              'RootFS':{'Type':'layers','Layers':verified['diffIds']},
+              'Config':verified['configObject'].get('config')}
+    descriptor=image.get('Descriptor',{})
+    if (any(image.get(k)!=v for k,v in expected.items()) or descriptor.get('digest')!=verified['imageId']
+            or descriptor.get('mediaType')!='application/vnd.oci.image.index.v1+json'):
+        raise ValueError('outer Tools index/platform/config/rootfs differs from verified archive')
+
+
+def _one(values):
+    if not isinstance(values,list) or len(values)!=1: raise ValueError('one inspection required')
+    return values[0]
+
+
+def _decode_wsl(data):
+    return data.decode('utf-16-le' if b'\0' in data else 'utf-8-sig').replace('\x00','')
+
+
+def create_empty_environment(*,generation,distro,output_directory,wsl_executable,
+                             outer_docker,docker_bundle,archive_root):
+    """Initial private daemon stage only. A returned receipt remains creating.
+
+    All failed generations are retained; this API never retries a claimed output.
+    Full load/smoke and independent observation belong to the later acceptance stage.
+    """
+    import development_image_migration as migration
+    output=_safe_path(output_directory)
+    validate_parameters(generation,distro,[output,wsl_executable,docker_bundle,archive_root])
+    output.mkdir()  # Claim first, before any subprocess or mutable resource.
+    receipt={'schemaVersion':1,'generation':generation,'distro':distro,'status':'creating',
+             'phase':'preflight','formalQualification':False,'finalSystemAccepted':False,
+             'coldBuildExecuted':False,'resourcesPreserved':True,'commands':[]}
+    sink=(output/'environment-result.json').open('xb')
+    def persist():
+        sink.seek(0); sink.truncate(); _json(sink,receipt)
+    def command(key,argv,timeout=60,stdin=None,environment=None):
+        receipt['commands'].append(key); persist()
+        result=capture(output,key,argv,timeout=timeout,stdin=stdin,environment=environment)
+        if result.returncode: raise ValueError('command failed: '+key)
+        return (output/(key+'.stdout.log')).read_bytes()
+    def docker(key,args,timeout=60):
+        from docker_transport import _environment
+        return command(key,outer_docker.argv(args),timeout,environment=_environment())
+    def inspect_many(key,kind,ids):
+        result=[]
+        for offset in range(0,len(ids),64):
+            result.extend(json.loads(docker(key+'-'+str(offset//64),[kind,'inspect',*ids[offset:offset+64]])))
+        return result
+    persist()
+    try:
+        if outer_docker is None or not outer_docker.endpoint.startswith('npipe:////./pipe/'):
+            raise ValueError('explicit outer npipe endpoint required')
+        with _open_input(docker_bundle) as bundle:
+            if _hash(bundle)!={'bytes':BUNDLE_BYTES,'sha256':BUNDLE_SHA256}: raise ValueError('Docker bundle pin mismatch')
+        archives=migration.verify_all(archive_root); receipt['archives']=archives
+        tools=migration.verify_one('tools',archive_root)
+        validate_tools_image(_one(json.loads(docker('tools-inspect',['image','inspect',migration.FIXED['tools']['imageId']]))),tools)
+        command('wsl-status',[str(wsl_executable),'--status'])
+        distros=_decode_wsl(command('wsl-list',[str(wsl_executable),'--list','--quiet'])).splitlines()
+        if distro.casefold() in {name.strip().casefold() for name in distros}: raise ValueError('target distro already exists')
+        here=Path(__file__).resolve().parent
+        helpers=[here/name for name in ('wsl_environment.py','wsl_environment_guest.py','docker_transport.py','development_image_migration.py','qualification_image_archive.py')]
+        manifest=freeze_inputs(helpers,output/'frozen'); verify_frozen(output/'frozen',manifest)
+        receipt['helpers']=manifest
+        outer={'endpoint':outer_docker.endpoint,
+               'info':json.loads(docker('outer-info',['info','--format','{{json .}}'])),
+               'context':docker('outer-context',['context','show']).decode().strip()}
+        outer['imageIds']=sorted(set(docker('outer-image-ids',['image','ls','-q','--no-trunc']).decode().splitlines()))
+        container_ids=sorted(set(docker('outer-container-ids',['ps','-a','-q','--no-trunc']).decode().splitlines()))
+        volume_ids=sorted(set(docker('outer-volume-names',['volume','ls','-q']).decode().splitlines()))
+        outer['images']=inspect_many('outer-images','image',outer['imageIds'])
+        outer['containers']=inspect_many('outer-containers','container',container_ids)
+        outer['volumes']=inspect_many('outer-volumes','volume',volume_ids)
+        receipt['outer']=outer; receipt['phase']='export'; persist()
+        identifier=docker('export-create',['create','--pull','never','--network','none','--restart','no',
+                    '--label','mingos.p01.generation='+generation,migration.FIXED['tools']['imageId']]).decode().strip()
+        if not re.fullmatch('[0-9a-f]{64}',identifier): raise ValueError('full created container ID required')
+        receipt['exportContainerId']=identifier; persist()
+        inspection=_one(json.loads(docker('export-inspect',['container','inspect',identifier])))
+        if (inspection.get('Id')!=identifier or inspection.get('State',{}).get('Running') is not False
+                or inspection.get('Mounts')!=[] or inspection.get('Image')!=tools['imageId']
+                or inspection.get('Config',{}).get('Image')!=tools['imageId']
+                or inspection.get('HostConfig',{}).get('RestartPolicy')!={'Name':'no','MaximumRetryCount':0}
+                or inspection.get('HostConfig',{}).get('AutoRemove') is not False):
+            raise ValueError('export container must be stopped, mount-free and fixed Tools')
+        export=output/'export.tar'
+        # The explicit --output is new and never reused; capture preserves command logs.
+        if export.exists(): raise FileExistsError(export)
+        docker('export',['export','--output',str(export),identifier],300)
+        receipt['rootfs']=prepare_rootfs(export,docker_bundle,output/'rootfs.tar')
+        receipt['phase']='import';persist(); verify_frozen(output/'frozen',manifest)
+        command('wsl-import',[str(wsl_executable),'--import',distro,str(output/'distro'),str(output/'rootfs.tar'),'--version','2'],300)
+        vhds=list((output/'distro').glob('*.vhdx'))
+        if len(vhds)!=1: raise ValueError('one imported VHD required')
+        value=vhds[0].stat(); receipt['vhd']={'path':str(vhds[0]),'bytes':value.st_size,'device':value.st_dev,'inode':value.st_ino}
+        receipt['phase']='launch';persist()
+        helper=output/'launch-guest.py'
+        data=(output/'frozen/wsl_environment_guest.py').read_bytes()+b'\nif __name__ == "__main__":\n import sys\n print(json.dumps(launch_environment(sys.argv[1])))\n'
+        with helper.open('xb') as stream: stream.write(data);stream.flush();os.fsync(stream.fileno())
+        digest=hashlib.sha256(data).hexdigest(); remote='/root/'+generation+'-launch.py'
+        bootstrap=('import os,sys,hashlib; p=sys.argv[1]; n=int(sys.argv[2]); h=sys.argv[3]; '
+                   'd=sys.stdin.buffer.read(n+1); '
+                   'assert len(d)==n and hashlib.sha256(d).hexdigest()==h; '
+                   'root=os.open("/",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); '
+                   'parent=os.open("root",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=root); '
+                   'f=os.open(p.split("/")[-1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,448,dir_fd=parent); '
+                   's=os.fdopen(f,"wb"); s.write(d); s.flush(); os.fsync(s.fileno()); s.close(); '
+                   'os.fsync(parent); os.close(parent); os.close(root)')
+        with helper.open('rb') as stream:
+            command('guest-helper-transfer',[str(wsl_executable),'-d',distro,'--user','root','--exec',
+                '/usr/bin/python3','-c',bootstrap,remote,str(len(data)),digest],stdin=stream)
+        receipt['launcherPin']={'sha256':digest,'bytes':len(data),'path':remote}
+        # Check retained guest bytes immediately before the script-file invocation.
+        command('guest-helper-verify',[str(wsl_executable),'-d',distro,'--user','root','--exec','/usr/bin/python3','-c',
+            'import hashlib,sys; assert hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()==sys.argv[2]',remote,digest])
+        handle=json.loads(command('guest-launch',[str(wsl_executable),'-d',distro,'--user','root','--exec','/usr/bin/python3',remote,generation],90))
+        if handle.get('generation')!=generation: raise ValueError('guest handle generation differs')
+        receipt['handle']=handle;receipt['phase']='empty-daemon-observed';persist()
+        return receipt
+    except BaseException as error:
+        receipt['status']='failed';receipt['error']=repr(error); persist();raise
+    finally: sink.close()

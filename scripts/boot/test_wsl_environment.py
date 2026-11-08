@@ -150,3 +150,84 @@ class FrozenClosureTests(unittest.TestCase):
             self.assertEqual(set(manifest['files']['helper.py']),{'sha256','bytes','mode'})
             (root/'frozen/extra.py').write_bytes(b'extra')
             with self.assertRaises(ValueError): env.verify_frozen(root/'frozen',manifest)
+
+class CreationTests(unittest.TestCase):
+    def test_tools_identity_rejects_each_mismatch(self):
+        verified={'imageId':'sha256:x','diffIds':['sha256:y'],'configObject':{'config':{'User':'root'}}}
+        image={'Id':'sha256:x','Descriptor':{'digest':'sha256:x','mediaType':'application/vnd.oci.image.index.v1+json'},'Architecture':'amd64','Os':'linux','RootFS':{'Type':'layers','Layers':['sha256:y']},'Config':{'User':'root'}}
+        env.validate_tools_image(image,verified)
+        for key,value in [('Id','wrong'),('Config',{}),('RootFS',{}),('Architecture','arm64'),('Descriptor',{})]:
+            changed=dict(image);changed[key]=value
+            with self.subTest(key=key),self.assertRaises(ValueError): env.validate_tools_image(changed,verified)
+    def test_existing_output_fails_before_any_process(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(env.subprocess,'run') as run:
+            with self.assertRaises(FileExistsError):
+                env.create_empty_environment(generation='p01-test',distro='MingOS-P01-test',output_directory=Path(tmp),wsl_executable=Path(sys.executable).resolve(),outer_docker=None,docker_bundle=Path(sys.executable).resolve(),archive_root=Path(tmp))
+            run.assert_not_called()
+
+class LifecycleSequenceTests(unittest.TestCase):
+    def setUp(self):
+        from docker_transport import DockerTransport
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);self.bundle=self.root/'bundle';self.bundle.write_bytes(b'bundle')
+        self.transport=DockerTransport(str(Path(sys.executable).resolve()),'npipe:////./pipe/test',str(self.root/'config'))
+        self.calls=[];self.cid='a'*64
+        import development_image_migration as migration
+        self.tools={'imageId':migration.FIXED['tools']['imageId'],'diffIds':['sha256:y'],'configObject':{'config':{'User':'root'}}}
+        self.image={'Id':self.tools['imageId'],'Descriptor':{'digest':self.tools['imageId'],'mediaType':migration.INDEX},'Architecture':'amd64','Os':'linux','RootFS':{'Type':'layers','Layers':['sha256:y']},'Config':{'User':'root'}}
+        self.missing=False;self.old=False
+        self.old_ids=[]
+    def capture(self,directory,key,argv,**kwargs):
+        self.calls.append((key,argv,kwargs)); value=b''
+        if key=='tools-inspect':
+            if self.missing: raise ValueError('Tools missing')
+            value=json.dumps([self.image]).encode()
+        elif key=='wsl-list': value=(('MingOS-P01-test\n' if self.old else '')).encode('utf-16-le')
+        elif key=='outer-info':value=b'{"ID":"outer"}'
+        elif key=='outer-context':value=b'desktop-linux\n'
+        elif key=='outer-container-ids':value='\n'.join(self.old_ids).encode()
+        elif key.startswith('outer-containers'):value=b'[]'
+        elif key=='export-create':value=self.cid.encode()
+        elif key=='export-inspect':value=json.dumps([{'Id':self.cid,'Image':self.tools['imageId'],'Config':{'Image':self.tools['imageId']},'HostConfig':{'RestartPolicy':{'Name':'no','MaximumRetryCount':0},'AutoRemove':False},'State':{'Running':False},'Mounts':[]}]).encode()
+        elif key=='export':(directory/'export.tar').write_bytes(b'export')
+        elif key=='wsl-import':
+            (directory/'distro').mkdir();(directory/'distro/ext4.vhdx').write_bytes(b'vhd')
+        elif key=='guest-launch':value=b'{"generation":"p01-test","pid":42}'
+        (directory/(key+'.stdout.log')).write_bytes(value)
+        return subprocess.CompletedProcess(argv,0)
+    def create(self):
+        import development_image_migration as migration
+        def prepare(a,b,c):c.write_bytes(b'rootfs');return {'rootfs':{'sha256':'fake'}}
+        with patch.object(env,'BUNDLE_BYTES',6),patch.object(env,'BUNDLE_SHA256',hashlib.sha256(b'bundle').hexdigest()),patch.object(env,'capture',side_effect=self.capture),patch.object(env,'prepare_rootfs',side_effect=prepare),patch.object(migration,'verify_all',return_value={'images':[self.tools]}),patch.object(migration,'verify_one',return_value=self.tools):
+            return env.create_empty_environment(generation='p01-test',distro='MingOS-P01-test',output_directory=self.root/'output',wsl_executable=Path(sys.executable).resolve(),outer_docker=self.transport,docker_bundle=self.bundle,archive_root=self.root)
+    def test_sequence_stopped_inspected_id_only_and_no_destructive_calls(self):
+        receipt=self.create();names=[k for k,_,_ in self.calls]
+        self.assertEqual(receipt['status'],'creating');self.assertEqual(receipt['phase'],'empty-daemon-observed')
+        self.assertLess(names.index('export-inspect'),names.index('export'))
+        self.assertLess(names.index('outer-info'),names.index('export-create'))
+        export=next(argv for key,argv,_ in self.calls if key=='export');self.assertEqual(export[-1],self.cid)
+        for key,argv,options in self.calls:
+            self.assertFalse(set(argv)&{'delete','prune','reset','--unregister','--shutdown','rm','rmi','start'})
+            if key.startswith(('outer-','tools-','export')): self.assertEqual(argv[1:3],['--host',self.transport.endpoint])
+        self.assertEqual(receipt['exportContainerId'],self.cid)
+    def test_missing_tools_prevents_mutation(self):
+        self.missing=True
+        with self.assertRaises(ValueError):self.create()
+        self.assertEqual([k for k,_,_ in self.calls],['tools-inspect'])
+        self.assertEqual(json.loads((self.root/'output/environment-result.json').read_text())['status'],'failed')
+    def test_existing_distro_prevents_mutation(self):
+        self.old=True
+        with self.assertRaises(ValueError):self.create()
+        self.assertFalse(any(k in {'export-create','export','wsl-import'} for k,_,_ in self.calls))
+    def test_large_outer_inventory_batches_inspections(self):
+        self.old_ids=[format(i,'064x') for i in range(130)]
+        self.create()
+        commands=[argv for key,argv,_ in self.calls if key.startswith('outer-containers')]
+        self.assertEqual(len(commands),3)
+        self.assertEqual([len(argv[7:]) for argv in commands],[64,64,2])
+    def test_bootstrap_opens_root_parent_without_following_links(self):
+        self.create()
+        argv=next(argv for key,argv,_ in self.calls if key=='guest-helper-transfer')
+        bootstrap=argv[argv.index('-c')+1]
+        self.assertIn('O_DIRECTORY',bootstrap)
+        self.assertIn('dir_fd=',bootstrap)
