@@ -2,7 +2,43 @@
 
 更新：2026-11-08。S1严格导入、S2独立WSL环境已实际验收；本页记录S3逐任务结果，不能据此关闭S3或P01。完整合同见[设计](superpowers/specs/2026-11-08-p01-source-build-design.md)和[七任务计划](superpowers/plans/2026-11-08-p01-source-build.md)。
 
-## 最新 Task3 检查点：源码与机械控制验收完成
+## 最新 Task4：源码与机械控制验收完成
+
+实现`2254d24`及首轮修复`731fca907b281d10f40d7cbfef5fa85faf1a30b8`已通过原独立审查者复审：Spec PASS、Quality Approved，两项Important均ADDRESSED，无新增Critical/Important/Minor。主执行者核对原六项要求、完整源码/缓存接口、真实权限控制及同冻结原始证据，接受Task4的实现与机械控制；实际S3仍须Task7验收。
+
+| 最终同源控制 | 结果与证据 |
+| --- | --- |
+| 完整Linux八模块 | 218运行、215通过、3明确跳过，零失败/错误，9.409秒、exit0；`artifacts/p01-s3-task4-controls-20261108-35d21c61/result.json` |
+| 同冻结原生Windows | 218运行、145通过、73平台跳过，零失败/错误，3.363秒、exit0；`.superpowers/sdd/2026-11-08-p01-source-build/task-4-final-windows-0eb7ea76/result.json` |
+| 实际root管理器 | 3/3，零跳过/失败/错误，原固定c2能力集合；`artifacts/p01-s3-task4-manager-controls-20261108-01ddc74d/result.json` |
+| 实际root所有权历史 | 7/7，零跳过/失败/错误，独立CHOWN-only；`artifacts/p01-s3-task4-ownership-controls-20261108-50b3dd13/result.json` |
+
+Linux的两项Windows专属控制在原生Windows执行，唯一共享root跳过由独立CHOWN夹具执行；合并矩阵无未执行测试。主执行者核对各代145源码pin、138受保护文件、10个旧函数AST及原始日志/精确停止exit0非OOM容器。原S2/transfer/seal/cache/Kotlin字节保持不变。
+
+容量修复将完整Linux保留/后续分配预算计入Windows宿主需求，再加宿主导出/解压与reserve，不假设ext4空闲空间已由稀疏VHD物理占用；可能保守多计，不能默默少计。目录修复在独立验证两侧完整schema、路径、唯一性、父目录、文件hash/type后规范化目录遍历顺序，兼容原Kotlin递归localeCompare，仍拒绝重复/额外/缺失/非法成员并返回原观察快照。原生产字节下的新11项负控产生19条断言失败、零错误/跳过，记录于`artifacts/p01-s3-task4-controls-20261108-933635df/`；原失败和此前GREEN均不改写。
+
+原六项要求分别由固定输入/原传输完成闭包、原S1导入与独立重开、缓存只读复核与失败资源保留、有效worker隔离和实际管理器身份恢复、完整source/过滤映射、实际容量辅助与完整预算及上述回归/独立审查覆盖。完整报告及复审保留在`.superpowers/sdd/2026-11-08-p01-source-build/task-4-report.md`、`task-4-fix1-report.md`及`task-4-fix1-independent-review.md`。原结果中的`fullTask4Accepted=false`保持生成时含义，不回写证据。
+
+Task5接续实际私有Kotlin快照核对、每次prepare8GiB、两profile六次真实编译、工具字节及复制产物只读回放；Task6仍须原Windows证明链/ready、同一live-host传输见证、实际VHD首次传输前测量、完整期限及封存导出；Task7负责实际S3验收。所有机械替身和root控制只证明各自范围。S4–S6、P01及全部11项目仍未完成，正式标志保持false。
+
+## 历史 Task4 首轮检查点：独立审查未通过
+
+Task3验收文档已发布至`a3c44fa`。Task4实现原始descriptor一致的S1导入/独立重开、缓存恢复/消费者只读复核、原Task2完成闭包核对、有效worker隔离、容量预算及Windows/Linux实际测量辅助。仅两份源码形成本地检查点`2254d2497ebfc8860d1ef70b10edc34a3e90dc60`，尚未推送或接受Task4。独立审查为Spec FAIL、Quality Needs fixes：Windows宿主预算仅计导出而漏算稀疏VHD后续增长，过滤目录列表的Python全局顺序与原Kotlin递归localeCompare快照不兼容。原实现子Agent进入首轮修复，先补真实负控；下列完整GREEN仍保留其原范围，不能豁免这两处缺口。
+
+| 同一冻结源码的控制 | 结果与证据 |
+| --- | --- |
+| 完整Linux八模块 | 212运行、209通过、3明确跳过、零失败/错误，13.718秒、exit0；`artifacts/p01-s3-task4-controls-20261108-7bbd8e1b/result.json` |
+| 原生Windows完整控制 | 212运行、139通过、73平台跳过、零失败/错误，4.431秒、exit0；`.superpowers/sdd/2026-11-08-p01-source-build/task-4-final-windows-46a35375/result.json` |
+| 实际root管理器身份 | 3/3、零跳过/失败/错误，固定SETUID/SETGID/DAC_OVERRIDE；`artifacts/p01-s3-task4-manager-controls-20261108-df7270ee/result.json` |
+| 实际root所有权历史 | 7/7、零跳过/失败/错误，独立CHOWN-only夹具；`artifacts/p01-s3-task4-ownership-controls-20261108-2e74ca10/result.json` |
+
+Linux的三项跳过是两项Windows原生snapshot/junction及一项root所有权控制，分别在原生Windows和独立root夹具实际执行；合并矩阵无未执行测试。主执行者重核145项冻结/当前pin、138个受保护文件和10个既有函数AST，核对原始日志及精确容器停止exit0/非OOM。Linux实际all-RO夹具沿用独立封存pin，不将其作为真实S3恢复证据。
+
+Task4私有阶段不产生新资格；仍须原证明链/ready、同一live-host两次成功传输及实际manager准入。Windows临时普通文件仅验证VHD身份/容量测量机制，Task6必须在首次传输前实际测量已资格化VHD；Task5仍须验证实际私有Kotlin快照、每次prepare的8GiB下限、六次真实编译和工具字节。普通phase控制使用明确的Docker/特权边界替身，不能替代Task7实际恢复/编译/导出。原archive EOF、容器清单覆盖、缺最终缓存收据及root祖先打开错误的失败代全部保留、不改判。
+
+Task4首轮修复、同源验证和独立复审尚未完成；Task5仅准备brief/控制器，尚未派发实现。实际S3、S4–S6及P01继续开放，全部11项目仍0/11，正式标志保持false。
+
+## Task3 检查点：源码与机械控制验收完成
 
 Task2验收及文档已发布至远程`31edb062bf582e28053a5448c2129bc59cb2e195`。Task3新增封存/只读验证和显式endpoint可执行包装器，实现提交为`ff6425e8a2d6994f3ffa98695fc1a76d927ce763`。新独立审查Spec PASS、Quality Approved，无Critical/Important/Minor问题；主执行者核对完整五项要求、双平台证据和真实挂载矩阵后接受本任务。`guest.run`的实际恢复/编译阶段继续由Tasks4/5实现，公开编排由Task6实现，本任务没有成功占位入口。
 

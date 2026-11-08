@@ -103,16 +103,18 @@ Task3 complete: implementation `ff6425e`, independent Spec PASS/Quality Approved
 
 ### Task 4: Descriptor-identical import and cache restoration
 
+Controller acceptance: implementation `2254d24` and fix `731fca9` passed original-reviewer scoped Spec PASS/Quality Approved; both Important findings addressed and no new findings. Parent adopted all six requirements after full same-source Linux218/Windows218 controls and actual root-manager3/ownership7 controls, zero failures/errors and no aggregate skipped test. Only Task4 source/mechanical controls are accepted, not actualS3. Details, original negative controls and mandatory Task5/6/7 obligations are recorded in [stage evidence](../../p01-source-build.md).
+
 **Files:** Extend `source_build_guest.py`, `test_source_build_guest.py`.
 
 **Interfaces:** Existing `import_handoff.import_restore(archive_path,archive_pin,handoff_pin,source_descriptor_pin,output_directory)`, `reopen(...)`; `developer_cache.restore(inputs,descriptor_sha,output,docker=wrapper) -> dict` returns cargoVolume/gradleVolume and restore/projection/consumerVerify receipts.
 
-- [ ] Write orchestration tests requiring S1 archive+all three external pins, source path beneath fresh import, RO source/harness/archive mounts on independent reopen, and exact three cache sibling inputs. Verify mismatched descriptor prevents Docker calls.
-- [ ] Write tests that source mutation, cache baseline drift, ext4 mismatch, RO verify absence or false statvfsReadOnly stops before Kotlin. Require exact owned volume IDs plus endpoint in state, failure preserves all resources, and Cargo consumer never used for compiler work in S3.
-- [ ] Implement worker creation with design confinement and effective observations. Root ownership initialization gets CHOWN only and fresh empty targets; import/cache projection/reopen execute UID65534. Reuse cache's existing 128pids confinement unchanged.
-- [ ] Implement full source descriptor before/after validation and separate filtered Kotlin snapshot mapping. Harness is always a separate input; do not patch source scripts to add new orchestration.
-- [ ] Add real preflight host/ext4 free space observations and budget ledger including retained archive/restores/two private Kotlin caches/export/reserves; preserve 8GiB per-Kotlin prepare observation. Fail rather than deleting anything or reducing limits.
-- [ ] Run focused and existing import/cache tests; review/commit own changes. Actual import/cache acceptance remains part of Task 7, after accepted S2 gate.
+- [x] Write orchestration tests requiring S1 archive+all three external pins, source path beneath fresh import, RO source/harness/archive mounts on independent reopen, and exact three cache sibling inputs. Verify mismatched descriptor prevents Docker calls.
+- [x] Write tests that source mutation, cache baseline drift, ext4 mismatch, RO verify absence or false statvfsReadOnly stops before Kotlin. Require exact owned volume IDs plus endpoint in state, failure preserves all resources, and Cargo consumer never used for compiler work in S3.
+- [x] Implement worker creation with design confinement and effective observations. Root ownership initialization gets CHOWN only and fresh empty targets; import/cache projection/reopen execute UID65534. Reuse cache's existing 128pids confinement unchanged.
+- [x] Implement full source descriptor before/after validation and separate filtered Kotlin snapshot mapping. Harness is always a separate input; do not patch source scripts to add new orchestration.
+- [x] Add real preflight host/ext4 free space observations and budget ledger including retained archive/restores/two private Kotlin caches/export/reserves; preserve 8GiB per-Kotlin prepare observation. Fail rather than deleting anything or reducing limits.
+- [x] Run focused and existing import/cache tests; review/commit own changes. Actual import/cache acceptance remains part of Task 7, after accepted S2 gate.
 
 ### Task 5: Six genuine Kotlin compiles and toolchain byte verification
 
