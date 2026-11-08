@@ -335,6 +335,14 @@ class LinuxClosureTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((clean/'bin/helper').stat().st_mode),0o555)
 
 
+def _host_fixture_reply(output,key,value,deadline):
+    # Only external WSL behavior is supplied; real host channel durability runs.
+    transfer._host_write(output/(key+'.stdout.log'),transfer._encode(value),deadline)
+    transfer._host_write(output/(key+'.stderr.log'),b'',deadline)
+    return value
+
+_NATIVE_EXECUTE_HOST_TRANSACTION=transfer._execute_host_transaction
+
 class PublicHostFlowTests(unittest.TestCase):
     def setUp(self):
         TransferAuthorityTests.setUp(self)
@@ -348,18 +356,22 @@ class PublicHostFlowTests(unittest.TestCase):
         import wsl_environment
         self.enterContext(patch.object(wsl_environment,'_read_ready',return_value=self.ready))
         self.outcome='success';self.source_fds=[]
+        def inline(context,role,members,output,deadline):
+            result=transfer._run_transfer_inner(context,role,members,output,deadline=deadline)
+            return {'ok':True,'result':result,'witness':getattr(transfer,'_LAST_HOST_WITNESS',None)}
+        self.enterContext(patch.object(transfer,'_execute_host_transaction',side_effect=inline))
     def guest_boundary(self,output,key,argv,incoming,deadline):
         if key=='admission':
-            request=json.loads(argv[-1]);return {'status':'admission-succeeded','nonce':request['nonce'],'deadline':1.0}
+            request=json.loads(argv[-1]);return _host_fixture_reply(output,key,{'status':'admission-succeeded','nonce':request['nonce'],'deadline':1.0},deadline)
         request=json.loads(argv[-4]);action=argv[-3];argument=json.loads(argv[-2])
         if action=='receive':
             self.source_fds.append(incoming.fileno());data=incoming.read()
-            return dict(schemaVersion=1,operationNonce=request['nonce'],action='receive',status='succeeded',
+            return _host_fixture_reply(output,key,dict(schemaVersion=1,operationNonce=request['nonce'],action='receive',status='succeeded',
                 child=dict(pid=51,starttime='1',pgid=51,sid=51),bytes=len(data),sha256=hashlib.sha256(data).hexdigest(),
-                sealSha256=None,error=None,possibleSurvivors=False,observations=[])
-        if action=='finalize':return {'status':'input-closure-complete','files':len(request['members'][argument]),'directories':len(request['directories']) if argument=='harness' else 0}
+                sealSha256=None,error=None,possibleSurvivors=False,observations=[]),deadline)
+        if action=='finalize':return _host_fixture_reply(output,key,{'status':'input-closure-complete','files':len(request['members'][argument]),'directories':len(request['directories']) if argument=='harness' else 0},deadline)
         if self.outcome=='missing':raise FileNotFoundError('completion missing')
-        return {'status':'succeeded','nonce':request['nonce'] if self.outcome=='success' else '0'*32}
+        return _host_fixture_reply(output,key,{'status':'succeeded','nonce':request['nonce'] if self.outcome=='success' else '0'*32},deadline)
     def test_public_handoff_retains_exact_frozen_code_argv_and_binary_descriptor(self):
         # WSL itself is unavailable here. Only that external boundary is replaced;
         # local qualification, actual files, hashes, worker pipes and evidence run.
@@ -465,3 +477,388 @@ class LinuxBufferControls(unittest.TestCase):
                 self.assertEqual(json.loads(result['stdout'])['bytes'],count*65536)
                 self.assertLess(peak,8*1024*1024)
             self.assertLess(peaks[1]-peaks[0],2*1024*1024)
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux rooted finalizer controls')
+class FinalizerReplacementTests(unittest.TestCase):
+    def test_root_ancestor_terminal_and_hardlink_replacement_are_rejected(self):
+        for replacement in ('root','ancestor','terminal','hardlink'):
+            with self.subTest(replacement=replacement),tempfile.TemporaryDirectory() as tmp:
+                top=Path(tmp);root=top/'input';(root/'bin').mkdir(parents=True);outside=top/'outside';(outside/'bin').mkdir(parents=True)
+                for p in (root/'bin/helper',outside/'bin/helper'):p.write_bytes(b'x');p.chmod(0o444)
+                pins={'bin/helper':{'bytes':1,'sha256':hashlib.sha256(b'x').hexdigest(),'mode':0o444}}
+                if replacement=='root':root.rename(top/'original');root.symlink_to(outside,target_is_directory=True)
+                elif replacement=='ancestor':(root/'bin').rename(root/'old');(root/'bin').symlink_to(outside/'bin',target_is_directory=True)
+                elif replacement=='terminal':(root/'bin/helper').unlink();(root/'bin/helper').symlink_to(outside/'bin/helper')
+                else:(root/'bin/helper').unlink();os.link(outside/'bin/helper',root/'bin/helper')
+                op=top/'operation';op.mkdir()
+                with self.assertRaises(ValueError):
+                    transfer._supervise([sys.executable,'-I','-B','-c',transfer._FINALIZE,str(root),json.dumps(pins),json.dumps(['bin'])],input_file=None,output_policy='COMPLETION_CONTROL',guest_deadline=time.monotonic()+2,operation_directory=op)
+                self.assertEqual(outside.stat().st_mode&0o777,0o755)
+                self.assertEqual((outside/'bin').stat().st_mode&0o777,0o755)
+
+
+class RecordInvariantFixTests(unittest.TestCase):
+    def record(self):
+        return dict(schemaVersion=1,operationNonce='a'*32,action='receive',status='started',child=None,bytes=0,sha256=None,sealSha256=None,error=None,possibleSurvivors=False,observations=[])
+    def test_status_error_and_canonical_refs_reject_contradictions(self):
+        for changes in ({'status':'failed'},{'error':'unexpected'},*({'observations':[{'path':p,'bytes':0,'sha256':'a'*64}]} for p in ('/','//x','/../x','/x//y','/x/./y','/x\\y','/x\x00y','/x/'))):
+            with self.subTest(changes=changes),self.assertRaises(ValueError):transfer.validate_operation_record({**self.record(),**changes})
+    def test_multibyte_error_is_truncated_on_utf8_boundary(self):
+        error=transfer._error_text(ValueError('你'*2000))
+        self.assertLessEqual(len(error.encode()),4096);self.assertNotIn('\ufffd',error)
+
+@unittest.skipUnless(os.name=='posix' and Path('/proc/self/stat').exists(),'Linux typed cancellation failure controls')
+class FailurePropagationFixTests(unittest.TestCase):
+    def test_dead_leader_survivors_and_partial_facts_survive_persistence_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            code='import os,time;os.write(1,b"partial");p=os.fork();time.sleep(2) if p==0 else None'
+            with patch.object(transfer,'_persist_files',side_effect=OSError('evidence disk stalled')):
+                with self.assertRaises(Exception) as raised:
+                    transfer._supervise([sys.executable,'-I','-c',code],input_file=None,output_policy='RECEIVER_CONTROL',guest_deadline=time.monotonic()+.15,operation_directory=root)
+            failure=raised.exception
+            self.assertTrue(failure.possible_survivors)
+            self.assertEqual(failure.facts['stdoutBytes'],7)
+            self.assertEqual(set(failure.facts['child']),{'pid','starttime','pgid','sid'})
+            self.assertIn('evidence disk stalled',failure.facts['persistenceErrors'][0])
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux real target filesystem controls')
+class CapacityTargetFixTests(unittest.TestCase):
+    def test_actual_target_device_is_observed_instead_of_roomy_parent(self):
+        if not Path('/dev/shm').is_dir():self.skipTest('separate tmpfs required')
+        with tempfile.TemporaryDirectory(dir='/dev/shm') as tmp,tempfile.TemporaryDirectory() as parent:
+            root=Path(tmp)/'generation';context={'spec':'a'*64};argument={'role':'handoff','nonce':'a'*32,'first':True}
+            members={'handoff':{'handoff.tar':{'bytes':1,'sha256':'a'*64,'mode':0o444}},'harness':{}}
+            transfer._payload_filesystem(root,context,members,[],'prepare',argument,capacity_root=parent)
+            observed=transfer._payload_filesystem(root,context,members,[],'capacity',argument,capacity_root=parent)
+            self.assertEqual(observed['device'],root.stat().st_dev)
+            self.assertLessEqual(observed['available'],os.statvfs(root).f_bavail*os.statvfs(root).f_frsize+1024*1024)
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux real replacement/membership controls')
+class RequiredRealControlsFixTests(unittest.TestCase):
+    def test_live_executable_replacement_after_descriptor_open_is_rejected(self):
+        r,w=os.pipe();p=subprocess.Popen([sys.executable,'-I','-c','import os,sys;os.read(int(sys.argv[1]),1);os.execv("/usr/bin/sleep",["sleep","2"])',str(r)],pass_fds=(r,));os.close(r)
+        real_open=Path.open;target=Path('/proc')/str(p.pid)/'exe';triggered=[]
+        def opening(path,*args,**kwargs):
+            stream=real_open(path,*args,**kwargs)
+            if path==target and not triggered:
+                triggered.append(True);before=os.fstat(stream.fileno()).st_ino;os.write(w,b'E')
+                end=time.monotonic()+2
+                while target.stat().st_ino==before and time.monotonic()<end:time.sleep(.005)
+                self.assertNotEqual(target.stat().st_ino,before)
+            return stream
+        try:
+            with patch.object(Path,'open',opening),self.assertRaises(ValueError):transfer._process_identity_work(p.pid,guest_deadline=time.monotonic()+3)
+            self.assertTrue(triggered)
+        finally:os.close(w);p.terminate();p.wait(timeout=3)
+    def test_actual_management_check_rejects_fake_cgroup_file(self):
+        import wsl_environment_guest as accepted
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'management').mkdir();(root/'management/cgroup.procs').write_bytes(b'')
+            with patch.object(accepted,'paths',return_value={'cgroup':str(root)}),self.assertRaises(ValueError):
+                transfer._management({'generation':'p01-impossible-membership'},time.monotonic()+2,root)
+            self.assertEqual((root/'management/cgroup.procs').read_text().strip(),str(os.getpid()))
+    def test_real_bootstrap_and_entry_reject_substituted_adapter_before_import(self):
+        if not os.access('/opt',os.W_OK):self.skipTest('writable isolated /opt tmpfs required')
+        s2='p01-fix-'+__import__('uuid').uuid4().hex[:12];generation='fixture';nonce='a'*32
+        base=Path('/opt')/s2/'s3-admission-observations'/generation;directory=base/nonce;directory.mkdir(parents=True)
+        marker=base/'must-not-execute';good=b'raise RuntimeError("original adapter not invoked")\n';bad=('open('+repr(str(marker))+',"w").write("executed")\n').encode()
+        request={'s2Generation':s2,'generation':generation,'nonce':nonce,'duration':2,'adapter':{'bytes':len(good),'sha256':hashlib.sha256(good).hexdigest()}}
+        (directory/'adapter.py').write_bytes(bad);(directory/'session.json').write_text(json.dumps({'deadline':time.monotonic()+2}))
+        p=subprocess.run([sys.executable,'-I','-B','-c',transfer._ENTRY,json.dumps(request),'complete','null','2'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=7)
+        self.assertNotEqual(p.returncode,0);self.assertFalse(marker.exists())
+        request['nonce']='b'*32;request['generation']='bootstrap'
+        p=subprocess.run([sys.executable,'-I','-B','-c',transfer._BOOTSTRAP,json.dumps(request)],input=bad,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=7)
+        self.assertNotEqual(p.returncode,0);self.assertIn(b'adapter',p.stderr);self.assertFalse(marker.exists())
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux full guard hierarchy controls')
+class HierarchyOwnerFixTests(unittest.TestCase):
+    def test_bootstrap_owner_accounts_inner_independent_session_worker(self):
+        if not os.access('/opt',os.W_OK):self.skipTest('writable isolated /opt tmpfs required')
+        s2='p01-owner-'+__import__('uuid').uuid4().hex[:12];generation='fixture';nonce='a'*32
+        code=Path(transfer.__file__).read_bytes()+b'\ndef _guest_install(r,deadline,directory):\n return _fork_job(lambda:time.sleep(20),deadline=deadline,evidence_path=Path(directory)/"inner-stall-worker.json")\n'
+        request={'s2Generation':s2,'generation':generation,'nonce':nonce,'duration':1,'adapter':{'bytes':len(code),'sha256':hashlib.sha256(code).hexdigest()}}
+        start=time.monotonic();p=subprocess.run([sys.executable,'-I','-B','-c',transfer._BOOTSTRAP,json.dumps(request)],input=code,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=7)
+        self.assertNotEqual(p.returncode,0);self.assertLess(time.monotonic()-start,6.5)
+        evidence=Path('/opt')/s2/'s3-admission-observations'/generation/nonce
+        identity=json.loads((evidence/'inner-stall-worker.json').read_text());pid=identity['pid']
+        try:
+            state=Path('/proc',str(pid),'stat').read_text().rsplit(')',1)[1].split()[0]
+        except FileNotFoundError:state='gone'
+        self.assertIn(state,('gone','Z'),'outer killed supervisor while registered worker survived')
+        terminal=[json.loads(line[19:]) for line in p.stderr.splitlines() if line.startswith(b'P01_OWNER_FAILURE: ')]
+        self.assertTrue(terminal,'outer owner must return exact registry even if inner evidence cannot persist')
+        self.assertIn(pid,[c['pid'] for c in terminal[-1]['ownedChildren']])
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux deterministic rooted replacement controls')
+class DynamicFinalizerFixTests(unittest.TestCase):
+    def test_replace_root_ancestor_terminal_after_open_never_reads_or_chmods_outside(self):
+        for replacement in ('root','ancestor','terminal'):
+            with self.subTest(replacement=replacement),tempfile.TemporaryDirectory() as tmp:
+                top=Path(tmp);root=top/'input';(root/'bin').mkdir(parents=True);outside=top/'outside';(outside/'bin').mkdir(parents=True)
+                for path in (root/'bin/helper',outside/'bin/helper'):path.write_bytes(b'x');path.chmod(0o444)
+                pins={'bin/helper':{'bytes':1,'sha256':hashlib.sha256(b'x').hexdigest(),'mode':0o444}}
+                prelude='''import os,sys
+from pathlib import Path
+root=Path(sys.argv[1]);outside=root.parent/'outside';replacement=sys.argv.pop();real_open=os.open;real_read=os.read;triggered=False
+outside_inode=(outside/'bin/helper').stat().st_ino
+
+def opening(name,*args,**kwargs):
+ global triggered
+ fd=real_open(name,*args,**kwargs)
+ target={'root':'input','ancestor':'bin','terminal':'helper'}[replacement]
+ if name==target and not triggered:
+  triggered=True;p={'root':root,'ancestor':root/'bin','terminal':root/'bin/helper'}[replacement]
+  p.rename(root.parent/'saved');p.symlink_to({'root':outside,'ancestor':outside/'bin','terminal':outside/'bin/helper'}[replacement],target_is_directory=replacement!='terminal')
+ return fd
+
+def reading(fd,n):
+ if os.fstat(fd).st_ino==outside_inode:(root.parent/'outside-read').write_text('bad')
+ return real_read(fd,n)
+os.open=opening;os.read=reading
+'''
+                p=subprocess.run([sys.executable,'-I','-B','-c',prelude+transfer._FINALIZE,str(root),json.dumps(pins),json.dumps(['bin']),replacement],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=4)
+                self.assertNotEqual(p.returncode,0);self.assertFalse((top/'outside-read').exists());self.assertEqual((outside/'bin').stat().st_mode&0o777,0o755)
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux shared whole-call cancellation controls')
+class SharedCancellationFixTests(unittest.TestCase):
+    def test_full_guard_stalled_task_and_nested_failure_persistence_share_one_allowance(self):
+        if not os.access('/opt',os.W_OK):self.skipTest('writable isolated /opt tmpfs required')
+        s2='p01-budget-'+__import__('uuid').uuid4().hex[:12];nonce='a'*32
+        extra=b'''
+def _guest_install(r,deadline,directory):
+ import signal
+ def block():
+  signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(20)
+ try:
+  return _fork_job(block,deadline=deadline,evidence_path=Path(directory)/'task-worker.json')
+ finally:
+  for index in range(3):
+   try:_fork_job(block,deadline=time.monotonic()+1,evidence_path=Path(directory)/('failure-persistence-'+str(index)+'.json'))
+   except BaseException:pass
+'''
+        code=Path(transfer.__file__).read_bytes()+extra;request={'s2Generation':s2,'generation':'fixture','nonce':nonce,'duration':1,'adapter':{'bytes':len(code),'sha256':hashlib.sha256(code).hexdigest()}}
+        start=time.monotonic();p=subprocess.run([sys.executable,'-I','-B','-c',transfer._BOOTSTRAP,json.dumps(request)],input=code,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=7)
+        self.assertNotEqual(p.returncode,0);self.assertLess(time.monotonic()-start,6.5)
+        terminals=[json.loads(line[19:]) for line in p.stderr.splitlines() if line.startswith(b'P01_OWNER_FAILURE: ')]
+        self.assertTrue(terminals);self.assertTrue(terminals[-1]['ownedChildren'])
+        for identity in terminals[-1]['ownedChildren']:
+            self.assertNotEqual(transfer._owner_state(identity),'live')
+
+class HostBlockingDeadlineFixTests(unittest.TestCase):
+    def test_public_transaction_metadata_and_final_recheck_cannot_escape_deadline(self):
+        for phase in ('metadata','recheck'):
+            with self.subTest(phase=phase),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);source=root/'source';source.write_bytes(b'x');module=root/'adapter.py'
+                injection="\ndef _new_host_operation(*a,**k):Path("+repr(str(root/'entered'))+").write_text('metadata');time.sleep(10);raise OSError('metadata stalled')\n"
+                if phase=='recheck':
+                    injection="\n_original_pinned_source=_pinned_source\n@contextmanager\ndef _pinned_source(*a,**k):\n with _original_pinned_source(*a,**k) as incoming:\n  try:yield incoming\n  finally:Path("+repr(str(root/'entered'))+").write_text('recheck');time.sleep(10)\ndef _new_host_operation(*a,**k):raise OSError('force final recheck')\n"
+                code=Path(transfer.__file__).read_bytes()+injection.encode();module.write_bytes(code)
+                context={'timeout':1,'adapter':{'bytes':len(code),'sha256':hashlib.sha256(code).hexdigest()},'qualification':{'specRef':{},'environment':{},'s2Acceptance':{},'s2Generation':'fixture'},'spec':{'generation':'fixture'},'manifestPin':{}}
+                members={'handoff.tar':{'path':str(source),'bytes':1,'sha256':hashlib.sha256(b'x').hexdigest(),'mode':0o444}}
+                runner='import importlib.util,json,sys,time;sys.path.insert(0,sys.argv[1]);import source_build;s=importlib.util.spec_from_file_location("isolated_adapter",sys.argv[2]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\ntry:m._run_transfer(json.loads(sys.argv[3]),"handoff",json.loads(sys.argv[4]),sys.argv[5])\nexcept BaseException as e:sys.stderr.buffer.write(getattr(e,"partial_stderr",b""));raise'
+                p=subprocess.Popen([sys.executable,'-I','-B','-c',runner,str(Path(transfer.__file__).parent),str(module),json.dumps(context),json.dumps(members),str(root/'operation')],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                start=time.monotonic()
+                try:
+                    out,err=p.communicate(timeout=7);self.assertNotEqual(p.returncode,0);self.assertTrue((root/'entered').exists(),err);self.assertGreater(time.monotonic()-start,.8);self.assertLess(time.monotonic()-start,6.5)
+                except subprocess.TimeoutExpired:
+                    p.kill();p.communicate(timeout=2);self.fail(phase+' blocked parent filesystem work escaped public deadline')
+
+class HostCompletionOrderingFixTests(unittest.TestCase):
+    def setUp(self):PublicHostFlowTests.setUp(self)
+    def guest_boundary(self,*args):return PublicHostFlowTests.guest_boundary(self,*args)
+    def test_host_prepared_receipt_is_durable_before_guest_provisional_completion(self):
+        boundary=self.guest_boundary
+        def observe(output,key,argv,incoming,deadline):
+            if key=='complete':
+                receipt=json.loads((output/'prepared-result.json').read_text())
+                self.assertEqual(receipt['status'],'input-transfer-complete')
+                self.assertFalse((output/'result.json').exists())
+            return boundary(output,key,argv,incoming,deadline)
+        with patch.object(transfer,'_host_call',side_effect=observe):transfer.transfer_environment(**self.kw)
+
+class HostLifecycleWitnessFixTests(unittest.TestCase):
+    def setUp(self):
+        PublicHostFlowTests.setUp(self);transfer._HOST_HISTORY.clear();self.admissions=[]
+        context=transfer._local_context(self.kw['environment_receipt'],self.kw['spec'],self.kw['spec_sha256'],self.kw['timeout'])
+        self.frozen=self.root/'frozen';source_build.freeze_harness(context['spec'],context['qualification'],output_directory=self.frozen)
+    def guest_boundary(self,output,key,argv,incoming,deadline):
+        if key=='admission':
+            request=json.loads(argv[-1]);observed={e['operationNonce'] for e in request.get('hostHistory',[])}
+            if any(nonce not in observed for nonce in self.admissions):raise ValueError('unfinished/provisional prior operation is ineligible')
+            self.admissions.append(request['nonce'])
+        return PublicHostFlowTests.guest_boundary(self,output,key,argv,incoming,deadline)
+    def harness(self):
+        return transfer.transfer_harness(self.kw['environment_receipt'],self.frozen,spec=self.kw['spec'],spec_sha256=self.kw['spec_sha256'],output_directory=self.root/'harness-operation',timeout=30)
+    def test_same_live_host_success_then_harness_rechecks_durable_predecessor(self):
+        with patch.object(transfer,'_host_call',side_effect=self.guest_boundary):
+            transfer.transfer_environment(**self.kw);result=self.harness()
+        self.assertEqual(result['status'],'input-transfer-complete');self.assertEqual(len(self.admissions),2)
+        request=json.loads((self.root/'harness-operation/request.json').read_text());self.assertEqual(len(request['hostHistory']),1)
+    def fail_window(self,window):
+        real_write=transfer._host_write;real_publish=transfer._publish_host_witness;boundary=self.guest_boundary
+        def write(path,data,deadline):
+            if path.name=='failed.json':raise OSError('negative latch persistence also failed')
+            if window=='result' and path.name=='result.json':raise OSError('result fsync failed')
+            if window=='log' and path.name=='complete.stdout.log':raise OSError('completion log fsync failed')
+            real_write(path,data,deadline)
+            if window=='index-response' and path.name=='eligibility.json':raise OSError('durable index response was lost')
+        def guest(output,key,argv,incoming,deadline):
+            if key=='complete' and window=='ack':raise OSError('provisional guest commit acknowledgement lost')
+            return boundary(output,key,argv,incoming,deadline)
+        def publish(context,witness):
+            real_publish(context,witness)
+            if window=='epilogue':raise KeyboardInterrupt('injected exceptional success epilogue')
+        with patch.object(transfer,'_host_call',side_effect=guest),patch.object(transfer,'_host_write',side_effect=write),patch.object(transfer,'_publish_host_witness',side_effect=publish):
+            with self.assertRaises((OSError,ValueError,KeyboardInterrupt)):transfer.transfer_environment(**self.kw)
+        self.assertFalse(transfer._HOST_HISTORY)
+        with patch.object(transfer,'_host_call',side_effect=self.guest_boundary),self.assertRaises(ValueError):self.harness()
+        self.assertEqual(len(self.admissions),1)
+    def test_lost_guest_ack_blocks_next_sibling(self):self.fail_window('ack')
+    def test_host_completion_log_fsync_failure_blocks_next_sibling(self):self.fail_window('log')
+    def test_host_result_fsync_failure_blocks_next_sibling(self):self.fail_window('result')
+    def test_durable_index_but_lost_worker_reply_blocks_next_sibling(self):self.fail_window('index-response')
+    def test_baseexception_after_publication_revokes_before_next_sibling(self):self.fail_window('epilogue')
+    def test_changed_durable_ack_rejects_before_next_guest_admission(self):
+        with patch.object(transfer,'_host_call',side_effect=self.guest_boundary):transfer.transfer_environment(**self.kw)
+        (self.root/'operation/complete.stdout.log').write_bytes(b'changed')
+        with patch.object(transfer,'_host_call',side_effect=self.guest_boundary),self.assertRaises(ValueError):self.harness()
+        self.assertEqual(len(self.admissions),1)
+    def test_new_process_and_reloaded_module_do_not_reconstruct_live_witness(self):
+        with patch.object(transfer,'_host_call',side_effect=self.guest_boundary):transfer.transfer_environment(**self.kw)
+        context=transfer._local_context(self.kw['environment_receipt'],self.kw['spec'],self.kw['spec_sha256'],30);context['adapter']=transfer._adapter_pin(context)
+        self.assertTrue(transfer._observed_host_history(context))
+        code='import sys,json,importlib;sys.path.insert(0,sys.argv[1]);import wsl_environment_transfer as t;assert not t._observed_host_history(json.loads(sys.argv[2]));importlib.reload(t);assert not t._observed_host_history(json.loads(sys.argv[2]))'
+        result=subprocess.run([sys.executable,'-I','-B','-c',code,str(Path(transfer.__file__).parent),json.dumps(context)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=3)
+        self.assertEqual(result.returncode,0,result.stderr)
+    @unittest.skipUnless(hasattr(os,'fork'),'real fork inheritance control')
+    def test_fork_cannot_inherit_positive_witness(self):
+        with patch.object(transfer,'_host_call',side_effect=self.guest_boundary):transfer.transfer_environment(**self.kw)
+        r,w=os.pipe();pid=os.fork()
+        if pid==0:
+            os.close(r);os.write(w,b'bad' if transfer._HOST_HISTORY else b'empty');os._exit(0)
+        os.close(w)
+        try:self.assertEqual(os.read(r,16),b'empty')
+        finally:os.close(r);os.waitpid(pid,0)
+    def test_concurrent_public_call_rejects_without_runtime(self):
+        import threading
+        ready=threading.Event();done=threading.Event()
+        def hold():
+            with transfer._host_public_guard():ready.set();done.wait(2)
+        thread=threading.Thread(target=hold);thread.start();self.assertTrue(ready.wait(1))
+        try:
+            with patch.object(transfer,'_host_call',side_effect=AssertionError('concurrent runtime forbidden')),self.assertRaises(ValueError):transfer.transfer_environment(**self.kw)
+        finally:done.set();thread.join(3)
+
+class LateHostFailureFixTests(unittest.TestCase):
+    def setUp(self):PublicHostFlowTests.setUp(self);transfer._HOST_HISTORY.clear()
+    def guest_boundary(self,*args):return PublicHostFlowTests.guest_boundary(self,*args)
+    def test_durable_final_then_index_failure_retains_terminal_failure(self):
+        original=transfer._host_write
+        def write(path,data,deadline):
+            if path.name=='eligibility.json':raise OSError('index allocation failed after final receipt')
+            original(path,data,deadline)
+        with patch.object(transfer,'_host_call',side_effect=self.guest_boundary),patch.object(transfer,'_host_write',side_effect=write),self.assertRaises(OSError):transfer.transfer_environment(**self.kw)
+        output=self.root/'operation'
+        self.assertEqual(json.loads((output/'result.json').read_text())['status'],'input-transfer-complete')
+        self.assertEqual(json.loads((output/'failed.json').read_text())['status'],'failed')
+        self.assertEqual(json.loads((output/'ambiguous.json').read_text())['status'],'ambiguous')
+        self.assertFalse(transfer._HOST_HISTORY)
+    def test_real_final_worker_reply_loss_retains_ambiguous_and_no_live_witness(self):
+        # The real owned native process commits final/index bytes, then exits
+        # without its response. No in-process seam simulates this response loss.
+        worker="import json,os,sys;from pathlib import Path;p=json.load(sys.stdin);o=Path(p['output']);o.mkdir();[(lambda fd,data:(os.write(fd,data),os.fsync(fd),os.close(fd)))(os.open(o/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),data) for name,data in [('result.json',b'{\"status\":\"input-transfer-complete\"}'),('eligibility.json',b'{}')]];os._exit(0)"
+        with patch.object(transfer,'_execute_host_transaction',side_effect=_NATIVE_EXECUTE_HOST_TRANSACTION),patch.object(transfer,'_HOST_TRANSACTION',worker),self.assertRaises(ValueError):transfer.transfer_environment(**self.kw)
+        output=self.root/'operation'
+        self.assertEqual(json.loads((output/'result.json').read_text())['status'],'input-transfer-complete')
+        self.assertEqual(json.loads((output/'ambiguous.json').read_text())['status'],'ambiguous')
+        self.assertTrue((output/'eligibility.json').exists());self.assertFalse(transfer._HOST_HISTORY)
+    def test_ambiguous_terminal_rejects_even_erroneously_republished_memory(self):
+        with patch.object(transfer,'_host_call',side_effect=self.guest_boundary):transfer.transfer_environment(**self.kw)
+        context=transfer._local_context(self.kw['environment_receipt'],self.kw['spec'],self.kw['spec_sha256'],30);context['adapter']=transfer._adapter_pin(context)
+        context['_hostHistory']=transfer._observed_host_history(context)
+        (self.root/'operation/ambiguous.json').write_bytes(b'{}')
+        with self.assertRaises(ValueError):transfer._verify_host_history(context,time.monotonic()+2)
+
+class SharedHostCancellationFixTests(unittest.TestCase):
+    def test_later_native_cleanup_consumes_original_endpoint(self):
+        previous=transfer._HOST_ABSOLUTE_CANCEL_END
+        transfer._HOST_ABSOLUTE_CANCEL_END=time.monotonic()+.15
+        started=time.monotonic()
+        try:
+            with self.assertRaises(transfer.TransferFailure):transfer._pump_host([sys.executable,'-I','-c','import time;time.sleep(.3)'],input_file=None,deadline=time.monotonic()+3)
+        finally:transfer._HOST_ABSOLUTE_CANCEL_END=previous
+        self.assertLess(time.monotonic()-started,1.0)
+
+    def test_native_worker_shrinking_shared_endpoint_bounds_outer_parent(self):
+        previous=transfer._HOST_ABSOLUTE_CANCEL_END;started=time.monotonic()
+        transfer._HOST_ABSOLUTE_CANCEL_END=started+8
+        worker="import json,mmap,os,struct,sys,time;p=json.load(sys.stdin);m=mmap.mmap(-1,8,tagname=p['cancelMap']) if os.name=='nt' else mmap.mmap(p['cancelMap'],8);m[:8]=struct.pack('d',time.monotonic()+.15);time.sleep(.3)"
+        try:
+            with patch.object(transfer,'_HOST_TRANSACTION',worker),self.assertRaises(transfer.TransferFailure):_NATIVE_EXECUTE_HOST_TRANSACTION({},'handoff',{},'unused',started+3)
+            self.assertLess(transfer._HOST_ABSOLUTE_CANCEL_END,started+1)
+        finally:transfer._HOST_ABSOLUTE_CANCEL_END=previous
+        self.assertLess(time.monotonic()-started,1.0)
+
+@unittest.skipUnless(os.name=='nt','actual native Windows job ownership control')
+class WindowsProcessTreeFixTests(unittest.TestCase):
+    def test_timeout_job_closes_blocking_native_descendant(self):
+        code='import subprocess,sys,time;sys.stdin.buffer.read(1);p=subprocess.Popen([sys.executable,"-I","-c","import time;time.sleep(20)"]);print(p.pid,flush=True);time.sleep(20)'
+        with self.assertRaises(transfer.TransferFailure) as raised:transfer._pump_host([sys.executable,'-I','-c',code],input_file=None,input_bytes=b'E',deadline=time.monotonic()+.3)
+        pid=int(raised.exception.partial_stdout.strip())
+        import ctypes
+        kernel=ctypes.WinDLL('kernel32',use_last_error=True);kernel.OpenProcess.restype=ctypes.c_void_p
+        kernel.OpenProcess.argtypes=[ctypes.c_uint,ctypes.c_int,ctypes.c_uint];kernel.WaitForSingleObject.argtypes=[ctypes.c_void_p,ctypes.c_uint];kernel.CloseHandle.argtypes=[ctypes.c_void_p]
+        handle=kernel.OpenProcess(0x100000,False,pid)
+        if handle:
+            try:self.assertEqual(kernel.WaitForSingleObject(handle,1000),0)
+            finally:kernel.CloseHandle(handle)
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux authoritative target capacity controls')
+class LowTargetCapacityFixTests(unittest.TestCase):
+    def test_low_actual_target_rejects_before_and_after_creation_and_spool_checks_identity(self):
+        if not Path('/dev/shm').is_dir():self.skipTest('separate tmpfs required')
+        with tempfile.TemporaryDirectory(dir='/dev/shm') as tmp,tempfile.TemporaryDirectory() as parent:
+            root=Path(tmp)/'generation';context={'spec':'a'*64};argument={'role':'handoff','nonce':'a'*32,'first':True}
+            members={'handoff':{'handoff.tar':{'bytes':1,'sha256':'a'*64,'mode':0o444}},'harness':{}}
+            def command(request,args,*rest):return transfer._payload_filesystem(root,context,members,[],args['action'],{**argument,**args},capacity_root=parent)
+            actual=transfer._target_space(str(root/'inputs/handoff'));required=actual['available']+1
+            if os.statvfs(parent).f_bavail*os.statvfs(parent).f_frsize<=required:self.skipTest('roomy parent required')
+            request={'s2Generation':'fixture','generation':'fixture','nonce':'a'*32,'duration':2,'requiredBytes':required}
+            with patch.object(transfer,'_payload_command',side_effect=command),patch.object(transfer,'_fork_job',side_effect=AssertionError('management/payload allocation forbidden')):
+                with self.assertRaises(ValueError):transfer._guest_capacity(request,None,0,time.monotonic()+2)
+            self.assertFalse(root.exists())
+            command(request,{'action':'prepare'})
+            with patch.object(transfer,'_payload_command',side_effect=command),patch.object(transfer,'_fork_job',side_effect=AssertionError('spool forbidden')):
+                with self.assertRaises(ValueError):transfer._guest_capacity(request,None,0,time.monotonic()+2)
+            stage=root/'staging';stage.mkdir();space=transfer._target_space(str(stage));space['inode']+=1
+            with io.BytesIO(b'x') as incoming,self.assertRaises(ValueError):transfer.stage_input(incoming,stage/'member.partial',hashlib.sha256(b'x').hexdigest(),1,guest_deadline=time.monotonic()+2,filesystem=space)
+            self.assertFalse((stage/'member.partial').exists())
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux end-to-end receive failure controls')
+class ReceiveFailureEvidenceFixTests(unittest.TestCase):
+    def test_receive_terminal_preserves_real_dead_leader_survivor_and_partial_facts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);payload=root/'payload';payload.mkdir();spool=root/'spool';spool.write_bytes(b'x');deadline=time.monotonic()+.4
+            request={'s2Generation':'fixture','generation':'fixture','nonce':'a'*32,'specRef':{},'environment':{},'acceptance':{},'adapter':{},'manifestPin':{},'handle':{},'codeRoot':'/unused','helpers':{},'requiredBytes':0,
+                'members':{'handoff':{'handoff.tar':{'bytes':1,'sha256':hashlib.sha256(b'x').hexdigest(),'mode':0o444}}}}
+            member={'role':'handoff','name':'handoff.tar','pin':request['members']['handoff']['handoff.tar'],'first':True,'ordinal':0}
+            def command(*args):return {'base':str(payload),'retained':0}
+            def stream(handle,argv,**kw):
+                return transfer._supervise([sys.executable,'-I','-c','import os,time;os.write(1,b"partial");p=os.fork();time.sleep(2) if p==0 else None'],**kw)
+            with patch.object(transfer,'_read_session',return_value=deadline),patch.object(transfer,'_guest_load_helpers'),patch.object(transfer,'_guest_context',return_value=str(root)),patch.object(transfer,'_admit'),patch.object(transfer,'_guest_capacity',return_value={'managementSpool':{},'targets':{'destination':{}},'retained':0}),patch.object(transfer,'_payload_command',side_effect=command),patch.object(transfer,'stage_input',return_value=spool),patch.object(transfer,'stream_admitted',side_effect=stream),patch.object(transfer,'_latch',side_effect=OSError('latch persistence unavailable')):
+                with self.assertRaises(transfer.TransferFailure) as raised:transfer._guest_receive(request,member,str(root))
+            self.assertTrue(raised.exception.possible_survivors);self.assertEqual(raised.exception.facts['stdoutBytes'],7)
+            record=json.loads(next(root.glob('receive-*/failed.json')).read_text());self.assertTrue(record['possibleSurvivors']);self.assertEqual(record['child'],raised.exception.facts['child'])
+            facts=json.loads(next(root.glob('receive-*/failure-facts.json')).read_text());self.assertEqual(facts['stdoutBytes'],7);self.assertEqual(facts['ownedChildren'],[record['child']])
+
+@unittest.skipUnless(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0,'Linux provisional history controls')
+class BootstrapHistoryWitnessFixTests(unittest.TestCase):
+    def test_success_looking_disk_without_live_host_witness_rejects_before_adapter(self):
+        if not os.access('/opt',os.W_OK):self.skipTest('writable isolated /opt tmpfs required')
+        s2='p01-history-'+__import__('uuid').uuid4().hex[:12];base=Path('/opt')/s2/'s3-admission-observations/fixture';prior=base/('a'*32);prior.mkdir(parents=True)
+        (prior/'public-complete.json').write_text(json.dumps({'status':'succeeded'}));marker=base/'must-not-install'
+        code=('def _guest_install(r,deadline,directory):\n open('+repr(str(marker))+',"w").write("executed")\n return {"status":"admission-succeeded"}\n').encode()
+        request={'s2Generation':s2,'generation':'fixture','nonce':'b'*32,'duration':2,'adapter':{'bytes':len(code),'sha256':hashlib.sha256(code).hexdigest()},'hostHistory':[]}
+        p=subprocess.run([sys.executable,'-I','-B','-c',transfer._BOOTSTRAP,json.dumps(request)],input=code,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=7)
+        self.assertNotEqual(p.returncode,0);self.assertIn(b'prior host success',p.stderr);self.assertFalse(marker.exists())

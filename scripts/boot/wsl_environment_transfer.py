@@ -161,6 +161,36 @@ def _frozen_harness(context,frozen_harness):
     return members
 
 
+class TransferFailure(ValueError,TimeoutError):
+    """Bounded failure facts survive secondary persistence/cancellation errors."""
+    def __init__(self,error,*,facts=None):
+        super().__init__(_error_text(error));self.facts=dict(getattr(error,'facts',{}))
+        if facts:
+            for key,value in facts.items():
+                if key=='possibleSurvivors':self.facts[key]=bool(value or self.facts.get(key))
+                elif key in ('signals','ownedChildren','survivorIdentities','persistenceErrors'):
+                    merged=list(self.facts.get(key,[]))
+                    for item in value:
+                        if key=='persistenceErrors':item=str(item).encode()[:512].decode(errors='ignore')
+                        if item not in merged:merged.append(item)
+                    self.facts[key]=merged[:8] if key=='persistenceErrors' else merged
+                else:self.facts[key]=value
+        self.possible_survivors=bool(self.facts.get('possibleSurvivors',getattr(error,'possible_survivors',False)))
+        self.facts['possibleSurvivors']=self.possible_survivors
+        _encode(self.facts)
+
+class TransferFileExistsFailure(TransferFailure,FileExistsError):pass
+
+def _failure(cause,**facts):
+    kind=TransferFileExistsFailure if isinstance(cause,FileExistsError) else TransferFailure
+    return kind(cause,facts=facts)
+
+
+def _error_text(error):
+    # Ignoring an incomplete trailing codepoint never grows the declared byte cap.
+    return str(error).encode('utf-8',errors='replace')[:4096].decode('utf-8',errors='ignore') or type(error).__name__
+
+
 def validate_operation_record(record):
     if type(record) is not dict or set(record)!=RECORD_KEYS:raise ValueError('operation record keys differ')
     if type(record['schemaVersion']) is not int or record['schemaVersion']!=1:raise ValueError('operation schema differs')
@@ -177,12 +207,15 @@ def validate_operation_record(record):
         if child['pid']!=child['pgid'] or child['pid']!=child['sid']:raise ValueError('dedicated child session required')
         if type(child['starttime']) is not str or re.fullmatch('[0-9]+',child['starttime']) is None:raise ValueError('invalid child starttime')
     if type(record['possibleSurvivors']) is not bool:raise ValueError('survivor flag must be boolean')
-    if record['error'] is not None and (type(record['error']) is not str or len(record['error'].encode())>4096):raise ValueError('error exceeds cap')
+    if record['error'] is not None and (type(record['error']) is not str or not record['error'] or len(record['error'].encode())>4096):raise ValueError('error exceeds cap')
+    if (record['status']=='failed') != (record['error'] is not None):raise ValueError('status/error invariant differs')
     refs=record['observations']
     if type(refs) is not list or len(refs)>32:raise ValueError('too many observation refs')
     for ref in refs:
         if type(ref) is not dict or set(ref)!= {'path','bytes','sha256'}:raise ValueError('observation ref differs')
-        if type(ref['path']) is not str or not ref['path'].startswith('/') or len(ref['path'])>4096:raise ValueError('invalid observation path')
+        if (type(ref['path']) is not str or not ref['path'].startswith('/') or ref['path'].startswith('//') or ref['path']=='/' or len(ref['path'].encode())>4096
+                or '\\' in ref['path'] or '\x00' in ref['path'] or PurePosixPath(ref['path']).as_posix()!=ref['path']
+                or any(part in ('.','..') for part in ref['path'].split('/')[1:])):raise ValueError('invalid observation path')
         _integer(ref['bytes']);_hex(ref['sha256'])
     if record['status']=='succeeded' and (child is None or record['sha256'] is None or record['possibleSurvivors'] or record['error'] is not None):
         raise ValueError('incomplete success record')
@@ -255,14 +288,15 @@ def _owned(child):
     except (ProcessLookupError,FileNotFoundError):return False
 
 
-def _cancel(process,child):
+def _cancel(process,child,*,deadline):
     import signal
     signals=[];possible=False
     for sig,seconds in ((signal.SIGTERM,2),(signal.SIGKILL,3)):
         if process.poll() is not None:break
-        if child is None or not _owned(child):possible=True;break
-        os.killpg(child['pid'],sig);signals.append(sig.name)
-        try:process.wait(timeout=seconds);break
+        if time.monotonic()>=deadline or child is None or not _owned(child):possible=True;break
+        try:os.killpg(child['pid'],sig);signals.append(sig.name)
+        except ProcessLookupError:break
+        try:process.wait(timeout=max(0,min(seconds,deadline-time.monotonic())))
         except subprocess.TimeoutExpired:possible=True
     if process.poll() is None:possible=True
     return signals,possible
@@ -289,11 +323,12 @@ def _launch(argv,input_file,directory,deadline):
     try:
         process=subprocess.Popen([sys.executable,'-I','-B','-c',_LAUNCHER,str(ready_w),str(ack_r),
             str(directory/'child.identity.json'),json.dumps(argv)],stdin=input_file if input_file is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,stderr=subprocess.PIPE,shell=False,start_new_session=True,pass_fds=(ready_w,ack_r),bufsize=0)
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,shell=False,start_new_session=True,pass_fds=(ready_w,ack_r,*_owner_pass_fds()),bufsize=0)
         os.close(ready_w);ready_w=None;os.close(ack_r);ack_r=None
         handshake=min(deadline,time.monotonic()+5)
         if _byte(ready_r,handshake)!=b'H':raise ValueError('launcher handshake differs')
         child=_proc_fields(process.pid)
+        _register_owner(child,deadline)
         if not _owned(child) or child['pgid']!=process.pid or child['sid']!=process.pid:raise ValueError('launcher session ownership differs')
         record={**child,'operationNonce':uuid.uuid4().hex,'argv':argv,'launcherSha256':hashlib.sha256(_LAUNCHER.encode()).hexdigest()}
         os.write(ack_w,_encode(record))
@@ -301,7 +336,7 @@ def _launch(argv,input_file,directory,deadline):
         os.write(ack_w,b'E')
         return process,child
     except BaseException:
-        if process is not None:_cancel(process,child)
+        if process is not None:_cancel(process,child,deadline=_shared_end(deadline,True))
         raise
     finally:
         for fd in (ready_r,ready_w,ack_r,ack_w):
@@ -384,7 +419,7 @@ def _supervise(argv,*,input_file,output_policy,guest_deadline,operation_director
     except BaseException as error:
         failure=error
         if process is not None:
-            signals,possible=_cancel(process,child)
+            signals,possible=_cancel(process,child,deadline=_shared_end(guest_deadline,True))
             if process.poll() is not None and isinstance(error,TimeoutError):possible=True
     finally:
         if process is not None:
@@ -393,16 +428,19 @@ def _supervise(argv,*,input_file,output_policy,guest_deadline,operation_director
         if old_blocking is not None:os.set_blocking(1,old_blocking)
         # Evidence persistence is delegated to a cancellable worker below.
         result={'status':'failed' if failure else 'succeeded','child':child,'exitCode':None if process is None else process.poll(),
-            'possibleSurvivors':possible,'signals':signals,'stdoutBytes':forwarded if forwarding else len(stdout),
+            'possibleSurvivors':possible,'ownedChildren':[] if child is None else [child],'signals':signals,'stdoutBytes':forwarded if forwarding else len(stdout),
             'stdoutSha256':forward_hash.hexdigest() if forwarding else hashlib.sha256(stdout).hexdigest(),
             'error':None if failure is None else str(failure)[:4096]}
-        _persist_files(directory,{'stdout.log':bytes(stdout),'stderr.log':bytes(stderr),'process-result.json':_encode(result)},deadline=time.monotonic()+min(1, max(.05,guest_deadline-time.monotonic())))
-    if failure is not None:raise failure
+        try:_persist_files(directory,{'stdout.log':bytes(stdout),'stderr.log':bytes(stderr),'process-result.json':_encode(result)},deadline=_shared_end(guest_deadline,True) if failure else guest_deadline)
+        except BaseException as persistence:
+            failure=_failure(failure or persistence,**result,persistenceErrors=[_error_text(persistence)])
+    if failure is not None:raise _failure(failure,**result)
     return {**result,'stdout':bytes(stdout),'stderr':bytes(stderr)}
 
 
 def _fork_job(function,*,deadline,evidence_path):
     """Supervise blocking local disk/hash work; no blocking parent disk/reap."""
+    deadline=min(deadline,_shared_end(deadline));_remaining(deadline)
     ready_r,ready_w=os.pipe();ack_r,ack_w=os.pipe();result_r,result_w=os.pipe()
     pid=os.fork()
     if pid==0:
@@ -431,6 +469,7 @@ def _fork_job(function,*,deadline,evidence_path):
     try:
         if _byte(ready_r,min(deadline,time.monotonic()+5))!=b'H':raise ValueError('disk worker handshake failed')
         child=_proc_fields(pid)
+        _register_owner(child,deadline)
         if not _owned(child):raise ValueError('disk worker identity differs')
         os.write(ack_w,_encode({**child,'operationNonce':uuid.uuid4().hex,'status':'registered'}))
         if _byte(ready_r,min(deadline,time.monotonic()+5))!=b'R' or not _owned(child):
@@ -457,16 +496,18 @@ def _fork_job(function,*,deadline,evidence_path):
         return value['value']
     except BaseException as error:
         import signal
+        end=_shared_end(deadline,True);signals=[]
         for sig,seconds in ((signal.SIGTERM,2),(signal.SIGKILL,3)):
-            if reaped:break
+            if reaped or time.monotonic()>=end:break
             if child is None or not _owned(child):break
-            os.killpg(pid,sig);end=time.monotonic()+seconds
-            while time.monotonic()<end:
+            try:os.killpg(pid,sig);signals.append(sig.name)
+            except ProcessLookupError:break
+            phase_end=min(end,time.monotonic()+seconds)
+            while time.monotonic()<phase_end:
                 got,_=os.waitpid(pid,os.WNOHANG)
                 if got:reaped=True;break
-                time.sleep(.005)
-        error.possible_survivors=not reaped
-        raise
+                time.sleep(min(.005,max(0,phase_end-time.monotonic())))
+        raise _failure(error,child=child,ownedChildren=[] if child is None else [child],signals=signals,possibleSurvivors=not reaped)
     finally:
         for fd in (ready_r,ack_w,result_r):os.close(fd)
 
@@ -480,13 +521,16 @@ def _persist_files(directory,files,*,deadline):
     raise ValueError('guest persistence requires Linux')
 
 
-def stage_input(stream,path,sha256,size,*,guest_deadline):
+def stage_input(stream,path,sha256,size,*,guest_deadline,filesystem=None,required_available=0):
     _hex(sha256);_integer(size);_remaining(guest_deadline)
     path=Path(path)
     def copy():
         parent=_safe_dir(str(path.parent),root_owned=False,create=False)
         parent_stamp=_stamp(os.fstat(parent))
         try:
+            if filesystem is not None:
+                space=os.fstatvfs(parent)
+                if (parent_stamp[0],parent_stamp[1])!=(filesystem['device'],filesystem['inode']) or space.f_bavail*space.f_frsize<required_available:raise ValueError('actual spool target changed or lacks capacity')
             fd=os.open(path.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
             try:
                 digest=hashlib.sha256();count=0
@@ -514,7 +558,49 @@ def stage_input(stream,path,sha256,size,*,guest_deadline):
     return Path(_fork_job(copy,deadline=guest_deadline,evidence_path=path.parent/('spool-worker-'+uuid.uuid4().hex+'.json')))
 
 
-def _pump_host(argv,*,input_file,deadline,input_bytes=None):
+def _native_job(process):
+    """Owned Windows Job keeps blocking native descendants under the host owner."""
+    if os.name!='nt':return None
+    import ctypes
+    from ctypes import wintypes
+    kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+    class Basic(ctypes.Structure):
+        _fields_=[('processTime',ctypes.c_longlong),('jobTime',ctypes.c_longlong),('flags',wintypes.DWORD),('minimum',ctypes.c_size_t),('maximum',ctypes.c_size_t),('active',wintypes.DWORD),('affinity',ctypes.c_size_t),('priority',wintypes.DWORD),('scheduling',wintypes.DWORD)]
+    class IO(ctypes.Structure):_fields_=[(name,ctypes.c_ulonglong) for name in ('readOps','writeOps','otherOps','readBytes','writeBytes','otherBytes')]
+    class Extended(ctypes.Structure):_fields_=[('basic',Basic),('io',IO),('processMemory',ctypes.c_size_t),('jobMemory',ctypes.c_size_t),('peakProcess',ctypes.c_size_t),('peakJob',ctypes.c_size_t)]
+    kernel.CreateJobObjectW.restype=wintypes.HANDLE
+    kernel.SetInformationJobObject.argtypes=[wintypes.HANDLE,ctypes.c_int,wintypes.LPVOID,wintypes.DWORD]
+    kernel.AssignProcessToJobObject.argtypes=[wintypes.HANDLE,wintypes.HANDLE]
+    kernel.CloseHandle.argtypes=[wintypes.HANDLE]
+    handle=kernel.CreateJobObjectW(None,None)
+    if not handle:raise ctypes.WinError(ctypes.get_last_error())
+    limits=Extended();limits.basic.flags=0x2000 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    try:
+        if not kernel.SetInformationJobObject(handle,9,ctypes.byref(limits),ctypes.sizeof(limits)):raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel.AssignProcessToJobObject(handle,int(process._handle)):raise ctypes.WinError(ctypes.get_last_error())
+    except BaseException:kernel.CloseHandle(handle);raise
+    return lambda:kernel.CloseHandle(handle)
+
+_HOST_TRANSACTION_WORKER=False
+_HOST_ABSOLUTE_CANCEL_END=None
+_HOST_CANCEL_MAP=None
+
+def _host_cancel_end(deadline,*,start=False):
+    global _HOST_ABSOLUTE_CANCEL_END
+    import struct
+    end=deadline+5
+    if _HOST_ABSOLUTE_CANCEL_END is not None:end=min(end,_HOST_ABSOLUTE_CANCEL_END)
+    if _HOST_CANCEL_MAP is not None:end=min(end,struct.unpack('d',_HOST_CANCEL_MAP[:8])[0])
+    if start:
+        end=min(end,time.monotonic()+5)
+        if _HOST_ABSOLUTE_CANCEL_END is not None:_HOST_ABSOLUTE_CANCEL_END=end
+        # Only the owned transaction writes this shared endpoint. The outer
+        # parent reads it before cancelling or persisting ambiguous evidence.
+        if _HOST_TRANSACTION_WORKER and _HOST_CANCEL_MAP is not None:_HOST_CANCEL_MAP[:8]=struct.pack('d',end)
+    return end
+
+
+def _pump_host(argv,*,input_file,deadline,input_bytes=None,pass_fds=()):
     """Native binary descriptor forwarding with independent bounded host deadline.
 
     os.set_blocking supports Windows anonymous pipes on supported Python (3.12+).
@@ -526,15 +612,19 @@ def _pump_host(argv,*,input_file,deadline,input_bytes=None):
         from docker_transport import _stdin
         _stdin(input_file)
     if input_bytes is not None and len(input_bytes)>2*STDERR_CAP:raise ValueError('host control input exceeds cap')
+    deadline=min(deadline,_host_cancel_end(deadline));_remaining(deadline)
     process=subprocess.Popen(argv,stdin=subprocess.PIPE if input_bytes is not None else input_file if input_file is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0,shell=False)
+        stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0,shell=False,start_new_session=os.name=='posix' and not _HOST_TRANSACTION_WORKER,**({'pass_fds':pass_fds} if os.name=='posix' else {}))
+    job=None;host_child=None
     out=bytearray();err=bytearray();channels={process.stdout.fileno():(process.stdout,out,CONTROL_CAP),process.stderr.fileno():(process.stderr,err,STDERR_CAP)}
     pending=memoryview(input_bytes) if input_bytes is not None else None
     try:
+        job=_native_job(process)
+        if os.name=='posix' and not _HOST_TRANSACTION_WORKER:host_child=_proc_fields(process.pid)
         for fd in channels:os.set_blocking(fd,False)
         if pending is not None:os.set_blocking(process.stdin.fileno(),False)
         while channels or process.poll() is None or pending is not None:
-            _remaining(deadline);progress=False
+            _remaining(min(deadline,_host_cancel_end(deadline)));progress=False
             if pending is not None:
                 try:
                     if pending:
@@ -549,23 +639,33 @@ def _pump_host(argv,*,input_file,deadline,input_bytes=None):
                 if not data:stream.close();del channels[fd];progress=True;continue
                 if len(target)+len(data)>cap:raise ValueError('host channel exceeds cap')
                 target.extend(data);progress=True
-            if not progress:time.sleep(min(.005,_remaining(deadline)))
+            if not progress:time.sleep(min(.005,_remaining(min(deadline,_host_cancel_end(deadline)))))
         if process.returncode:raise ValueError('host invocation exited nonzero: '+str(process.returncode))
         return {'stdout':bytes(out),'stderr':bytes(err),'exitCode':process.returncode}
     except BaseException as error:
         # Popen's owned native process handle authorizes this exact process only;
         # Linux descendants retain their own independent guest watchdog budget.
-        if process.poll() is None:
+        cancel_end=_host_cancel_end(deadline,start=True)
+        if process.poll() is None and host_child is not None:
+            _cancel(process,host_child,deadline=cancel_end)
+        elif process.poll() is None:
             process.terminate()
-            end=time.monotonic()+2
+            end=min(cancel_end,time.monotonic()+2)
             while process.poll() is None and time.monotonic()<end:time.sleep(.005)
             if process.poll() is None:
-                process.kill();end=time.monotonic()+3
+                process.kill();end=cancel_end
                 while process.poll() is None and time.monotonic()<end:time.sleep(.005)
         error.partial_stdout=bytes(out);error.partial_stderr=bytes(err)
-        error.possible_survivors=True
-        raise
+        failure=_failure(error,possibleSurvivors=True,hostChild=host_child,hostStdoutBytes=len(out),hostStderrBytes=len(err))
+        for line in bytes(err).splitlines():
+            for prefix in (b'P01_TRANSFER_FAILURE: ',b'P01_OWNER_FAILURE: '):
+                if line.startswith(prefix):
+                    try:failure=_failure(failure,**_decode(line[len(prefix):]))
+                    except (ValueError,TypeError,KeyError):pass
+        failure.partial_stdout=bytes(out);failure.partial_stderr=bytes(err)
+        raise failure
     finally:
+        if job is not None:job()
         for stream in (process.stdin if input_bytes is not None else None,process.stdout,process.stderr):
             if stream is not None and not stream.closed:stream.close()
 
@@ -713,7 +813,7 @@ def stream_admitted(handle,argv,*,input_file,output_policy,guest_deadline,operat
 # Fixed admitted command. Receiving authority comes only from host-generated
 # qualified request; no shell, candidate command or incomplete harness import.
 _RECEIVER = r'''import hashlib,json,os,stat,sys,types
-root,pins,path,sha,size,mode=sys.argv[1:];pins=json.loads(pins)
+root,pins,path,sha,size,mode,allocation=sys.argv[1:];pins=json.loads(pins);allocation=json.loads(allocation)
 if set(pins)!={'wsl_environment.py','wsl_environment_guest.py','docker_transport.py','development_image_migration.py','qualification_image_archive.py'}:raise ValueError('accepted helper closure differs')
 parent=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
 try:
@@ -741,6 +841,24 @@ for name in ('qualification_image_archive.py','docker_transport.py','wsl_environ
  m=types.ModuleType(name[:-3]);m.__file__=root+'/'+name;sys.modules[name[:-3]]=m
  exec(compile(sources[name],m.__file__,'exec'),m.__dict__)
 from wsl_environment_guest import receive_file
+# The accepted receiver remains byte-identical. Its actual descriptor-relative
+# opens are additionally constrained to the observed role root and backing store.
+real_open=os.open;positions={};target=allocation['target']
+def bound_open(name,flags,*args,**kw):
+ parent=kw.get('dir_fd');position=name if parent is None else positions.get(parent,'').rstrip('/')+'/'+name
+ if flags&os.O_CREAT:
+  s=os.fstat(parent);space=os.fstatvfs(parent)
+  if s.st_dev!=target['device'] or space.f_bavail*space.f_frsize<allocation['requiredAvailable']:raise ValueError('actual receiver target device/capacity differs')
+ fd=real_open(name,flags,*args,**kw)
+ try:
+  s=os.fstat(fd)
+  if stat.S_ISDIR(s.st_mode):
+   position=position.rstrip('/') or '/';positions[fd]=position
+   if position==target['directory'] and (s.st_dev,s.st_ino)!=(target['device'],target['inode']):raise ValueError('receiver role root replaced')
+   if position.startswith(target['directory']+'/') and s.st_dev!=target['device']:raise ValueError('receiver child filesystem differs')
+  return fd
+ except BaseException:os.close(fd);raise
+os.open=bound_open
 print(json.dumps(receive_file(path,sha,int(size),int(mode),sys.stdin.buffer)))
 '''
 
@@ -789,18 +907,38 @@ def _latch(request,error,deadline):
     _fork_job(write,deadline=deadline,evidence_path=Path(_guest_context(request))/('latch-worker-'+uuid.uuid4().hex+'.json'))
 
 
+def _target_space(path):
+    """Observe the actual nofollow allocation directory, or nearest existing one."""
+    parts=PurePosixPath(path)
+    if not parts.is_absolute() or parts.as_posix()!=str(path) or '..' in parts.parts:raise ValueError('canonical allocation target required')
+    fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);resolved=''
+    try:
+        for name in parts.parts[1:]:
+            try:child=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+            except FileNotFoundError:break
+            info=os.fstat(child)
+            if info.st_uid or info.st_gid:os.close(child);raise ValueError('allocation directory owner differs')
+            os.close(fd);fd=child;resolved+='/'+name
+        info=os.fstat(fd);space=os.fstatvfs(fd)
+        import ctypes
+        raw=ctypes.create_string_buffer(256)
+        if ctypes.CDLL(None,use_errno=True).fstatfs(fd,raw)!=0:raise OSError(ctypes.get_errno(),'fstatfs failed')
+        return {'available':space.f_bavail*space.f_frsize,'device':info.st_dev,'filesystemType':ctypes.c_long.from_buffer(raw).value,
+            'directory':resolved or '/','inode':info.st_ino}
+    finally:os.close(fd)
+
+
 def _guest_capacity(request,base,retained,deadline,role='handoff'):
     directory=_guest_context(request)
     actual=_payload_command(request,{'action':'capacity','role':role},deadline,directory)
     if actual['available']<request['requiredBytes']-actual['retained']:
         raise ValueError('insufficient actual admitted bavail')
     def management_space():
-        info=os.statvfs('/var/lib/'+request['s2Generation'])
-        return {'available':info.f_bavail*info.f_frsize,'device':os.stat('/var/lib/'+request['s2Generation']).st_dev}
+        return _target_space('/var/lib/'+request['s2Generation']+'/s3/'+request['generation']+'/staging/'+role)
     management=_fork_job(management_space,deadline=deadline,evidence_path=Path(directory)/('spool-capacity-'+uuid.uuid4().hex+'.json'))
-    if management['device']!=actual['device'] or management['available']<request['requiredBytes']-actual['retained']:
+    if (management['device'],management['filesystemType'])!=(actual['device'],actual['filesystemType']) or management['available']<request['requiredBytes']-actual['retained']:
         raise ValueError('management spool filesystem/capacity differs from authoritative destination')
-    return actual
+    return {**actual,'managementSpool':management}
 
 
 def _guest_install(request,deadline,directory):
@@ -842,16 +980,16 @@ def _guest_receive(request,member,directory):
         else:os.close(_safe_dir(spool_root+'/'+role,create=False))
         return None
     _fork_job(allocate_spool,deadline=deadline,evidence_path=evidence/('spool-allocation-'+uuid.uuid4().hex+'.json'))
-    _guest_capacity(request,base,prepared['retained'],deadline,role)
+    capacity=_guest_capacity(request,base,prepared['retained'],deadline,role)
     pin=member['pin'];ordinal=member['ordinal']
     stage=Path(base)/'staging'/role/('member-'+str(ordinal)+'.partial')
     record={'schemaVersion':1,'operationNonce':request['nonce'],'action':'receive','status':'started','child':None,
         'bytes':0,'sha256':None,'sealSha256':None,'error':None,'possibleSurvivors':False,'observations':[]}
     try:
-        spool=stage_input(sys.stdin.buffer,stage,pin['sha256'],pin['bytes'],guest_deadline=deadline)
+        spool=stage_input(sys.stdin.buffer,stage,pin['sha256'],pin['bytes'],guest_deadline=deadline,filesystem=capacity['managementSpool'],required_available=request['requiredBytes']-capacity['retained'])
         destination=base+'/inputs/'+role+'/'+member['name']
         child_dir=evidence/'payload';os.close(_safe_dir(str(child_dir),exclusive=True))
-        argv=['/usr/bin/python3','-I','-B','-c',_RECEIVER,request['codeRoot'],json.dumps(request['helpers']),destination,pin['sha256'],str(pin['bytes']),str(pin['mode'])]
+        argv=['/usr/bin/python3','-I','-B','-c',_RECEIVER,request['codeRoot'],json.dumps(request['helpers']),destination,pin['sha256'],str(pin['bytes']),str(pin['mode']),json.dumps({'target':capacity['targets']['destination'],'requiredAvailable':request['requiredBytes']-capacity['retained']})]
         with spool.open('rb') as incoming:
             result=stream_admitted(request['handle'],argv,input_file=incoming,output_policy='RECEIVER_CONTROL',guest_deadline=deadline,operation_directory=child_dir)
         expected={'path':destination,'sha256':pin['sha256'],'bytes':pin['bytes'],'mode':pin['mode']}
@@ -867,37 +1005,17 @@ def _guest_receive(request,member,directory):
         _payload_command(request,{'action':'record','role':role,'ordinal':ordinal,'name':member['name'],'record':record},deadline,directory)
         return record
     except BaseException as error:
-        record.update(status='failed',error=str(error).encode()[:4096].decode(errors='replace'),possibleSurvivors=bool(getattr(error,'possible_survivors',False)))
-        try:_persist_files(evidence,{'failed.json':_encode(record)},deadline=min(deadline,time.monotonic()+1))
-        finally:_latch(request,error,time.monotonic()+1)
-        raise
+        record.update(status='failed',child=getattr(error,'facts',{}).get('child'),error=_error_text(error),possibleSurvivors=bool(getattr(error,'possible_survivors',False)))
+        validate_operation_record(record)
+        end=_shared_end(deadline,True)
+        try:_persist_files(evidence,{'failed.json':_encode(record),'failure-facts.json':_encode(getattr(error,'facts',{}))},deadline=end)
+        except BaseException as persistence:error=_failure(error,persistenceErrors=[_error_text(persistence)])
+        try:_latch(request,error,end)
+        except BaseException as persistence:error=_failure(error,persistenceErrors=[_error_text(persistence)])
+        raise error
 
 
-_FINALIZE = r'''import hashlib,json,os,stat,sys
-base,files,dirs=sys.argv[1:];files=json.loads(files);dirs=json.loads(dirs)
-def visit(root):
- actual_files={};actual_dirs=[]
- for current,children,names in os.walk(root,followlinks=False):
-  for name in children:
-   p=os.path.join(current,name);s=os.lstat(p)
-   if not stat.S_ISDIR(s.st_mode):raise ValueError('linked directory')
-   actual_dirs.append(os.path.relpath(p,root))
-  for name in names:
-   p=os.path.join(current,name);s=os.lstat(p)
-   if not stat.S_ISREG(s.st_mode) or s.st_nlink!=1:raise ValueError('nonregular member')
-   n=os.path.relpath(p,root);h=hashlib.sha256();count=0
-   with open(p,'rb') as f:
-    while b:=f.read(1048576):h.update(b);count+=len(b)
-   actual_files[n]={'bytes':count,'sha256':h.hexdigest(),'mode':stat.S_IMODE(s.st_mode)}
- return actual_files,actual_dirs
-actual,actual_dirs=visit(base)
-if actual!=files or set(actual_dirs)!=set(dirs):raise ValueError('completed input closure differs')
-for name in sorted(dirs,key=lambda n:(n.count('/'),n),reverse=True):os.chmod(base+'/'+name,0o555,follow_symlinks=False)
-os.chmod(base,0o555,follow_symlinks=False)
-actual,actual_dirs=visit(base)
-if actual!=files or any(stat.S_IMODE(os.lstat(base+'/'+n).st_mode)!=0o555 for n in dirs) or stat.S_IMODE(os.lstat(base).st_mode)!=0o555:raise ValueError('completed modes differ')
-print(json.dumps({'status':'input-closure-complete','files':len(actual),'directories':len(actual_dirs)}))
-'''
+_FINALIZE = "import hashlib,json,os,stat,sys\nbase,files,dirs=sys.argv[1:];files=json.loads(files);dirs=json.loads(dirs)\ndef stamp(s):return (s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)\ndef identity(s):return (s.st_dev,s.st_ino,stat.S_IFMT(s.st_mode))\nheld=[];links=[];handles={};file_handles={};actual={}\ndef directory(parent,name):\n fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)\n held.append(fd);s=os.fstat(fd)\n if s.st_uid or s.st_gid:raise ValueError('directory owner differs')\n links.append((parent,name,fd));return fd\ndef verify_links():\n for parent,name,fd in links:\n  if identity(os.stat(name,dir_fd=parent,follow_symlinks=False))!=identity(os.fstat(fd)):raise ValueError('directory replaced')\ndef scan(fd,prefix=''):\n expected={n.split('/')[0] for n in files if n.startswith(prefix) for n in [n[len(prefix):]]}\n expected|={n[len(prefix):].split('/')[0] for n in dirs if n.startswith(prefix)}\n if set(os.listdir(fd))!=expected:raise ValueError('completed input closure differs')\n for name in sorted(expected):\n  path=prefix+name;s=os.stat(name,dir_fd=fd,follow_symlinks=False)\n  if path in dirs:\n   child=directory(fd,name);handles[path]=child;scan(child,path+'/')\n  else:\n   if path not in files or not stat.S_ISREG(s.st_mode) or s.st_nlink!=1 or s.st_uid or s.st_gid:raise ValueError('unsafe file member')\n   f=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd);held.append(f);first=os.fstat(f)\n   if stamp(s)!=stamp(first):raise ValueError('member replaced before open')\n   h=hashlib.sha256();count=0\n   while b:=os.read(f,1048576):h.update(b);count+=len(b)\n   if stamp(first)!=stamp(os.fstat(f)) or stamp(first)!=stamp(os.stat(name,dir_fd=fd,follow_symlinks=False)):raise ValueError('member replaced during hash')\n   actual[path]={'bytes':count,'sha256':h.hexdigest(),'mode':stat.S_IMODE(first.st_mode)}\n   file_handles[path]=(fd,name,f,stamp(first))\n verify_links()\ndef recheck():\n verify_links()\n for path,(parent,name,fd,first) in file_handles.items():\n  if first!=stamp(os.fstat(fd)) or first!=stamp(os.stat(name,dir_fd=parent,follow_symlinks=False)):raise ValueError('completed member replaced')\n for path,fd in handles.items():\n  prefix=path+'/' if path else ''\n  expected={n[len(prefix):].split('/')[0] for n in list(files)+dirs if n.startswith(prefix)}\n  if set(os.listdir(fd))!=expected:raise ValueError('completed member set changed')\ntry:\n if not base.startswith('/') or any(v in ('','.','..') for v in base.split('/')[1:]):raise ValueError('canonical root required')\n current=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);held.append(current)\n for part in base.split('/')[1:]:current=directory(current,part)\n handles['']=current;scan(current)\n if actual!=files or set(handles)-{''}!=set(dirs):raise ValueError('completed input closure differs')\n recheck()\n for path in sorted(handles,key=lambda n:(n.count('/'),len(n),n),reverse=True):\n  recheck();os.fchmod(handles[path],0o555);os.fsync(handles[path])\n recheck()\n if any(stat.S_IMODE(os.fstat(fd).st_mode)!=0o555 for fd in handles.values()):raise ValueError('completed directory mode differs')\n print(json.dumps({'status':'input-closure-complete','files':len(actual),'directories':len(dirs)}))\nfinally:\n for fd in reversed(held):os.close(fd)\n"
 
 
 def _guest_finalize(request,role,directory):
@@ -915,128 +1033,7 @@ def _guest_finalize(request,role,directory):
 # Inline installer is deliberately independent of the untransferred guest harness.
 # Its dedicated process group is verified before the installer receives an ack;
 # the installed adapter has its own independently enforced nested work deadline.
-_BOOTSTRAP = r'''import hashlib,json,os,signal,stat,sys,time
-r=json.loads(sys.argv[1]);start=time.monotonic();deadline=start+r['duration']
-base='/opt/'+r['s2Generation']+'/s3-admission-observations/'+r['generation'];directory=base+'/'+r['nonce']
-def fields(pid):
- f=open('/proc/'+str(pid)+'/stat').read().rsplit(')',1)[1].split()
- return {'pid':pid,'starttime':f[19],'pgid':int(f[2]),'sid':int(f[3])}
-def mkdir(path,exclusive=False):
- fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
- try:
-  parts=path.split('/')[1:]
-  for i,name in enumerate(parts):
-   if not name or name in ('.','..'):raise ValueError('unsafe evidence path')
-   try:os.mkdir(name,0o700,dir_fd=fd)
-   except FileExistsError:
-    if exclusive and i==len(parts)-1:raise
-   n=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);s=os.fstat(n)
-   if s.st_uid or s.st_gid:raise ValueError('evidence owner differs')
-   os.close(fd);fd=n
-  return fd
- except BaseException:os.close(fd);raise
-ready_r,ready_w=os.pipe();ack_r,ack_w=os.pipe();pid=os.fork()
-if pid==0:
- try:
-  os.close(ready_r);os.close(ack_w);os.setsid();os.write(ready_w,b'H')
-  raw=b''
-  while not raw.endswith(b'\n'):
-   b=os.read(ack_r,4096)
-   if not b:raise ValueError('bootstrap parent disconnected')
-   raw+=b
-   if len(raw)>65536:raise ValueError('registration too large')
-  identity=json.loads(raw)
-  parent=mkdir(base)
-  try:
-   if 'generation-failed.json' in os.listdir(parent):raise ValueError('failed generation cannot retry')
-   # An incomplete earlier public operation is a generation latch as well.
-   for name in os.listdir(parent):
-    if len(name)==32 and all(c in '0123456789abcdef' for c in name):
-     prior=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
-     try:
-      if 'public-complete.json' not in os.listdir(prior):raise ValueError('unfinished generation cannot retry')
-     finally:os.close(prior)
-  finally:os.close(parent)
-  root=mkdir(directory,True)
-  def write(name,data):
-   fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=root)
-   try:
-    v=memoryview(data)
-    while v:
-     n=os.write(fd,v)
-     if n<=0:raise OSError('zero write')
-     v=v[n:]
-    os.fsync(fd)
-   finally:os.close(fd)
-  write('bootstrap-child.json',raw);os.write(ready_w,b'R')
-  if os.read(ack_r,1)!=b'E':raise ValueError('bootstrap exec not acknowledged')
-  os.close(ready_w);os.close(ack_r)
-  fd=os.open('adapter.py',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400,dir_fd=root)
-  h=hashlib.sha256();n=0
-  try:
-   while True:
-    b=sys.stdin.buffer.read(min(1048576,r['adapter']['bytes']-n+1))
-    if not b:break
-    n+=len(b)
-    if n>r['adapter']['bytes']:raise ValueError('adapter too long')
-    h.update(b);v=memoryview(b)
-    while v:
-     k=os.write(fd,v)
-     if k<=0:raise OSError('adapter write stalled')
-     v=v[k:]
-   if n!=r['adapter']['bytes'] or h.hexdigest()!=r['adapter']['sha256']:raise ValueError('adapter substitution')
-   os.fsync(fd);first=os.fstat(fd)
-  finally:os.close(fd)
-  fd=os.open('adapter.py',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=root)
-  try:
-   s=os.fstat(fd);code=b''
-   while b:=os.read(fd,1048576):code+=b
-   if (s.st_dev,s.st_ino,s.st_size)!=(first.st_dev,first.st_ino,first.st_size) or hashlib.sha256(code).hexdigest()!=r['adapter']['sha256']:raise ValueError('installed adapter changed')
-  finally:os.close(fd);os.close(root)
-  namespace={'__name__':'p01_frozen_adapter','__file__':directory+'/adapter.py'}
-  exec(compile(code,namespace['__file__'],'exec'),namespace)
-  result=namespace['_guest_install'](r,deadline,directory)
-  os.write(1,(json.dumps(result)+'\n').encode());os._exit(0)
- except BaseException as error:
-  try:
-   root=mkdir(base);fd=os.open('generation-failed.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=root)
-   os.write(fd,(json.dumps({'nonce':r['nonce'],'error':str(error)[:4096]})+'\n').encode());os.fsync(fd);os.close(fd);os.close(root)
-  except BaseException:pass
-  try:os.write(2,(str(error)+'\n').encode()[:4096])
-  finally:os._exit(1)
-os.close(ready_w);os.close(ack_r);os.set_blocking(ready_r,False);child=None
-try:
- stage=0
- while True:
-  if time.monotonic()>=deadline:raise TimeoutError('bootstrap deadline')
-  try:b=os.read(ready_r,1)
-  except BlockingIOError:time.sleep(.005);continue
-  if b==b'H' and stage==0:
-   child=fields(pid)
-   if child['pgid']!=pid or child['sid']!=pid:raise ValueError('bootstrap session differs')
-   os.write(ack_w,(json.dumps({**child,'nonce':r['nonce']})+'\n').encode());stage=1
-  elif b==b'R' and stage==1:
-   if fields(pid)!=child:raise ValueError('bootstrap identity changed')
-   os.write(ack_w,b'E');break
-  else:raise ValueError('bootstrap handshake failed')
- while True:
-  got,status=os.waitpid(pid,os.WNOHANG)
-  if got:raise SystemExit(os.waitstatus_to_exitcode(status))
-  if time.monotonic()>=deadline:raise TimeoutError('bootstrap deadline')
-  time.sleep(.005)
-except (Exception,KeyboardInterrupt):
- for sig,seconds in ((signal.SIGTERM,2),(signal.SIGKILL,3)):
-  try:
-   if child is None or fields(pid)!=child:break
-   os.killpg(pid,sig)
-  except (FileNotFoundError,ProcessLookupError):break
-  end=time.monotonic()+seconds
-  while time.monotonic()<end:
-   got,status=os.waitpid(pid,os.WNOHANG)
-   if got:raise SystemExit(1)
-   time.sleep(.005)
- raise SystemExit(1)
-'''
+_BOOTSTRAP_BODY = "import hashlib,stat\nr=json.loads(sys.argv[1]);base='/opt/'+r['s2Generation']+'/s3-admission-observations/'+r['generation'];directory=base+'/'+r['nonce']\ndef mkdir(path,exclusive=False):\n fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)\n try:\n  parts=path.split('/')[1:]\n  for i,name in enumerate(parts):\n   if not name or name in ('.','..'):raise ValueError('unsafe evidence path')\n   try:os.mkdir(name,0o700,dir_fd=fd)\n   except FileExistsError:\n    if exclusive and i==len(parts)-1:raise\n   n=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);s=os.fstat(n)\n   if s.st_uid or s.st_gid:raise ValueError('evidence owner differs')\n   os.close(fd);fd=n\n  return fd\n except BaseException:os.close(fd);raise\nparent=mkdir(base)\ntry:\n if 'generation-failed.json' in os.listdir(parent):raise ValueError('failed generation cannot retry')\n # An incomplete earlier public operation is a generation latch as well.\n for name in os.listdir(parent):\n  if name!=r['nonce'] and len(name)==32 and all(c in '0123456789abcdef' for c in name):\n   prior=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)\n   try:\n    if 'public-complete.json' not in os.listdir(prior):raise ValueError('unfinished generation cannot retry')\n    completed=os.open('public-complete.json',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=prior)\n    try:\n     meta=os.fstat(completed)\n     if not stat.S_ISREG(meta.st_mode) or meta.st_nlink!=1 or meta.st_uid or meta.st_gid or meta.st_size>65536:raise ValueError('unsafe provisional history')\n     prior_record=json.loads(os.read(completed,65537))\n    finally:os.close(completed)\n    eligible=[entry for entry in r.get('hostHistory',[]) if entry['operationNonce']==name]\n    if len(eligible)!=1:raise ValueError('prior host success was not observed by this live host owner')\n    witness=eligible[0]\n    expected={'status':'provisional','context':witness['context'],'role':witness['role'],'nonce':name,'hostReceipt':witness['preparedReceipt']}\n    if prior_record!=expected:raise ValueError('provisional guest and final host history differ')\n   finally:os.close(prior)\nfinally:os.close(parent)\nroot=mkdir(directory)\ndef write(name,data):\n fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=root)\n try:\n  v=memoryview(data)\n  while v:\n   n=os.write(fd,v)\n   if n<=0:raise OSError('zero write')\n   v=v[n:]\n  os.fsync(fd)\n finally:os.close(fd)\nfd=os.open('adapter.py',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400,dir_fd=root)\nh=hashlib.sha256();n=0\ntry:\n while True:\n  b=sys.stdin.buffer.read(min(1048576,r['adapter']['bytes']-n+1))\n  if not b:break\n  n+=len(b)\n  if n>r['adapter']['bytes']:raise ValueError('adapter too long')\n  h.update(b);v=memoryview(b)\n  while v:\n   k=os.write(fd,v)\n   if k<=0:raise OSError('adapter write stalled')\n   v=v[k:]\n if n!=r['adapter']['bytes'] or h.hexdigest()!=r['adapter']['sha256']:raise ValueError('adapter substitution')\n os.fsync(fd);first=os.fstat(fd)\nfinally:os.close(fd)\nfd=os.open('adapter.py',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=root)\ntry:\n s=os.fstat(fd);code=b''\n while b:=os.read(fd,1048576):code+=b\n if (s.st_dev,s.st_ino,s.st_size)!=(first.st_dev,first.st_ino,first.st_size) or hashlib.sha256(code).hexdigest()!=r['adapter']['sha256']:raise ValueError('installed adapter changed')\nfinally:os.close(fd);os.close(root)\nnamespace={'__name__':'p01_frozen_adapter','__file__':directory+'/adapter.py'}\nexec(compile(code,namespace['__file__'],'exec'),namespace)\nresult=namespace['_guest_install'](r,deadline,directory)\nos.write(1,(json.dumps(result)+'\\n').encode())\n"
 
 
 _ENTRY = r'''import hashlib,json,os,stat,sys
@@ -1067,15 +1064,93 @@ try:
  elif action=='finalize':result=namespace['_guest_finalize'](r,argument,directory)
  elif action=='complete':
   deadline=namespace['_read_session'](r,directory)
-  namespace['_persist_files'](directory,{'public-complete.json':namespace['_encode']({'status':'succeeded','context':namespace['_context_identity'](r)})},deadline=deadline)
+  namespace['_persist_files'](directory,{'public-complete.json':namespace['_encode']({'status':'provisional','context':namespace['_context_identity'](r),'role':r['role'],'nonce':r['nonce'],'hostReceipt':argument})},deadline=deadline)
   result={'status':'succeeded','nonce':r['nonce']}
  else:raise ValueError('unknown fixed action')
  os.write(1,namespace['_encode'](result))
 except BaseException as error:
- try:namespace['_latch'](r,error,__import__('time').monotonic()+1)
+ try:os.write(2,b'P01_TRANSFER_FAILURE: '+namespace['_encode']({'error':namespace['_error_text'](error),**getattr(error,'facts',{})}))
+ except BaseException:pass
+ try:namespace['_latch'](r,error,namespace['_shared_end'](deadline,True))
  except BaseException:pass
  raise
 '''
+
+
+# Live history adds only rejection; every call still qualifies and admits afresh.
+import threading
+_HOST_PROCESS=os.getpid();_HOST_INSTANCE=object();_HOST_HISTORY={};_HOST_GATE=threading.RLock()
+_LAST_HOST_WITNESS=None
+
+def _discard_host_history():
+    global _HOST_PROCESS,_HOST_INSTANCE,_HOST_GATE
+    _HOST_HISTORY.clear();_HOST_PROCESS=os.getpid();_HOST_INSTANCE=object();_HOST_GATE=threading.RLock()
+if hasattr(os,'register_at_fork'):os.register_at_fork(after_in_child=_discard_host_history)
+
+@contextmanager
+def _host_public_guard():
+    if os.getpid()!=_HOST_PROCESS:_discard_host_history()
+    if not _HOST_GATE.acquire(blocking=False):raise ValueError('concurrent INPUT calls are rejected')
+    try:
+        try:yield
+        except BaseException:_HOST_HISTORY.clear();raise
+    finally:
+        try:_HOST_GATE.release()
+        except BaseException:_HOST_HISTORY.clear();raise
+
+def _host_context(context):
+    q=context['qualification']
+    return {'specRef':q['specRef'],'environment':q['environment'],'acceptance':q['s2Acceptance'],
+        'generation':context['spec']['generation'],'s2Generation':q['s2Generation'],'adapter':context['adapter'],'manifestPin':context['manifestPin']}
+
+def _history_key(context):return hashlib.sha256(_encode(_host_context(context))).hexdigest()
+
+def _observed_host_history(context):
+    return [entry['evidence'] for entry in _HOST_HISTORY.get(_history_key(context),[]) if entry['process']==os.getpid() and entry['instance'] is _HOST_INSTANCE]
+
+def _publish_host_witness(context,witness):
+    key=_history_key(context)
+    if witness['context']!=_host_context(context):raise ValueError('observed host witness context differs')
+    entries=_HOST_HISTORY.setdefault(key,[])
+    if any(entry['evidence']['role']==witness['role'] for entry in entries):raise ValueError('completed role cannot retry')
+    entries.append({'process':os.getpid(),'instance':_HOST_INSTANCE,'evidence':witness})
+    if len(_HOST_HISTORY)>64:
+        for old in list(_HOST_HISTORY):
+            if old!=key:del _HOST_HISTORY[old];break
+
+def _host_ref(output,name,deadline):
+    import source_build
+    path=Path(output)/name
+    with source_build._open(path) as incoming:
+        first=_stamp(os.fstat(incoming.fileno()));named=_stamp(os.stat(path,follow_symlinks=False))
+        if (first[0],first[1],first[2],first[5],first[6])!=(named[0],named[1],named[2],named[5],named[6]):raise ValueError('host evidence path identity differs')
+        pin=_hash(incoming)
+        if _stamp(os.fstat(incoming.fileno()))!=first or _stamp(os.stat(path,follow_symlinks=False))!=named:raise ValueError('host evidence changed during hash')
+    return {'path':str(path),**pin}
+
+def _read_host_ref(ref,deadline):
+    if type(ref) is not dict or set(ref)!= {'path','bytes','sha256'} or ref['bytes']>CONTROL_CAP:raise ValueError('host evidence ref differs')
+    with _pinned_source(ref['path'],ref['sha256'],ref['bytes'],deadline=deadline) as incoming:return _decode(incoming.read(CONTROL_CAP+1))
+
+def _verify_host_history(context,deadline):
+    import source_build
+    verified=[]
+    for entry in context.get('_hostHistory',[]):
+        if entry['context']!=_host_context(context):raise ValueError('predecessor host context differs')
+        output=Path(entry['receipt']['path']).parent
+        for terminal in ('failed.json','ambiguous.json'):
+            try:
+                with source_build._open(output/terminal):raise ValueError('predecessor terminal failure retained')
+            except FileNotFoundError:pass
+        prepared=_read_host_ref(entry['preparedReceipt'],deadline)
+        receipt=_read_host_ref(entry['receipt'],deadline);ack=_read_host_ref(entry['acknowledgement'],deadline)
+        closure=_read_host_ref(entry['closure'],deadline);index=_read_host_ref(entry['index'],deadline)
+        expected={key:entry[key] for key in ('context','role','operationNonce','preparedReceipt','receipt','acknowledgement','closure')}
+        if (prepared!=receipt or entry['preparedReceipt']['path']==entry['receipt']['path'] or index!=expected or receipt.get('status')!='input-transfer-complete' or receipt.get('role')!=entry['role']
+                or receipt.get('context')!=entry['context'] or receipt.get('operationNonce')!=entry['operationNonce']
+                or ack!={'status':'succeeded','nonce':entry['operationNonce']} or receipt.get('closure')!=closure):raise ValueError('predecessor durable completion differs')
+        verified.append(entry)
+    return verified
 
 
 def _new_host_operation(context,output_directory,deadline):
@@ -1102,6 +1177,7 @@ def _new_host_operation(context,output_directory,deadline):
             'harness':{name:{'bytes':entry['bytes'],'sha256':entry['sha256'],'mode':entry['transferMode']}
                 for name,entry in context['manifest']['files'].items()}}}
     request['members']['harness']['manifest.json']={**context['manifestPin'],'mode':0o444}
+    request['hostHistory']=_verify_host_history(context,deadline)
     _encode(request)
     prefix=[ready['wslExecutable'],'-d',ready['distro'],'--user','root','--exec','/usr/bin/python3','-I','-B']
     bootstrap=[*prefix,'-c',_BOOTSTRAP,json.dumps(request,separators=(',',':'))]
@@ -1122,15 +1198,15 @@ def _host_call(output,key,argv,incoming,deadline):
         # Preserve independently bounded partial channels through a cancellable
         # writer. Failure here remains failure, even when persistence also fails.
         for name,data in (('stdout',getattr(error,'partial_stdout',b'')),('stderr',getattr(error,'partial_stderr',b''))):
-            try:_host_write(output/(key+'.'+name+'.log'),data,time.monotonic()+1)
+            try:_host_write(output/(key+'.'+name+'.log'),data,_host_cancel_end(deadline,start=True))
             except BaseException:pass
         raise
     for name in ('stdout','stderr'):_host_write(output/(key+'.'+name+'.log'),result[name],deadline)
     return _decode(result['stdout'])
 
 
-def _run_transfer(context,role,members,output_directory):
-    deadline=time.monotonic()+context['timeout']
+def _run_transfer_inner(context,role,members,output_directory,*,deadline=None):
+    if deadline is None:deadline=time.monotonic()+context['timeout']
     context['role']=role
     sources=ExitStack()
     incoming_sources={}
@@ -1160,43 +1236,139 @@ def _run_transfer(context,role,members,output_directory):
         sources.close()
         finalize=[*prefix,'-c',_ENTRY,json.dumps(request,separators=(',',':')),'finalize',json.dumps(role),str(max(1,math.ceil(_remaining(deadline))))]
         result['closure']=_host_call(output,'finalize',finalize,None,deadline)
-        complete=[*prefix,'-c',_ENTRY,json.dumps(request,separators=(',',':')),'complete','null',str(max(1,math.ceil(_remaining(deadline))))]
+        result['status']='input-transfer-complete'
+        _host_write(output/'prepared-result.json',_encode(result),deadline)
+        prepared=_host_ref(output,'prepared-result.json',deadline)
+        complete=[*prefix,'-c',_ENTRY,json.dumps(request,separators=(',',':')),'complete',json.dumps(prepared,separators=(',',':')),str(max(1,math.ceil(_remaining(deadline))))]
         if _host_call(output,'complete',complete,None,deadline)!={'status':'succeeded','nonce':request['nonce']}:
             raise ValueError('public completion changed')
-        result['status']='input-transfer-complete'
         _host_write(output/'result.json',_encode(result),deadline)
+        receipt=_host_ref(output,'result.json',deadline)
+        witness={'context':_context_identity(request),'role':role,'operationNonce':request['nonce'],'preparedReceipt':prepared,'receipt':receipt,
+            'acknowledgement':_host_ref(output,'complete.stdout.log',deadline),'closure':_host_ref(output,'finalize.stdout.log',deadline)}
+        _host_write(output/'eligibility.json',_encode(witness),deadline)
+        witness['index']=_host_ref(output,'eligibility.json',deadline)
+        global _LAST_HOST_WITNESS
+        _LAST_HOST_WITNESS=witness
         return result
     except BaseException as error:
         try:sources.close()
-        except BaseException as recheck_error:error=recheck_error
-        result.update(status='failed',error=str(error)[:4096],possibleSurvivors=bool(getattr(error,'possible_survivors',False)))
-        try:_host_write(output/'result.json',_encode(result),time.monotonic()+1)
+        except BaseException as recheck_error:error=_failure(error,persistenceErrors=['source recheck: '+_error_text(recheck_error)])
+        result.update(status='failed',error=_error_text(error),possibleSurvivors=bool(getattr(error,'possible_survivors',False)),failureFacts=getattr(error,'facts',{}))
+        try:_host_write(output/'failed.json',_encode(result),_host_cancel_end(deadline,start=True))
+        except BaseException:pass
+        try:_host_write(output/'result.json',_encode(result),_host_cancel_end(deadline,start=True))
         except BaseException:pass
         raise
 
 
+_HOST_TRANSACTION = r'''import hashlib,json,os,stat,sys
+payload=sys.stdin.buffer.read(2097153)
+if len(payload)>2097152:raise ValueError('host transaction request exceeds cap')
+p=json.loads(payload);sys.path.insert(0,p['helperRoot'])
+fd=os.open(p['module'],os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_BINARY',0))
+try:
+ first=os.fstat(fd)
+ if not stat.S_ISREG(first.st_mode) or first.st_nlink!=1 or first.st_size!=p['context']['adapter']['bytes']:raise ValueError('worker adapter identity differs')
+ code=bytearray()
+ while b:=os.read(fd,1048576):
+  code.extend(b)
+  if len(code)>1048576:raise ValueError('worker adapter exceeds bound')
+ last=os.fstat(fd)
+ if hashlib.sha256(code).hexdigest()!=p['context']['adapter']['sha256'] or (first.st_dev,first.st_ino,first.st_size,first.st_mtime_ns,first.st_ctime_ns)!=(last.st_dev,last.st_ino,last.st_size,last.st_mtime_ns,last.st_ctime_ns):raise ValueError('worker adapter changed')
+finally:os.close(fd)
+namespace={'__name__':'p01_host_transaction','__file__':p['module']}
+exec(compile(code,p['module'],'exec'),namespace)
+namespace['_HOST_TRANSACTION_WORKER']=True
+namespace['_HOST_ABSOLUTE_CANCEL_END']=p['deadline']+5
+import mmap
+namespace['_HOST_CANCEL_MAP']=mmap.mmap(-1,8,tagname=p['cancelMap']) if os.name=='nt' else mmap.mmap(p['cancelMap'],8)
+try:
+ result=namespace['_run_transfer_inner'](p['context'],p['role'],p['members'],p['output'],deadline=p['deadline'])
+ value={'ok':True,'result':result,'witness':namespace.get('_LAST_HOST_WITNESS')}
+except BaseException as error:
+ value={'ok':False,'error':str(error)[:4096],'facts':getattr(error,'facts',{}),'possibleSurvivors':bool(getattr(error,'possible_survivors',False))}
+os.write(1,namespace['_encode'](value))
+'''
+
+def _execute_host_transaction(context,role,members,output_directory,deadline):
+    helper=sys.modules.get('source_build')
+    payload={'module':str(Path(__file__).absolute()),'helperRoot':str(Path(helper.__file__).parent) if helper else str(Path(__file__).parent),
+        'context':context,'role':role,'members':members,'output':str(output_directory),'deadline':deadline}
+    import mmap,struct
+    global _HOST_CANCEL_MAP
+    descriptor=None;mapping=None
+    try:
+        if os.name=='nt':
+            payload['cancelMap']='Local\\p01-cancel-'+uuid.uuid4().hex
+            mapping=mmap.mmap(-1,8,tagname=payload['cancelMap'])
+        else:
+            descriptor=os.memfd_create('p01-host-cancel',0);os.ftruncate(descriptor,8)
+            payload['cancelMap']=descriptor;mapping=mmap.mmap(descriptor,8)
+        mapping[:8]=struct.pack('d',deadline+5);_HOST_CANCEL_MAP=mapping
+        result=_pump_host([sys.executable,'-I','-B','-c',_HOST_TRANSACTION],input_file=None,input_bytes=_encode(payload),deadline=deadline,pass_fds=() if descriptor is None else (descriptor,))
+        value=_decode(result['stdout'])
+    finally:
+        # Carry the worker's original cancellation endpoint beyond map lifetime.
+        global _HOST_ABSOLUTE_CANCEL_END
+        if mapping is not None:
+            observed=struct.unpack('d',mapping[:8])[0]
+            if _HOST_ABSOLUTE_CANCEL_END is not None:_HOST_ABSOLUTE_CANCEL_END=min(_HOST_ABSOLUTE_CANCEL_END,observed)
+            _HOST_CANCEL_MAP=None;mapping.close()
+        if descriptor is not None:os.close(descriptor)
+    if value.get('ok') is not True:
+        facts={**value.get('facts',{}),'possibleSurvivors':bool(value.get('possibleSurvivors',False) or value.get('facts',{}).get('possibleSurvivors'))}
+        raise _failure(value.get('error','host transaction failed'),**facts)
+    return value
+
+def _run_transfer(context,role,members,output_directory):
+    global _HOST_ABSOLUTE_CANCEL_END
+    with _host_public_guard():
+        deadline=time.monotonic()+context['timeout'];previous_end=_HOST_ABSOLUTE_CANCEL_END
+        _HOST_ABSOLUTE_CANCEL_END=deadline+5
+        try:
+            context={**context,'_hostHistory':_observed_host_history(context)}
+            value=_execute_host_transaction(context,role,members,output_directory,deadline)
+            result=value['result'];witness=value.get('witness')
+            if witness is None:raise ValueError('host successful-return evidence absent')
+            if (witness['role']!=role or witness['operationNonce']!=result['operationNonce']
+                    or witness['receipt']['sha256']!=hashlib.sha256(_encode(result)).hexdigest()):raise ValueError('observed final host receipt differs')
+            _remaining(deadline)
+            _publish_host_witness(context,witness)
+            return result
+        except BaseException as error:
+            # The owned worker may have committed final bytes before its reply
+            # was lost. A separate terminal record must never imply success.
+            try:_host_write(Path(output_directory)/'ambiguous.json',_encode({'status':'ambiguous','error':_error_text(error),'possibleSurvivors':bool(getattr(error,'possible_survivors',False))}),_host_cancel_end(deadline,start=True))
+            except BaseException:pass
+            raise
+        finally:_HOST_ABSOLUTE_CANCEL_END=previous_end
+
+
 def transfer_environment(environment_receipt,source,destination,sha256,size,mode,*,spec,spec_sha256,output_directory,timeout):
     """Transfer only the original pinned handoff to its qualified fixed role."""
-    import source_build
-    context=_local_context(environment_receipt,spec,spec_sha256,timeout)
-    handoff=context['spec']['handoff']
-    if (source_build._path(source)!=source_build._path(handoff['path'])
-            or destination!=context['base']+'/inputs/handoff/handoff.tar'
-            or type(size) is not int or size!=handoff['bytes'] or sha256!=handoff['sha256']
-            or type(mode) is not int or mode!=0o444):raise ValueError('fixed original handoff role required')
-    context['adapter']=_adapter_pin(context)
-    return _run_transfer(context,'handoff',{'handoff.tar':{**handoff,'mode':0o444}},output_directory)
+    with _host_public_guard():
+        import source_build
+        context=_local_context(environment_receipt,spec,spec_sha256,timeout)
+        handoff=context['spec']['handoff']
+        if (source_build._path(source)!=source_build._path(handoff['path'])
+                or destination!=context['base']+'/inputs/handoff/handoff.tar'
+                or type(size) is not int or size!=handoff['bytes'] or sha256!=handoff['sha256']
+                or type(mode) is not int or mode!=0o444):raise ValueError('fixed original handoff role required')
+        context['adapter']=_adapter_pin(context)
+        return _run_transfer(context,'handoff',{'handoff.tar':{**handoff,'mode':0o444}},output_directory)
 
 
 def transfer_harness(environment_receipt,frozen_harness,*,spec,spec_sha256,output_directory,timeout):
     """Own the complete frozen harness's directory/file/finalization lifecycle."""
-    context=_local_context(environment_receipt,spec,spec_sha256,timeout)
-    members=_frozen_harness(context,frozen_harness)
-    context['adapter']=_adapter_pin(context)
-    return _run_transfer(context,'harness',members,output_directory)
+    with _host_public_guard():
+        context=_local_context(environment_receipt,spec,spec_sha256,timeout)
+        members=_frozen_harness(context,frozen_harness)
+        context['adapter']=_adapter_pin(context)
+        return _run_transfer(context,'harness',members,output_directory)
 
 
-def _payload_filesystem(root,context,members,directories,action,argument,*,capacity_root):
+def _payload_filesystem(root,context,members,directories,action,argument,*,capacity_root,eligible_history=None):
     """Trusted filesystem control, executed only by a registered nsenter child.
 
     The low-level root argument supports isolated controls; the guest dispatcher
@@ -1210,8 +1382,11 @@ def _payload_filesystem(root,context,members,directories,action,argument,*,capac
         if not root.exists():return 0
         fd=_safe_dir(str(root),create=False);os.close(fd)
         if json_at(root/'context.json')!=context:raise ValueError('generation context differs')
-        if set(os.listdir(root/'operations'))-{'handoff','harness'}:raise ValueError('unexpected operation role')
-        for sibling in os.listdir(root/'operations'):
+        ops_fd=_safe_dir(str(root/'operations'),create=False)
+        try:siblings=os.listdir(ops_fd)
+        finally:os.close(ops_fd)
+        if set(siblings)-{'handoff','harness'}:raise ValueError('unexpected operation role')
+        for sibling in siblings:
             op=root/'operations'/sibling
             owner=json_at(op/'owner.json')
             if owner.get('context')!=context:raise ValueError('sibling owner context differs')
@@ -1220,8 +1395,12 @@ def _payload_filesystem(root,context,members,directories,action,argument,*,capac
             else:
                 completed=json_at(op/'complete.json')
                 if completed.get('status')!='succeeded' or completed.get('context')!=context:raise ValueError('failed/incomplete sibling')
+                if eligible_history is not None and not any(entry['role']==sibling and entry['operationNonce']==owner['nonce'] and entry['context']==context for entry in eligible_history):raise ValueError('sibling lacks observed successful host history')
             names=list(members[sibling]);seen=set()
-            for name in os.listdir(op):
+            op_fd=_safe_dir(str(op),create=False)
+            try:operation_names=os.listdir(op_fd)
+            finally:os.close(op_fd)
+            for name in operation_names:
                 if name in ('owner.json','complete.json'):continue
                 match=re.fullmatch('member-([0-9]+).json',name)
                 if not match:raise ValueError('unexpected operation record')
@@ -1236,8 +1415,9 @@ def _payload_filesystem(root,context,members,directories,action,argument,*,capac
         return retained
     retained=history()
     if action=='capacity':
-        info=os.statvfs(capacity_root);device=os.stat(capacity_root).st_dev
-        return {'available':info.f_bavail*info.f_frsize,'retained':retained,'device':device}
+        destination=_target_space(str(root/'inputs'/role));spool=_target_space(str(root/'staging'/role))
+        if (destination['device'],destination['filesystemType'])!=(spool['device'],spool['filesystemType']):raise ValueError('spool and destination backing filesystems differ')
+        return {**destination,'available':min(destination['available'],spool['available']),'retained':retained,'targets':{'destination':destination,'spool':spool}}
     if action=='prepare':
         if not root.exists():
             os.close(_safe_dir(str(root),exclusive=True));_exclusive_bytes(root/'context.json',_encode(context))
@@ -1262,7 +1442,10 @@ def _payload_filesystem(root,context,members,directories,action,argument,*,capac
         _exclusive_bytes(role_dir/('member-'+str(ordinal)+'.json'),_encode(record))
         return {'status':'recorded'}
     if action=='complete':
-        if len(list(role_dir.glob('member-*.json')))!=len(members[role]):raise ValueError('missing aggregate member')
+        op_fd=_safe_dir(str(role_dir),create=False)
+        try:completed_members=[name for name in os.listdir(op_fd) if re.fullmatch('member-[0-9]+.json',name)]
+        finally:os.close(op_fd)
+        if len(completed_members)!=len(members[role]):raise ValueError('missing aggregate member')
         _exclusive_bytes(role_dir/'complete.json',_encode({'status':'succeeded','context':context}))
         return {'status':'succeeded'}
     raise ValueError('unknown closed filesystem action')
@@ -1272,105 +1455,22 @@ def _guest_filesystem(request,argument,directory):
     _read_session(request,directory)
     base='/var/lib/'+request['s2Generation']+'/s3/'+request['generation']
     return _payload_filesystem(base,_context_identity(request),request['members'],request['directories'],
-        argument['action'],{**argument,'nonce':request['nonce']},capacity_root='/var/lib/'+request['s2Generation'])
+        argument['action'],{**argument,'nonce':request['nonce']},capacity_root='/var/lib/'+request['s2Generation'],eligible_history=request.get('hostHistory',[]))
 
 
 def _payload_command(request,argument,deadline,directory):
     evidence=Path(directory)/('filesystem-'+uuid.uuid4().hex);os.close(_safe_dir(str(evidence),exclusive=True))
     argv=['/usr/bin/python3','-I','-B','-c',_ENTRY,json.dumps(request,separators=(',',':')),
-        'filesystem',json.dumps(argument,separators=(',',':')),str(max(1,math.ceil(_remaining(deadline))))]
+        'filesystem',json.dumps(argument,separators=(',',':')),str(max(1,math.ceil(_remaining(deadline)))),*map(str,_owner_pass_fds())]
     result=stream_admitted(request['handle'],argv,input_file=None,output_policy='COMPLETION_CONTROL',
         guest_deadline=deadline,operation_directory=evidence)
     return _decode(result['stdout'])
 
 _ENTRY_BODY = _ENTRY
-_ENTRY_GUARD = r'''import json,os,signal,sys,time
-r=json.loads(sys.argv[1]);duration=int(sys.argv[4]);deadline=time.monotonic()+min(duration,r['duration'])
-if duration<=0:raise ValueError('positive remaining duration required')
-directory='/opt/'+r['s2Generation']+'/s3-admission-observations/'+r['generation']+'/'+r['nonce']
-def fields(pid):
- with open('/proc/'+str(pid)+'/stat') as f:v=f.read(65537).rsplit(')',1)[1].split()
- return {'pid':pid,'starttime':v[19],'pgid':int(v[2]),'sid':int(v[3])}
-ready_r,ready_w=os.pipe();ack_r,ack_w=os.pipe();pid=os.fork()
-if pid==0:
- try:
-  os.close(ready_r);os.close(ack_w);os.setsid();os.write(ready_w,b'H');raw=b''
-  while not raw.endswith(b'\n'):
-   b=os.read(ack_r,4096)
-   if not b:raise ValueError('entry parent disconnected')
-   raw+=b
-   if len(raw)>65536:raise ValueError('registration cap')
-  fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-  try:
-   for name in directory.split('/')[1:]:
-    n=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);s=os.fstat(n)
-    if s.st_uid or s.st_gid:raise ValueError('entry parent owner differs')
-    os.close(fd);fd=n
-   out=os.open('entry-child-'+str(os.getpid())+'.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
-   try:
-    view=memoryview(raw)
-    while view:
-     n=os.write(out,view)
-     if n<=0:raise OSError('registration zero write')
-     view=view[n:]
-    os.fsync(out)
-   finally:os.close(out)
-   source=os.open('session.json',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)
-   try:
-    session=b''
-    while b:=os.read(source,65536):
-     session+=b
-     if len(session)>65536:raise ValueError('session cap')
-   finally:os.close(source)
-   original=json.loads(session)['deadline']
-  finally:os.close(fd)
-  os.write(ready_w,(str(original)+'\n').encode())
-  if os.read(ack_r,1)!=b'E':raise ValueError('entry exec not acknowledged')
-  os.close(ready_w);os.close(ack_r)
-  exec(compile(BODY,'<frozen-entry>','exec'),globals())
-  os._exit(0)
- except BaseException as error:
-  try:os.write(2,(str(error)+'\n').encode()[:4096])
-  finally:os._exit(1)
-os.close(ready_w);os.close(ack_r);os.set_blocking(ready_r,False);child=None
-try:
- raw=b'';stage=0
- while True:
-  if time.monotonic()>=deadline:raise TimeoutError('entry deadline')
-  try:b=os.read(ready_r,1)
-  except BlockingIOError:time.sleep(.005);continue
-  if stage==0:
-   if b!=b'H':raise ValueError('entry handshake')
-   child=fields(pid)
-   if child['pid']!=child['pgid'] or child['pid']!=child['sid']:raise ValueError('entry session differs')
-   os.write(ack_w,(json.dumps({**child,'nonce':r['nonce']})+'\n').encode());stage=1
-  else:
-   if not b:raise ValueError('entry disconnected')
-   raw+=b
-   if len(raw)>64:raise ValueError('deadline control cap')
-   if raw.endswith(b'\n'):
-    deadline=min(deadline,float(raw))
-    if time.monotonic()>=deadline or fields(pid)!=child:raise TimeoutError('original guest deadline expired')
-    os.write(ack_w,b'E');break
- while True:
-  got,status=os.waitpid(pid,os.WNOHANG)
-  if got:raise SystemExit(os.waitstatus_to_exitcode(status))
-  if time.monotonic()>=deadline:raise TimeoutError('entry deadline')
-  time.sleep(.005)
-except (Exception,KeyboardInterrupt):
- for sig,seconds in ((signal.SIGTERM,2),(signal.SIGKILL,3)):
-  try:
-   if child is None or fields(pid)!=child:break
-   os.killpg(pid,sig)
-  except (FileNotFoundError,ProcessLookupError):break
-  end=time.monotonic()+seconds
-  while time.monotonic()<end:
-   got,status=os.waitpid(pid,os.WNOHANG)
-   if got:raise SystemExit(1)
-   time.sleep(.005)
- raise SystemExit(1)
-'''
-_ENTRY = 'BODY='+repr(_ENTRY_BODY)+'\n'+_ENTRY_GUARD
+_OWNER_RUNTIME = 'import array,json,mmap,os,signal,socket,struct,sys,time\n\ndef _owner_fields(pid):\n with open(\'/proc/\'+str(pid)+\'/stat\') as f:parts=f.read(65537).rsplit(\')\',1)[1].split()\n return {\'pid\':pid,\'starttime\':parts[19],\'pgid\':int(parts[2]),\'sid\':int(parts[3])}\ndef _owner_live(identity):\n try:return _owner_fields(identity[\'pid\'])==identity\n except (FileNotFoundError,ProcessLookupError):return False\ndef _owner_state(identity):\n try:\n  with open(\'/proc/\'+str(identity[\'pid\'])+\'/stat\') as f:state=f.read(65537).rsplit(\')\',1)[1].split()[0]\n  if not _owner_live(identity):return \'identity-lost\'\n  return \'zombie\' if state==\'Z\' else \'live\'\n except (FileNotFoundError,ProcessLookupError):return \'gone\'\ndef _owner_config():\n value=os.environ.get(\'P01_OWNER_CONFIG\')\n return None if value is None else tuple(map(int,value.split(\',\')))\ndef _shared_end(work_deadline,start=False):\n config=_owner_config()\n if config is None:return min(work_deadline+5,time.monotonic()+5) if start else work_deadline+5\n fd=config[1]\n # One aligned shared double; shrinking writes are serialized with bounded flock.\n import fcntl\n while True:\n  try:fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);break\n  except BlockingIOError:\n   if time.monotonic()>=work_deadline+5:return work_deadline+5\n   time.sleep(.001)\n try:\n  raw=os.pread(fd,8,0);end=struct.unpack(\'d\',raw)[0]\n  if start:\n   end=min(end,time.monotonic()+5,work_deadline+5);os.pwrite(fd,struct.pack(\'d\',end),0)\n  return min(end,work_deadline+5)\n finally:fcntl.lockf(fd,fcntl.LOCK_UN)\ndef _register_owner(identity,deadline):\n config=_owner_config()\n if config is None:return\n request={\'child\':identity,\'parent\':_owner_fields(os.getpid()),\'nonce\':os.urandom(16).hex()}\n raw=(json.dumps(request,separators=(\',\',\':\'))+\'\\n\').encode()\n read,write=os.pipe();channel=socket.socket(fileno=os.dup(config[0]));channel.setblocking(False)\n try:\n  while True:\n   try:channel.sendmsg([raw],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array(\'i\',[write]))]);break\n   except BlockingIOError:\n    if time.monotonic()>=deadline:raise TimeoutError(\'owner registration deadline\')\n    time.sleep(.001)\n  os.close(write);write=None;os.set_blocking(read,False)\n  while True:\n   try:\n    if os.read(read,1)!=b\'E\':raise ValueError(\'owner registration rejected\')\n    break\n   except BlockingIOError:\n    if time.monotonic()>=deadline:raise TimeoutError(\'owner acknowledgement deadline\')\n    time.sleep(.001)\n finally:\n  channel.close();os.close(read)\n  if write is not None:os.close(write)\ndef _owner_pass_fds():\n config=_owner_config();return () if config is None else config\n\ndef _owner_guard(body,request,directory,deadline,*,session=False):\n # Ambient environment never authorizes an owner. Only an internal fixed ENTRY\n # argv carrying both inherited descriptors can reuse the authenticated owner.\n inherited=None\n if session and len(sys.argv)==7:inherited=(int(sys.argv[5]),int(sys.argv[6]))\n if inherited is not None:\n  for fd in inherited:os.fstat(fd)\n  os.environ[\'P01_OWNER_CONFIG\']=\',\'.join(map(str,inherited))\n  exec(compile(body,\'<frozen-owned-entry>\',\'exec\'),globals());return\n os.environ.pop(\'P01_OWNER_CONFIG\',None)\n channel,worker_channel=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)\n channel.setsockopt(socket.SOL_SOCKET,socket.SO_PASSCRED,1);channel.setblocking(False)\n cancel=os.memfd_create(\'p01-cancellation\',0);os.ftruncate(cancel,8);os.pwrite(cancel,struct.pack(\'d\',deadline+5),0)\n ready_r,ready_w=os.pipe();ack_r,ack_w=os.pipe();pid=os.fork()\n if pid==0:\n  try:\n   channel.close();os.close(ready_r);os.close(ack_w);os.setsid()\n   config=(worker_channel.fileno(),cancel)\n   for fd in config:os.set_inheritable(fd,True)\n   os.environ[\'P01_OWNER_CONFIG\']=\',\'.join(map(str,config))\n   def interrupted(signum,frame):raise TimeoutError(\'outer owner requested cancellation\')\n   signal.signal(signal.SIGUSR1,interrupted)\n   os.write(ready_w,b\'H\');raw=b\'\'\n   while not raw.endswith(b\'\\n\'):\n    b=os.read(ack_r,4096)\n    if not b:raise ValueError(\'owner disconnected before registration\')\n    raw+=b\n    if len(raw)>65536:raise ValueError(\'registration exceeds cap\')\n   identity=json.loads(raw)\n   # Blocking metadata/durability is done only in this owned child.\n   fd=os.open(\'/\',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)\n   try:\n    parts=directory.split(\'/\')[1:]\n    for ordinal,name in enumerate(parts):\n     if not name or name in (\'.\',\'..\'):raise ValueError(\'unsafe guard directory\')\n     try:os.mkdir(name,0o700,dir_fd=fd)\n     except FileExistsError:\n      if not session and ordinal==len(parts)-1:raise\n     n=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);info=os.fstat(n)\n     if info.st_uid or info.st_gid:raise ValueError(\'guard directory owner differs\')\n     os.close(fd);fd=n\n    out=os.open((\'entry-child-\' if session else \'bootstrap-owner-\')+str(os.getpid())+\'.json\',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)\n    try:\n     view=memoryview(raw)\n     while view:\n      count=os.write(out,view)\n      if count<=0:raise OSError(\'identity persistence stalled\')\n      view=view[count:]\n     os.fsync(out)\n    finally:os.close(out)\n    if session:\n     source=os.open(\'session.json\',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)\n     try:\n      data=b\'\'\n      while b:=os.read(source,65536):\n       data+=b\n       if len(data)>65536:raise ValueError(\'session exceeds cap\')\n      deadline=min(deadline,float(json.loads(data)[\'deadline\']))\n     finally:os.close(source)\n   finally:os.close(fd)\n   os.write(ready_w,(str(deadline)+\'\\n\').encode())\n   if os.read(ack_r,1)!=b\'E\':raise ValueError(\'owner did not acknowledge durable registration\')\n   os.close(ready_w);os.close(ack_r)\n   globals()[\'deadline\']=deadline\n   exec(compile(body,\'<frozen-owned-body>\',\'exec\'),globals());os._exit(0)\n  except BaseException as error:\n   try:\n    facts={\'error\':str(error).encode(\'utf-8\',errors=\'replace\')[:4096].decode(\'utf-8\',errors=\'ignore\'),**getattr(error,\'facts\',{})}\n    raw=(json.dumps(facts,separators=(\',\',\':\'))+\'\\n\').encode()\n    if len(raw)>65500:raw=b\'{"error":"failure facts exceeded cap","possibleSurvivors":true}\\n\'\n    os.write(2,b\'P01_TRANSFER_FAILURE: \'+raw)\n   finally:os._exit(1)\n worker_channel.close();os.close(ready_w);os.close(ack_r);os.set_blocking(ready_r,False)\n identities={};nonces=set();signals=[];signaled=set();supervisor=None;status=None;failure=None\n def drain():\n  while True:\n   try:raw,ancillary,flags,_=channel.recvmsg(4096,socket.CMSG_SPACE(4)+socket.CMSG_SPACE(12))\n   except BlockingIOError:return\n   if not raw:return\n   replies=[];credentials=None\n   for level,kind,data in ancillary:\n    if level==socket.SOL_SOCKET and kind==socket.SCM_RIGHTS:\n     a=array.array(\'i\');a.frombytes(data[:len(data)//a.itemsize*a.itemsize]);replies.extend(a)\n    if level==socket.SOL_SOCKET and kind==socket.SCM_CREDENTIALS:credentials=struct.unpack(\'3i\',data[:12])\n   try:\n    if flags or len(replies)!=1 or credentials is None or len(identities)>=64:raise ValueError(\'owner registration channel invalid/full\')\n    value=json.loads(raw);parent=value[\'parent\'];child=value[\'child\']\n    if credentials[0]!=parent[\'pid\'] or parent[\'pid\'] not in identities or not _owner_live(parent) or identities[parent[\'pid\']]!=parent:raise ValueError(\'unowned registration parent\')\n    if not _owner_live(child) or child[\'pid\']!=child[\'sid\'] or child[\'pid\']!=child[\'pgid\']:raise ValueError(\'unowned registered child\')\n    with open(\'/proc/\'+str(child[\'pid\'])+\'/stat\') as f:ppid=int(f.read(65537).rsplit(\')\',1)[1].split()[1])\n    if ppid!=parent[\'pid\'] or value[\'nonce\'] in nonces:raise ValueError(\'registered parent/nonce mismatch\')\n    identities[child[\'pid\']]=child;nonces.add(value[\'nonce\']);os.write(replies[0],b\'E\')\n   finally:\n    for fd in replies:os.close(fd)\n def signal_child(identity,sig):\n  if _owner_state(identity)!=\'live\' or (identity[\'pid\'],sig) in signaled:return\n  if identity[\'pid\']!=identity[\'pgid\'] or identity[\'pid\']!=identity[\'sid\']:return\n  try:\n   if _owner_live(identity):os.killpg(identity[\'pid\'],sig);signaled.add((identity[\'pid\'],sig));signals.append({\'child\':identity,\'signal\':sig.name})\n  except ProcessLookupError:pass\n try:\n  raw=b\'\';stage=0\n  while True:\n   drain()\n   if time.monotonic()>=deadline:raise TimeoutError(\'outer guard work deadline\')\n   try:b=os.read(ready_r,1)\n   except BlockingIOError:time.sleep(.002);continue\n   if stage==0:\n    if b!=b\'H\':raise ValueError(\'guard handshake disconnected\')\n    supervisor=_owner_fields(pid)\n    if supervisor[\'pgid\']!=pid or supervisor[\'sid\']!=pid:raise ValueError(\'guard session differs\')\n    identities[pid]=supervisor;os.write(ack_w,(json.dumps({**supervisor,\'nonce\':request[\'nonce\']})+\'\\n\').encode());stage=1\n   else:\n    if not b:raise ValueError(\'guard registration disconnected\')\n    raw+=b\n    if len(raw)>64:raise ValueError(\'guard deadline control cap\')\n    if raw.endswith(b\'\\n\'):\n     deadline=min(deadline,float(raw));os.pwrite(cancel,struct.pack(\'d\',deadline+5),0)\n     if time.monotonic()>=deadline or not _owner_live(supervisor):raise TimeoutError(\'original guest deadline expired\')\n     os.write(ack_w,b\'E\');break\n  while True:\n   drain();got,value=os.waitpid(pid,os.WNOHANG)\n   if got:status=os.waitstatus_to_exitcode(value);break\n   if time.monotonic()>=deadline:raise TimeoutError(\'outer guard work deadline\')\n   time.sleep(.002)\n  if status:raise ValueError(\'owned supervisor failed: \'+str(status))\n  # No independently registered live worker may outlast a successful supervisor.\n  if any(_owner_state(v)==\'live\' for k,v in identities.items() if k!=pid):raise ValueError(\'registered worker outlived supervisor\')\n except BaseException as error:\n  failure=error\n  end=min(deadline+5,time.monotonic()+5,struct.unpack(\'d\',os.pread(cancel,8,0))[0]);os.pwrite(cancel,struct.pack(\'d\',end),0)\n  if supervisor is not None and _owner_live(supervisor):\n   try:os.kill(supervisor[\'pid\'],signal.SIGUSR1)\n   except ProcessLookupError:pass\n  term_end=min(end,time.monotonic()+2)\n  while time.monotonic()<end:\n   try:drain()\n   except BaseException:pass\n   phase=signal.SIGTERM if time.monotonic()<term_end else signal.SIGKILL\n   for k,identity in list(identities.items()):\n    if k!=pid:signal_child(identity,phase)\n   live=[v for k,v in identities.items() if k!=pid and _owner_state(v)==\'live\']\n   if not live and supervisor is not None:signal_child(supervisor,phase)\n   if status is None:\n    try:\n     got,value=os.waitpid(pid,os.WNOHANG)\n     if got:status=os.waitstatus_to_exitcode(value)\n    except ChildProcessError:status=1\n   if status is not None and not live:break\n   time.sleep(.005)\n  survivors=[v for v in identities.values() if _owner_state(v) in (\'live\',\'identity-lost\')]\n  facts={\'error\':str(error)[:4096],\'ownedChildren\':list(identities.values()),\'survivorIdentities\':survivors,\n    \'possibleSurvivors\':bool(survivors),\'signals\':signals[-128:]}\n  raw=(json.dumps(facts,separators=(\',\',\':\'))+\'\\n\').encode()\n  if len(raw)>65500:raw=(json.dumps({\'error\':\'owner ledger exceeds evidence cap\',\'possibleSurvivors\':True})+\'\\n\').encode()\n  try:os.write(2,b\'P01_OWNER_FAILURE: \'+raw)\n  except OSError:pass\n finally:\n  for fd in (ready_r,ack_w,cancel):os.close(fd)\n  channel.close()\n if failure is not None:raise SystemExit(1)\n raise SystemExit(status or 0)\n'
+exec(compile(_OWNER_RUNTIME,'<frozen-owner-runtime>','exec'),globals())
+_ENTRY = 'BODY='+repr(_ENTRY_BODY)+'\n'+_OWNER_RUNTIME+"\nr=json.loads(sys.argv[1]);duration=int(sys.argv[4]);deadline=time.monotonic()+min(duration,r['duration'])\nif duration<=0:raise ValueError('positive remaining duration required')\ndirectory='/opt/'+r['s2Generation']+'/s3-admission-observations/'+r['generation']+'/'+r['nonce']\n_owner_guard(BODY,r,directory,deadline,session=True)\n"
+_BOOTSTRAP = 'BODY='+repr(_BOOTSTRAP_BODY)+'\n'+_OWNER_RUNTIME+"\nr=json.loads(sys.argv[1]);deadline=time.monotonic()+r['duration']\nif type(r['duration']) is not int or r['duration']<=0:raise ValueError('positive duration required')\ndirectory='/opt/'+r['s2Generation']+'/s3-admission-observations/'+r['generation']+'/'+r['nonce']\n_owner_guard(BODY,r,directory,deadline)\n"
 
 _HOST_HASH = r'''import hashlib,json,os,stat,sys
 first=os.fstat(0)
