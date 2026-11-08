@@ -28,7 +28,7 @@ def daemon_config(generation):
             'pidfile':p['run']+'/dockerd.pid','hosts':['unix://'+p['run']+'/docker.sock'],
             'group':'root','features':{'containerd-snapshotter':True},
             'exec-opts':['native.cgroupdriver=cgroupfs'],'cgroup-parent':'/workloads',
-            'containerd-namespace':generation,'containerd-plugin-namespace':generation+'-plugins',
+            'containerd-namespace':generation,
             'default-cgroupns-mode':'private','bridge':'none','iptables':False,
             'ip6tables':False,'ip-forward':False,'ip-masq':False,'userland-proxy':False}
 
@@ -62,7 +62,7 @@ test ! -e /mnt/wsl/docker-desktop
 test ! -e /run/docker.sock
 test ! -e /var/run/docker.sock
 test ! -e /run/containerd/containerd.sock
-exec env -i '''+environment+' /usr/local/bin/dockerd --config-file '+p['base']+'/daemon.json\n'
+exec env -i '''+environment+' /usr/local/bin/dockerd --config-file '+p['base']+'/daemon.json --containerd-plugins-namespace '+generation+'-plugins\n'
 
 
 def validate_containerd_namespaces(info,generation):

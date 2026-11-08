@@ -6,7 +6,7 @@
 
 当前范围：`persistentUpdateNormalRebootVerified=true`；`persistentUpdateExplicitRecoveryVerified=true` 仅覆盖下述 Linux 受控进程中断与显式恢复。`formalQualification=false`、`finalSystemAccepted=false`。
 
-S2公共入口create/observe/exec已实现并通过Task4代码复核，提交`f00331c`。首次正式新代`554bde65`的create退出0，但独立实际审计发现插件命名空间实际为`plugins.moby`，与本代专属值不符，因此S2未通过；原代、失败观察和全部资源保留。已修正配置键并补实际命名空间准入/回放检查，冻结Linux回归139项运行、138通过、1项Windows junction专属跳过、零失败/错误；修复已通过独立复核，全新代实际验收继续，不将局部控制当作S2成功，见[环境记录](p01-environment-audit.md)。
+S2公共入口create/observe/exec已实现并通过Task4代码复核，提交`f00331c`。首次正式新代`554bde65`的create退出0，但独立实际审计发现插件命名空间实际为`plugins.moby`，与本代专属值不符，因此S2未通过；原代、失败观察和全部资源保留。首轮修复补齐实际命名空间准入/回放检查并通过冻结Linux回归139项运行、138通过、1项Windows junction专属跳过及独立代码复核；但新代`8039baf3`在launch阶段因固定Docker拒绝单数JSON键而失败。已保留停止发行版的离线导出和原始错误；固定二进制`--help/--validate`证实应省略两种plugin JSON键并使用复数CLI选项，受影响修复和另一个全新代实际验收继续，不将配置校验当作实际namespace通过，见[环境记录](p01-environment-audit.md)。
 
 2026-11-07 开发交付已生成：`artifacts/mingos-vm-dev-20261107-0c9f60f/README.md`。3544954880字节归档（SHA256 `cb8ef776f35584c915ad4b72d322e1973a06ca9b856c8790625e6b23a09dc744`）已在不挂载原checkout的情况下严格导入、恢复完整源码及独立只读重开；原始三阶段 Notes SDK 回放一致。导入 runtime 投影后，以恢复的1561文件源码实际启动 Notes/Motion，新盘空便签，正常桌面POWER及精确exit0通过。该本机交付不包含全新daemon加载或可迁携用户数据恢复结论。具体pins、失败保留和源码快照/最终记录区别见 [本次交付记录](vm-delivery-release-20261107.md)。
 

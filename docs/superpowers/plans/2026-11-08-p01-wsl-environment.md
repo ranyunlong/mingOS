@@ -133,7 +133,7 @@ def test_failed_transfer_is_not_reused(self):
 
 Task4实现/控制及独立复核完成于`f00331c`；随后真实Task5发现实际plugins namespace缺陷，不能据此接受运行代。
 
-- [ ] 真实缺陷修复门槛：修正单数配置键，补实际两namespace的launch/live/retained/host验证，真实RED/GREEN及独立修复复核；另用全新代执行Task5，原554bde65保持不合格。
+- [ ] 真实缺陷修复门槛：保留实际两namespace的launch/live/retained/host验证；固定引擎不接受单数JSON键，须省略两种plugin JSON键并以复数CLI设置本代值，真实RED/GREEN、固定二进制parser控制及独立复核均须通过；另用全新代执行Task5，原554bde65及8039baf3保持不合格。
 
 ### Task 5: 正式新代实测与独立审查
 

@@ -80,3 +80,14 @@ Task4公共create/observe/exec已完成实现与独立复核，提交`f00331c`�
 固定Docker29.8.1官方源码的JSON键为单数`containerd-plugin-namespace`；原实现写成复数且未验证info返回的实际namespace。修复同时校验实际Containers/Plugins两值，覆盖初始launch、每次live handle admission、observe、保留first-empty及宿主ready receipt回放；默认、缺失、异代和格式错误必须拒绝，历史loader保持原字节。真正RED为8项测试17个断言失败；修复后Windows受影响72项运行、67通过、5项Linux专属跳过。冻结完整Linux公共/导入回归在`artifacts/p01-s2-public-controls-20261108-a1b29ded/`运行139项、138通过、1项Windows junction专属跳过、零失败/错误，精确容器`0fe7dac7910f830b27e644abb8235976a57b23695705ad575d5c48ea56b068cc`退出0且非OOM。修复已通过独立spec/quality复核；另一个全新实际环境代仍待通过。
 
 首次独立观察器还发现自身过严的共享mount、覆盖挂载和无标签镜像listing假设；原失败完整保留。修订后的独立证据须真实读取O_PATH/fdinfo可见mount、逐namespace核对内部owned peer无外部传播，并用实际info计数和三个固定index完整inspect核对store，不能用假设fixture填成实际通过。公共observe/exec仍须在修复后新代另取独占证据。S2未关闭，P01及11项目总交付保持0/11；正式标志均false。
+
+
+## 固定引擎JSON/CLI解析差异与第二次正式代（2026-11-08）
+
+已复核的首轮修复提交`d71b79d`在全新`8039baf3`执行正式create。该次于launch失败，尚未load或smoke；实际stderr明确拒绝`containerd-plugin-namespace`，因此不是实际namespace检查被放宽后成功。发行版随后停止，诊断先核对running清单并拒绝自动启动；以`wsl --export`另取只读文件系统归档后读取原始日志，导出后仍未运行该发行版。归档`offline-log-export-2e7ebe6f/failed-rootfs.tar`为1460387840字节、SHA256 `a92445cc455cc2028c42f93d98ea8c53797308811c1e0d01a8a53a37027316de`，原盘/配置/日志不改，原代不重试。
+
+进一步核对固定版本源码发现JSON struct tag为单数，known-option检查却按复数CLI注册名查找：单数JSON被拒绝，复数JSON虽可解析却未赋给实际字段。这解释了554bde65实际使用默认值和8039baf3启动失败。官方字段标签本身不足以证明配置可用，先前源码级修复结论不等于运行时修复成功。
+
+使用同一固定bundle的dockerd二进制，在独立受限容器仅执行`--help`和`--validate`：复数JSON退出0、单数JSON退出1并复现原错误；省略plugin JSON键、在CLI传`--containerd-plugins-namespace <generation>-plugins`退出0。证据`artifacts/p01-engine-config-controls-20261108-7f603208/`，精确容器`0421e333c7766bdd082f7dd04636a385fa1df5fa3587cd20c6d1f7cfd297dc31`保留，`daemonStarted=false`、`actualNamespaceAcceptance=false`。下一实现采用已确认的CLI路径，仍保留全部实际namespace验证；独立复核和另一全新运行代必须继续通过。两个原代均未接受，S2/P01仍未完成。
+
+CLI最小修复只修改guest配置和实际dockerd启动两行，host及全部实际namespace验证不变。新RED两项测试出现三个断言失败；Windows guest40项运行、35通过、5项Linux控制跳过，focused namespace7/7。最终受影响冻结Linux控制`artifacts/p01-s2-guest-controls-20261108-004c3929/`为40/40、零跳过/失败/错误，精确保留容器`7773e58857f03a42dcd7c78d8fed6620f61545d7c070971935b44c57ffcee956`退出0且非OOM。此前完整139项和本次受影响40项是不同快照执行；独立CLI修复spec/quality复核已通过，新的实际代仍为后续门槛。

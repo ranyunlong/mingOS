@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-08 — S2固定Docker解析差异的实际诊断
+
+- 首轮实际namespace修复提交`d71b79d`保持真实值准入和回放检查；全新8039baf3在daemon launch阶段失败，固定版本拒绝单数JSON键，未load/smoke，未改判通过。
+- 失败发行版已停止；只读离线导出保留原始daemon日志和完整文件系统，导出后仍停止，不重启/修改/重试原代。
+- 交叉核对官方flag注册、JSON标签及known-option解析；固定二进制help/validate对照确认省略plugin JSON键并使用复数CLI参数的可用解析路径。该诊断未启动daemon，不能作为实际namespace验收。
+- CLI最小实现只改guest配置/实际启动两行；真实RED两项测试三个断言失败，Windows guest40运行/35通过/5Linux跳过，最终受影响冻结Linux40/40且零跳过/失败/错误。独立spec/quality复核已通过；新代实际验收继续，两失败代保留，S2/P01及11项目交付仍未完成。
+
+
 ## 2026-11-08 — P01 S2公共入口与实际命名空间阻断
 
 - 公共create/observe/exec及有效smoke完成实现与独立代码复核，提交`f00331c`；完整原Linux控制与受影响最终guest控制分别保存，不夸大为同次全量执行。

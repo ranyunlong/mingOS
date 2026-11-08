@@ -338,10 +338,19 @@ def namespace_info(*,images=0,containers=0):
 
 
 class NamespaceContractTests(unittest.TestCase):
-    def test_config_uses_official_singular_plugin_namespace_key(self):
+    def test_plugin_namespace_omits_both_json_spellings(self):
         config=guest.daemon_config('p01-test')
-        self.assertEqual(config.get('containerd-plugin-namespace'),'p01-test-plugins')
+        self.assertEqual(config['containerd-namespace'],'p01-test')
+        self.assertNotIn('containerd-plugin-namespace',config)
         self.assertNotIn('containerd-plugins-namespace',config)
+    def test_dockerd_exec_sets_registered_plural_cli_namespace(self):
+        import shlex
+        for generation in ('p01-test','p01-other'):
+            with self.subTest(generation=generation):
+                argv=shlex.split(guest.boundary_script(generation).splitlines()[-1])
+                daemon=argv[argv.index('/usr/local/bin/dockerd'):]
+                self.assertEqual(daemon,['/usr/local/bin/dockerd','--config-file','/opt/'+generation+'/daemon.json',
+                                       '--containerd-plugins-namespace',generation+'-plugins'])
     def test_live_info_rejects_missing_default_or_foreign_namespace_pair(self):
         good=namespace_info(images=3,containers=1);guest.validate_live_info(good,'p01-test')
         for value in (None,{}, {'Namespaces':None},{'Namespaces':{}},
