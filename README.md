@@ -4,7 +4,7 @@
 
 当前已接通 **SDK6、真实 Kotlin/Wasm Compose 应用、GPU 直接呈现与缓存、中文字体/阴影、Ming 多窗口桌面、持续会话、文本输入和应用数据**。应用经 Rust/Wasmtime 调用 Ming SDK，父进程持有授权和系统资源；Node 用于构建与早期参考实现，应用执行不依赖 Node。
 
-真实 Linux kernel VM 已启动到 MingDesktop；当前 Windows + Docker/Linux 环境已完成真实 Kotlin 来源与 Rust 冷构建、持久更新同盘两次 fresh QEMU 冷启动及独立导出回放。受控进程中断与显式恢复也已按具体范围验证；当前继续持久卸载资格，系统整体验收仍未完成。当前统计和证据范围见[系统验收状态](docs/current-system-status.md)，历史阶段记录保留其冻结版本范围。
+真实 Linux kernel VM 已启动到 MingDesktop；当前 Windows + Docker/Linux 环境已完成真实 Kotlin 来源与 Rust 冷构建、持久更新/卸载同盘双启动及独立导出回放。2026-11-07已交付可复建的 x86_64 开发 VM，含 Notes/Motion、正常数据持久化、同 daemon 新卷恢复及完整交接包；交付后导入包的实际启动也已验证。源码与交付记录已推送到 `codex/persistent-update`，大归档保留本机。完整系统尚未验收；当前从全新环境一键部署开始推进[11个未交付项目](docs/undelivered-projects.md)。具体范围见[交付记录](docs/vm-delivery-release-20261107.md)和[系统验收状态](docs/current-system-status.md)，历史阶段记录保留其冻结版本范围。
 
 ## 文档
 

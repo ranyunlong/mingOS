@@ -1,6 +1,8 @@
 # 当前系统验收状态
 
-更新：2026-11-07。当前 Windows + Docker/Linux 开发环境已可完成真实 Kotlin 来源构建、Rust 冷构建及 kernel VM 资格。原 macOS/APFS 环境与完整备份目前不可访问；历史冻结、失败代和驱动保持原样。
+更新：2026-11-08。当前 Windows + Docker/Linux 开发环境已可完成真实 Kotlin 来源构建、Rust 冷构建及 kernel VM 资格。原 macOS/APFS 环境与完整备份目前不可访问；历史冻结、失败代和驱动保持原样。
+
+交付记录及发布补记已推送至 `codex/persistent-update`，基线提交为 `ecfe2763454638a4bf2e6808c830c20ac01dd769`；原远程推送授权阻断已解除。本机封存交付目录不变。当前按[未交付项目总表](undelivered-projects.md)推进11项工作，P01全新环境一键部署在调查/计划阶段，尚无新增项目完成。
 
 当前范围：`persistentUpdateNormalRebootVerified=true`；`persistentUpdateExplicitRecoveryVerified=true` 仅覆盖下述 Linux 受控进程中断与显式恢复。`formalQualification=false`、`finalSystemAccepted=false`。
 
