@@ -93,8 +93,46 @@ semantics require Linux. Tests include statvfs adapters for negative admission
 controls; adapters alone do not prove a read-only mount. The retained small
 fixture import/reopen evidence is separate from the actual 3.54 GB handoff test.
 
-S1 is complete only after independent review and actual sealed archive import
-and reopen pass. S1 does not close P01: S2–S6 still require a fresh daemon,
-compilation, assembly and runtime persistence acceptance. All six
-`current_source.FLAGS` remain false, including `formalQualification` and
+## Actual sealed archive acceptance — 2026-11-08
+
+The reviewed implementation is commit
+`e30139267f710afd7a13e66b58542fd8a4a6be26`. Independent implementation review
+approved spec compliance and task quality. The real 3,544,954,880-byte archive
+then passed public import and a separate container's read-only reopen. Evidence
+is retained at `artifacts/p01-import-actual-20261108-b/`, including each command,
+stdout/stderr, before/after inspections, frozen six-module public closure and
+`result.json`. The controller independently rechecked the captured results,
+resource configurations, closure hashes and unchanged volume identity. A separate
+supplemental review of the actual large integration approved the S1 stage gate;
+it did not rerun the tests or claim another live resource inspection.
+
+| Observation | Actual value |
+| --- | --- |
+| Restored source | 1561 files, 406 directories; complete byte/path/mode verification |
+| Public code-pins SHA256 | `41c883e12e04c8a03cb495c5b105b0aaaaee87745bc7713b83492e75d65385a6` |
+| Output volume | `p01-import-actual-20261108-b-output`, child `import/` |
+| Import container | `4ce5ca49520626ae285a8e405882ad36638f68d1af1fc544c38b4c25aaf03262` |
+| Reopen container | `a1e81a9c09c6aa877af52b3b2e87b8b67cbd32a6ee37ba496d9af5b47c4908df` |
+| Worker restrictions | UID/GID65534, network none, read-only root, drop ALL, no-new-privileges, 2 CPU, 4 GiB, pids256 |
+| Reopen inputs | Archive, verifier and complete imported volume mounted read-only |
+| Worker outcomes | Both exact containers exited0, not OOM; volume identity unchanged |
+
+Linux controls retained under
+`artifacts/p01-import-controls-20261108-default-worker/` report 19 importer tests
+and 88 required regression tests passed, with zero skips. Windows importer
+controls report 3 passed and 16 Linux-only skips; they are not Linux restore
+evidence. The independent review also inspected the genuine small-fixture
+import/reopen evidence before this large integration.
+
+The first large integration generation, `p01-import-actual-20261108-a`, failed
+before its initializer started because the controller compared `CHOWN` with
+Docker's equivalent `CAP_CHOWN` spelling. Its directory, container and volume
+remain retained. The harness now normalizes only that prefix when comparing
+the exact capability set; generation b used entirely new resources. No public
+importer code or historical driver was changed to bypass that failure.
+
+This acceptance used the existing Desktop daemon and proves S1 import semantics.
+It is not a fresh-daemon or cold-build result. S1 does not close P01: S2–S6 still
+require a fresh daemon, compilation, assembly and runtime persistence acceptance.
+All six `current_source.FLAGS` remain false, including `formalQualification` and
 `finalSystemAccepted`.

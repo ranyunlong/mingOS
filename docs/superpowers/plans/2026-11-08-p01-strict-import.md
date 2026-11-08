@@ -35,7 +35,7 @@
 - `import_restore` output layout: `delivery/`, `source-repo/`, `import-restore-result.json`; output directory is absent before invocation. `reopen` checks read-only mounts for archive, imported root and `Path(__file__).parent`, emits no file.
 - Successful import status: `handoff-imported-and-current-source-restored`; reopen status: `handoff-and-source-readonly-reopened`. The import receipt has exactly `status`, `archiveSha256`, `handoffSha256`, `sourceDescriptorSha256`, `importVerification`, `sourceRestore`, and every key of `current_source.FLAGS` with false values. `importVerification` equals the actual `handoff_manifest.verify(...)` result. `sourceRestore` has exactly `status='current-source-exclusively-restored-and-verified'`, `fileCount=len(verified_source['manifest']['files'])`, `repositoryCommit=verified_source['manifest']['repositoryCommit']`, and every `current_source.FLAGS` key false, matching `current_source.restore`'s existing result. Store exact canonical bytes from `current_source.encoded`; reopen rejects unknown fields, noncanonical bytes, incorrect values, and any mismatch from these recomputed results. Reopen result has exactly `status`, the same three pins and every `current_source.FLAGS` key false; it is emitted to stdout, never saved into the imported root.
 
-- [ ] **Step 1: Write real fixture and failing behavior tests.** Build a tiny valid sibling tree with all eight components, genuine `current_source.export` output and the minimal runtime provenance fixture pattern from `test_linux_handoff.py`; create a PAX tar rooted at `delivery` with actual modes and known hashes. Keep test fixture generation inside tests. The initial test asserts the public module/functions exist, then test positive import and use corrupted copies for negative controls. Core examples:
+- [x] **Step 1: Write real fixture and failing behavior tests.** Build a tiny valid sibling tree with all eight components, genuine `current_source.export` output and the minimal runtime provenance fixture pattern from `test_linux_handoff.py`; create a PAX tar rooted at `delivery` with actual modes and known hashes. Keep test fixture generation inside tests. The initial test asserts the public module/functions exist, then test positive import and use corrupted copies for negative controls. Core examples:
 
 ```python
 def test_public_module_exists(self):
@@ -66,7 +66,7 @@ def test_partial_failure_cannot_be_retried(self):
 
 Cover all three pin mismatches, duplicate/missing/extra entries, path traversal, symlink/hardlink/special/sparse, unknown PAX, type/size/mode/hash errors, descriptor/standalone inventory mismatch, symlink parent, archive mutation and caps. For caps patch module constants to small values instead of allocating multi-GiB fixtures. Linux restore tests must use actual filesystem; cross-platform tests still run pin/CLI/API admission. For readonly mount semantics use a small adapter around `statvfs` for control tests, and separately real RO mounts for integration; tests must not treat the adapter as real mount evidence.
 
-- [ ] **Step 2: Run RED and preserve its output.**
+- [x] **Step 2: Run RED and preserve its output.**
 
 ```powershell
 & 'C:/Users/54951/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -B -m unittest discover -s scripts/boot -p test_import_handoff.py -v
@@ -74,7 +74,7 @@ Cover all three pin mismatches, duplicate/missing/extra entries, path traversal,
 
 Expected meaningful failure: missing public module/API, not malformed fixture. Save the invocation and result in a new `artifacts/p01-import-controls-*` evidence directory. The task implementer can run Linux tests in a new retained fixed Tools container with readonly verifier/tests input and tmpfs `/tmp`; no `--rm` or resource deletion.
 
-- [ ] **Step 3: Implement the three public functions and CLI.** Reuse the frozen strict allowlist algorithm while removing environment-specific imports. Iterate bounded member collection, validate exact path/type/size/mode before writing; maintain one opened regular no-follow archive handle, stable file identity and pre/post hash, and no-follow directory operations. The composition is:
+- [x] **Step 3: Implement the three public functions and CLI.** Reuse the frozen strict allowlist algorithm while removing environment-specific imports. Iterate bounded member collection, validate exact path/type/size/mode before writing; maintain one opened regular no-follow archive handle, stable file identity and pre/post hash, and no-follow directory operations. The composition is:
 
 ```python
 def import_restore(archive_path, archive_pin, handoff_pin,
@@ -94,7 +94,7 @@ def import_restore(archive_path, archive_pin, handoff_pin,
 
 The code above specifies composition, not a complete implementation: the spec supplies mandatory pin, descriptor, identity, mode and result checks. Keep private helpers focused: opened archive admission, allowlist admission, complete source recheck, and readonly admission. `reopen` must verify saved receipt content and exact output root set, delivery, source and external archive pin. Do not change public existing source/handoff contracts or inject unearned claim flags.
 
-- [ ] **Step 4: Run GREEN and regressions.**
+- [x] **Step 4: Run GREEN and regressions.**
 
 ```powershell
 & 'C:/Users/54951/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -B -m unittest discover -s scripts/boot -p test_import_handoff.py -v
@@ -104,8 +104,12 @@ The code above specifies composition, not a complete implementation: the spec su
 
 Linux retained Tools container additionally runs `test_import_handoff.py`, `test_linux_handoff.py`, `test_current_source.py`, `test_handoff_manifest.py`, `test_qualification_volume_archive.py`. Report actual totals and skips separately. Negative RO reopen controls must reject writable input, added root/delivery/source path, source bytes/mode change and changed receipt.
 
-- [ ] **Step 5: Document and review.** `docs/p01-strict-import.md` records exact Linux CLI, absent output requirement, external trust pins, readonly reopen mounts, failure retention, and the S1/P01 distinction. Self-review against spec; report exact files, RED/GREEN logs, remaining concerns and commit. Controller produces a BASE..HEAD diff package and dispatches an independent spec/quality reviewer. Fix material findings before proceeding.
+- [x] **Step 5: Document and review.** `docs/p01-strict-import.md` records exact Linux CLI, absent output requirement, external trust pins, readonly reopen mounts, failure retention, and the S1/P01 distinction. Self-review against spec; report exact files, RED/GREEN logs, remaining concerns and commit. Controller produces a BASE..HEAD diff package and dispatches an independent spec/quality reviewer. Fix material findings before proceeding.
 
 - [ ] **Step 6: Actual handoff integration and checkpoint.** Controller or assigned integration worker freezes the reviewed public closure and uses unique new containers/volume. Import the real sealed archive without mounting original checkout writable, then reopen it from a different read-only container. Record before/after volume identity, fixed image/config/argv, all source bytes/modes and exact final output sets. Keep logs/resources even on failure and retry only in new generations. Publish evidence summary, update changelog and P01 S1 status, commit and push to authorized remote branch; keep P01 open for S2–S6.
 
 **Controller completion test:** S1 is complete only after independent review and real archive import/reopen pass. This plan does not close P01, P02, historical qualification or formal system acceptance.
+
+## 2026-11-08 acceptance checkpoint
+
+Implementation `e30139267f710afd7a13e66b58542fd8a4a6be26` passed independent spec/quality review. Linux importer19 and required regressions88 passed with zero skips. Actual generation `p01-import-actual-20261108-b` passed public import and separate read-only reopen of the sealed3.54GB archive, with all1561 source files/406 directories verified; controller and independent supplemental review approved the S1 technical gate. Generation a remains a retained pre-start controller failure. Exact identities and operations are in [S1 documentation](../../p01-strict-import.md). Step6 publication bookkeeping remains open until the acceptance checkpoint is committed and exact remote SHA verified; P01 remains0/11 with S2–S6 outstanding.

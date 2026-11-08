@@ -22,10 +22,34 @@ guest-c daemon ID：`81326b10-1096-4e41-a8a0-0303a61dd95e`；driver `overlayfs`�
 
 单次新容器的 `/dev/kvm` 探测在启动前失败，设备不存在；保留Created容器和日志，未修改Desktop/WSL。TCG实验未做Rust/Kotlin编译基准，不能从最小容器的55秒推断冷构建性能。
 
-为执行完整实际冷构建，继续评估独立WSL distro及其新VHD、新daemon和独立containerd store。当前只读升级查询已确认WSL服务可用，原来只有 `docker-desktop` WSL2发行版；普通沙箱下的 `E_ACCESSDENIED` 是访问限制，不是宿主WSL损坏证据。WSL版本2.7.14.0，kernel6.18.33.2-2，Windows10.0.26200.9711。
+为执行完整实际冷构建，已验证独立WSL distro及其新VHD、新daemon和独立containerd store。普通沙箱下的 `E_ACCESSDENIED` 是访问限制，不是宿主WSL损坏证据。WSL版本2.7.14.0，kernel6.18.33.2-2，Windows10.0.26200.9711。
 
 新distro实验不得修改默认distro、全局WSL配置、现有Desktop、现有socket或存储，不执行全局shutdown或unregister。禁用新distro的Windows盘自动挂载和interop；先实测cgroup/共享挂载边界，再决定是否启动只使用新配置及Unix socket的daemon。WSL共用基础设施，不声明独立内核或物理宿主隔离。最终部署方案以实际工具链加载、资源限制和冷构建证据选择。
 
+## WSL实际新存储与容器实验
+
+证据根为`artifacts/p01-wsl-audit-20261108-8a1c51f2/`。新distro `MingOS-P01-20261108-8a1c51f2`使用该目录下新`distro/ext4.vhdx`；rootfs从固定Tools镜像的保留stopped容器导出后，加入固定Docker static binaries和禁用automount/interop/systemd的`wsl.conf`。原export SHA256为`89112ff53cacdae8ffe1b3c7c3653b6ac144b25863bca3847132feab0bfb8a74`，派生WSL tar SHA256为`74b938e0c30b07f14103ed138cfd5d2fe87e37365bd7719e5f65c10471b597b0`。该实验明确依赖外层已有固定Tools image，不是无DockerDesktop前提的源码自举。
+
+| 身份/观察 | 实际值 |
+| --- | --- |
+| 新daemon ID | `20bdecf8-a496-402a-8171-13fa874dc3c3` |
+| daemon/containerd PID | 12 / 28，单独后续调用仍存活 |
+| socket | `unix:///run/mingos-p01-8a1c51f2/docker.sock` |
+| data-root | `/var/lib/mingos-p01-8a1c51f2/docker` |
+| 初始store | 0镜像、0容器、0卷 |
+| driver | `overlayfs`，`io.containerd.snapshotter.v1` |
+| namespace边界 | 新mount/net/cgroup namespace；专用management/workloads子树；共享祖先controllers/subtree_control前后不变 |
+
+启动已关闭bridge/iptables/ip6tables/forwarding/masquerade/proxy。只有daemon私有mount namespace遮蔽`/mnt/wsl`、`/mnt/wslg`并建立新cgroup视图；未修改原WSL共享挂载、默认发行版或Desktop配置。
+
+三固定工具链归档从原handoff只读逐一提取到新目录，整包摘要前后匹配，各归档固定bytes/SHA匹配，经binary stdin传入新distro的ext4输入路径。现有`development_image_migration.load_all`与`qualification_image_archive`代码保持原样、分别记录hash；wrapper始终指向新socket。一次load的完整结果位于`image-load-c62467b1/load-result-receipt.stdout.log`，状态`development-toolchain-load-inspect-verified`，rust/tools/kotlin各完成load及inspect，精确OCI index、ordered RootFS diffIDs、runtime config均匹配，没有platform剥离或index改写。attestation只验证字节及subject绑定，不声明签名真实性。
+
+成功smoke新代`mingos-p01-wsl-tools-smoke-c62467b2`的容器ID为`42952f845737ce9d2dd0a53df2517ee3b5698cacd84aec4eec5848cd9062ebc3`。实际读取UID/GID65534、只读根、五组capabilities全0、NoNewPrivs=1、`cpu.max=200000 100000`、`memory.max=4294967296`、`pids.max=256`，网络只有lo且无路由，Desktop共享路径不可见，tmpfs写入成功，精确容器exit0且非OOM并保留。
+
+首smoke在create时因`XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir`指向被私有tmpfs遮蔽后的缺失目录失败；TMPDIR/TMP/TEMP均未设置。失败命令及stderr保留。核实`/mnt/wslg`确为daemon私有`p01-private-wslg` tmpfs后，仅独占新建其`runtime-dir`（0700/root），再用全新smoke名验证；daemon未重启、镜像未重载。正式launcher必须在启动前清除GUI运行目录继承、显式设置受控TMPDIR并校验路径，不能靠手工修补关闭S2。
+
+完整汇总为`image-load-c62467b1/load-and-smoke-summary.json`。主执行者独立重核原loader六次操作、三个原index/config/rootfs、smoke原始输出/inspect、helper hashes及共享祖先未变，并在随后只读调用中确认同一daemon ID、3镜像/1容器。外层Desktop ID和镜像集合保持；无原容器/卷删除。并行S1 import从Running正常变为Exited0及新增reopen容器均单独归因，不宣称完整外层清单字节相同。
+
 ## 状态
 
-P01 S1公共严格导入模块正在实施，设计和计划已保存；本环境实验没有完成S2–S6。全部11项新项目仍为0项完成并发布；原开发VM交付与正式验收标志保持原范围。
+P01 S1公共严格导入已通过实际大包导入和独立只读重开及独立复核。WSL实验已完成三镜像加载和实际受限容器，但S2公共化及S3–S6源码/缓存消费、真实编译、新包装配和持久化验收继续。全部11项新项目仍为0项完成并发布；原开发VM交付与正式验收标志保持原范围。
